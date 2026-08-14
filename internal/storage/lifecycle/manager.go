@@ -1,0 +1,301 @@
+package lifecycle
+
+import (
+	"crypto/rand"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"slices"
+	"sync"
+	"time"
+
+	"github.com/akzj/streamd/internal/storage/format"
+	"github.com/akzj/streamd/internal/storage/fsutil"
+	manifeststore "github.com/akzj/streamd/internal/storage/manifest"
+	"github.com/akzj/streamd/internal/storage/memtable"
+	"github.com/akzj/streamd/internal/storage/segment"
+)
+
+type retirement struct {
+	source      string
+	destination string
+	renamed     bool
+}
+
+type Manager struct {
+	mu        sync.Mutex
+	root      string
+	manifests *manifeststore.Store
+	pins      map[format.UUID]int
+	pending   map[format.UUID]*retirement
+}
+
+func New(root string, manifests *manifeststore.Store) *Manager {
+	return &Manager{
+		root:      root,
+		manifests: manifests,
+		pins:      make(map[format.UUID]int),
+		pending:   make(map[format.UUID]*retirement),
+	}
+}
+
+func (m *Manager) Pin(id format.UUID) func() {
+	m.mu.Lock()
+	m.pins[id]++
+	m.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			m.mu.Lock()
+			m.pins[id]--
+			if m.pins[id] == 0 {
+				delete(m.pins, id)
+				if pending := m.pending[id]; pending != nil {
+					_ = m.retireLocked(id, pending.source)
+				}
+			}
+			m.mu.Unlock()
+		})
+	}
+}
+func (m *Manager) PublishFlush(streams []memtable.StreamSnapshot, lastEntryID uint64, lastCRC uint32) (format.Manifest, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(streams) == 0 {
+		return format.Manifest{}, fmt.Errorf("empty Flush")
+	}
+	id, err := newID()
+	if err != nil {
+		return format.Manifest{}, err
+	}
+	staging := filepath.Join(m.root, "staging", fmt.Sprintf("SEG-%x.tmp", id))
+	meta, err := segment.WriteFile(staging, id, time.Now().UnixNano(), streams)
+	if err != nil {
+		return format.Manifest{}, err
+	}
+	name := fmt.Sprintf("SEG-%x.seg", id)
+	final := filepath.Join(m.root, "segments", name)
+	if err = os.Rename(staging, final); err != nil {
+		return format.Manifest{}, err
+	}
+	if err = fsutil.SyncDir(filepath.Join(m.root, "segments")); err != nil {
+		return format.Manifest{}, err
+	}
+	reference := format.SegmentReference{Flags: format.SegmentRefHasLocal, SegmentID: id, FileSize: meta.Footer.FileLength, FirstEntryID: meta.Header.FirstEntryID, LastEntryID: meta.Header.LastEntryID, StreamCount: meta.Header.StreamCount, RecordCount: meta.Header.RecordCount, LocalPath: "segments/" + name, ContentSHA256: meta.Footer.ContentSHA256}
+	next, err := m.nextManifest(appendCurrent(m.manifests, reference), lastEntryID, lastCRC)
+	if err != nil {
+		return format.Manifest{}, err
+	}
+	return m.manifests.Publish(next)
+}
+func (m *Manager) Merge(ids []format.UUID) (format.Manifest, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(ids) < 2 {
+		return format.Manifest{}, fmt.Errorf("Merge requires at least two Segments")
+	}
+	current, ok := m.manifests.Current()
+	if !ok {
+		return format.Manifest{}, fmt.Errorf("no current Manifest")
+	}
+	wanted := make(map[format.UUID]bool, len(ids))
+	for _, id := range ids {
+		if wanted[id] {
+			return format.Manifest{}, fmt.Errorf("Merge input contains duplicate Segment %x", id)
+		}
+		wanted[id] = true
+	}
+	var selected []format.SegmentReference
+	var kept []format.SegmentReference
+	for _, ref := range current.SegmentReferences {
+		if wanted[ref.SegmentID] {
+			selected = append(selected, ref)
+		} else {
+			kept = append(kept, ref)
+		}
+	}
+	if len(selected) != len(wanted) {
+		return format.Manifest{}, fmt.Errorf("Merge input is not fully referenced")
+	}
+	byStream := make(map[uint64][][]byte)
+	for _, ref := range selected {
+		if ref.Flags&format.SegmentRefHasLocal == 0 {
+			return format.Manifest{}, fmt.Errorf("Merge input Segment %x has no local copy", ref.SegmentID)
+		}
+		reader, err := segment.Open(filepath.Join(m.root, ref.LocalPath))
+		if err != nil {
+			return format.Manifest{}, err
+		}
+		for _, d := range reader.Directories {
+			for seq := d.FirstSequence; seq < d.FirstSequence+d.RecordCount; seq++ {
+				frame, e := reader.ReadFrame(d.StreamID, seq)
+				if e != nil {
+					reader.Close()
+					return format.Manifest{}, e
+				}
+				byStream[d.StreamID] = append(byStream[d.StreamID], frame)
+			}
+		}
+		reader.Close()
+	}
+	streams := make([]memtable.StreamSnapshot, 0, len(byStream))
+	for streamID, frames := range byStream {
+		slices.SortFunc(frames, func(a, b []byte) int {
+			ra, _ := format.UnmarshalRecordFrame(a)
+			rb, _ := format.UnmarshalRecordFrame(b)
+			if ra.Sequence < rb.Sequence {
+				return -1
+			}
+			if ra.Sequence > rb.Sequence {
+				return 1
+			}
+			return 0
+		})
+		records := make([]format.RecordFrame, len(frames))
+		for i, frame := range frames {
+			r, e := format.UnmarshalRecordFrame(frame)
+			if e != nil {
+				return format.Manifest{}, e
+			}
+			records[i] = r
+			if i > 0 && (r.Sequence != records[i-1].Sequence+1 || r.ByteOffset != records[i-1].ByteOffset+uint64(len(frames[i-1]))) {
+				return format.Manifest{}, fmt.Errorf("Merge input has a Stream gap")
+			}
+		}
+		last := records[len(records)-1]
+		streams = append(streams, memtable.StreamSnapshot{StreamID: streamID, Tail: memtable.Tail{NextSequence: last.Sequence + 1, NextByteOffset: last.ByteOffset + uint64(len(frames[len(frames)-1])), LastRecordedAt: last.RecordedAt, LastEntryID: last.EntryID, RecordCount: uint64(len(frames))}, Frames: frames})
+	}
+	slices.SortFunc(streams, func(a, b memtable.StreamSnapshot) int {
+		if a.StreamID < b.StreamID {
+			return -1
+		}
+		if a.StreamID > b.StreamID {
+			return 1
+		}
+		return 0
+	})
+	id, err := newID()
+	if err != nil {
+		return format.Manifest{}, err
+	}
+	staging := filepath.Join(m.root, "staging", fmt.Sprintf("SEG-%x.tmp", id))
+	meta, err := segment.WriteFile(staging, id, time.Now().UnixNano(), streams)
+	if err != nil {
+		return format.Manifest{}, err
+	}
+	name := fmt.Sprintf("SEG-%x.seg", id)
+	final := filepath.Join(m.root, "segments", name)
+	if err = os.Rename(staging, final); err != nil {
+		return format.Manifest{}, err
+	}
+	if err = fsutil.SyncDir(filepath.Join(m.root, "segments")); err != nil {
+		return format.Manifest{}, err
+	}
+	kept = append(kept, format.SegmentReference{Flags: format.SegmentRefHasLocal, SegmentID: id, FileSize: meta.Footer.FileLength, FirstEntryID: meta.Header.FirstEntryID, LastEntryID: meta.Header.LastEntryID, StreamCount: meta.Header.StreamCount, RecordCount: meta.Header.RecordCount, LocalPath: "segments/" + name, ContentSHA256: meta.Footer.ContentSHA256})
+	next, err := m.nextManifest(kept, current.Header.LastEntryID, current.Header.LastEntryCRC32C)
+	if err != nil {
+		return format.Manifest{}, err
+	}
+	published, err := m.manifests.Publish(next)
+	if err != nil {
+		return format.Manifest{}, err
+	}
+	for _, ref := range selected {
+		path := filepath.Join(m.root, ref.LocalPath)
+		_ = m.retireLocked(ref.SegmentID, path)
+	}
+	return published, nil
+}
+func (m *Manager) nextManifest(refs []format.SegmentReference, lastID uint64, lastCRC uint32) (format.Manifest, error) {
+	var header format.ManifestHeader
+	current, ok := m.manifests.Current()
+	id, err := newID()
+	if err != nil {
+		return format.Manifest{}, err
+	}
+	header.FileID = id
+	header.CreatedAt = time.Now().UnixNano()
+	header.LastEntryID = lastID
+	header.LastEntryCRC32C = lastCRC
+	for _, ref := range refs {
+		header.RecordCount += ref.RecordCount
+	}
+	if ok {
+		header.Generation = current.Header.Generation + 1
+		header.PreviousGeneration = current.Header.Generation
+		header.PreviousManifestSHA256 = current.Footer.ContentSHA256
+	}
+	var artifacts []format.ArtifactReference
+	if ok {
+		artifacts = current.ArtifactReferences
+	}
+	return format.Manifest{Header: header, SegmentReferences: refs, ArtifactReferences: artifacts}, nil
+}
+func appendCurrent(store *manifeststore.Store, ref format.SegmentReference) []format.SegmentReference {
+	current, ok := store.Current()
+	if !ok {
+		return []format.SegmentReference{ref}
+	}
+	return append(current.SegmentReferences, ref)
+}
+func (m *Manager) retireLocked(id format.UUID, source string) error {
+	pending := m.pending[id]
+	if pending == nil {
+		pending = &retirement{
+			source:      source,
+			destination: filepath.Join(m.root, "trash", fmt.Sprintf("SEG-%x-%d.trash", id, time.Now().UnixNano())),
+		}
+		m.pending[id] = pending
+	}
+	if m.pins[id] > 0 {
+		return nil
+	}
+	if !pending.renamed {
+		if err := os.Rename(pending.source, pending.destination); err != nil {
+			return err
+		}
+		pending.renamed = true
+	}
+	if err := fsutil.SyncDir(filepath.Dir(pending.source)); err != nil {
+		return err
+	}
+	if err := fsutil.SyncDir(filepath.Dir(pending.destination)); err != nil {
+		return err
+	}
+	delete(m.pending, id)
+	return nil
+}
+
+func (m *Manager) CollectTrash(before time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var retryErr error
+	for id, pending := range m.pending {
+		if m.pins[id] == 0 {
+			retryErr = errors.Join(retryErr, m.retireLocked(id, pending.source))
+		}
+	}
+	entries, err := os.ReadDir(filepath.Join(m.root, "trash"))
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		info, e := entry.Info()
+		if e != nil {
+			return e
+		}
+		if info.ModTime().Before(before) {
+			if e = os.Remove(filepath.Join(m.root, "trash", entry.Name())); e != nil {
+				return e
+			}
+		}
+	}
+	return errors.Join(retryErr, fsutil.SyncDir(filepath.Join(m.root, "trash")))
+}
+
+func newID() (format.UUID, error) {
+	var id format.UUID
+	_, err := rand.Read(id[:])
+	return id, err
+}

@@ -220,6 +220,13 @@ func Open(path string) (*Reader, error) {
 }
 func (r *Reader) Close() error { return r.file.Close() }
 func (r *Reader) Read(streamID, sequence uint64) (format.RecordFrame, error) {
+	frame, err := r.ReadFrame(streamID, sequence)
+	if err != nil {
+		return format.RecordFrame{}, err
+	}
+	return format.UnmarshalRecordFrame(frame)
+}
+func (r *Reader) ReadFrame(streamID, sequence uint64) ([]byte, error) {
 	i, ok := slices.BinarySearchFunc(r.Directories, streamID, func(d format.StreamDirectoryEntry, id uint64) int {
 		if d.StreamID < id {
 			return -1
@@ -230,31 +237,31 @@ func (r *Reader) Read(streamID, sequence uint64) (format.RecordFrame, error) {
 		return 0
 	})
 	if !ok {
-		return format.RecordFrame{}, fmt.Errorf("Stream %d not found", streamID)
+		return nil, fmt.Errorf("Stream %d not found", streamID)
 	}
 	d := r.Directories[i]
 	if sequence < d.FirstSequence || sequence >= d.FirstSequence+d.RecordCount {
-		return format.RecordFrame{}, fmt.Errorf("Sequence outside Segment extent")
+		return nil, fmt.Errorf("Sequence outside Segment extent")
 	}
 	ordinal := sequence - d.FirstSequence
 	b := make([]byte, format.DenseIndexEntryLength)
 	if _, err := r.file.ReadAt(b, int64(d.RecordIndexOffset+ordinal*format.DenseIndexEntryLength)); err != nil {
-		return format.RecordFrame{}, err
+		return nil, err
 	}
 	idx, err := format.UnmarshalDenseIndexEntry(b)
 	if err != nil {
-		return format.RecordFrame{}, err
+		return nil, err
 	}
 	frame := make([]byte, idx.FrameLength)
 	if _, err = r.file.ReadAt(frame, int64(d.StreamDataOffset+idx.RelativeByteOffset)); err != nil {
-		return format.RecordFrame{}, err
+		return nil, err
 	}
 	record, err := format.UnmarshalRecordFrame(frame)
 	if err != nil {
-		return format.RecordFrame{}, err
+		return nil, err
 	}
 	if record.StreamID != streamID || record.Sequence != sequence || record.ByteOffset != d.FirstByteOffset+idx.RelativeByteOffset || record.RecordedAt != d.FirstRecordedAt+int64(idx.RecordedAtDelta) || binary.LittleEndian.Uint32(frame[len(frame)-4:]) != idx.FrameCRC32C {
-		return format.RecordFrame{}, fmt.Errorf("Segment Index does not match Frame")
+		return nil, fmt.Errorf("Segment Index does not match Frame")
 	}
-	return record, nil
+	return frame, nil
 }
