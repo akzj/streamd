@@ -3,6 +3,7 @@ package memtable
 import (
 	"bytes"
 	"fmt"
+	"slices"
 	"sync"
 
 	"github.com/akzj/streamd/internal/storage/format"
@@ -27,6 +28,11 @@ type recordRef struct {
 type streamData struct {
 	tail    Tail
 	records []recordRef
+}
+type StreamSnapshot struct {
+	StreamID uint64
+	Tail     Tail
+	Frames   [][]byte
 }
 type Table struct {
 	mu        sync.RWMutex
@@ -163,7 +169,27 @@ func (t *Table) Read(streamID, from uint64, maxRecords int) ([]format.RecordFram
 	}
 	return out, end, nil
 }
-func (t *Table) Freeze()      { t.mu.Lock(); t.frozen = true; t.mu.Unlock() }
+func (t *Table) Freeze() { t.mu.Lock(); t.frozen = true; t.mu.Unlock() }
+func (t *Table) FreezeSnapshot() []StreamSnapshot {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.frozen = true
+	ids := make([]uint64, 0, len(t.streams))
+	for id := range t.streams {
+		ids = append(ids, id)
+	}
+	slices.Sort(ids)
+	out := make([]StreamSnapshot, 0, len(ids))
+	for _, id := range ids {
+		s := t.streams[id]
+		snap := StreamSnapshot{StreamID: id, Tail: s.tail, Frames: make([][]byte, 0, len(s.records))}
+		for _, ref := range s.records {
+			snap.Frames = append(snap.Frames, bytes.Clone(t.chunks[ref.chunk][ref.start:ref.start+ref.length]))
+		}
+		out = append(out, snap)
+	}
+	return out
+}
 func (t *Table) Frozen() bool { t.mu.RLock(); defer t.mu.RUnlock(); return t.frozen }
 func (t *Table) Stats() (records, bytes uint64) {
 	t.mu.RLock()
