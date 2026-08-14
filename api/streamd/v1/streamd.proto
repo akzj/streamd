@@ -1,0 +1,202 @@
+syntax = "proto3";
+
+package streamd.v1;
+
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/akzj/streamd/api/streamd/v1;streamdv1";
+
+service StreamService {
+  rpc Append(AppendRequest) returns (AppendResponse);
+  rpc AppendBatch(AppendBatchRequest) returns (AppendBatchResponse);
+  rpc Read(ReadRequest) returns (ReadResponse);
+  rpc Subscribe(SubscribeRequest) returns (stream SubscribeResponse);
+  rpc ResolveTime(ResolveTimeRequest) returns (ResolveTimeResponse);
+  rpc InspectStream(InspectStreamRequest) returns (InspectStreamResponse);
+  rpc Health(HealthRequest) returns (HealthResponse);
+}
+
+enum Durability {
+  DURABILITY_UNSPECIFIED = 0;
+  DURABILITY_SINGLE_SYNC = 1;
+  DURABILITY_REPLICATED_STRICT = 2;
+  DURABILITY_DEGRADED_LOCAL_ONLY = 3;
+}
+
+enum ResolveTimeMode {
+  RESOLVE_TIME_MODE_UNSPECIFIED = 0;
+  RESOLVE_TIME_MODE_AT_OR_AFTER = 1;
+  RESOLVE_TIME_MODE_AT_OR_BEFORE = 2;
+}
+
+enum HealthStatus {
+  HEALTH_STATUS_UNSPECIFIED = 0;
+  HEALTH_STATUS_STARTING = 1;
+  HEALTH_STATUS_READY_READ = 2;
+  HEALTH_STATUS_READY_WRITE = 3;
+  HEALTH_STATUS_DEGRADED = 4;
+  HEALTH_STATUS_FAILED = 5;
+}
+
+enum NodeRole {
+  NODE_ROLE_UNSPECIFIED = 0;
+  NODE_ROLE_SINGLE = 1;
+  NODE_ROLE_PRIMARY = 2;
+  NODE_ROLE_STANDBY = 3;
+  NODE_ROLE_RECOVERING = 4;
+}
+
+enum ErrorCode {
+  ERROR_CODE_UNSPECIFIED = 0;
+  ERROR_CODE_INVALID_ARGUMENT = 1;
+  ERROR_CODE_UNAUTHENTICATED = 2;
+  ERROR_CODE_PERMISSION_DENIED = 3;
+  ERROR_CODE_STREAM_NOT_FOUND = 4;
+  ERROR_CODE_SEQUENCE_AHEAD = 5;
+  ERROR_CODE_SEQUENCE_CONFLICT = 6;
+  ERROR_CODE_RECORD_TOO_LARGE = 7;
+  ERROR_CODE_RESOURCE_EXHAUSTED = 8;
+  ERROR_CODE_DURABILITY_UNAVAILABLE = 9;
+  ERROR_CODE_NOT_LEADER = 10;
+  ERROR_CODE_REPLICA_UNAVAILABLE = 11;
+  ERROR_CODE_DEADLINE_EXCEEDED = 12;
+  ERROR_CODE_SLOW_CONSUMER = 13;
+  ERROR_CODE_DATA_LOSS = 14;
+}
+
+message StreamRef {
+  string namespace = 1;
+  string stream = 2;
+}
+
+message InputRecord {
+  map<string, bytes> headers = 1;
+  bytes payload = 2;
+}
+
+message StoredRecord {
+  uint64 sequence = 1;
+  google.protobuf.Timestamp recorded_at = 2;
+  bytes request_id = 3;
+  string producer = 4;
+  map<string, bytes> headers = 5;
+  bytes payload = 6;
+  uint64 storage_entry_id = 7;
+}
+
+message AppendRequest {
+  StreamRef stream = 1;
+  uint64 expected_sequence = 2;
+  bytes request_id = 3;
+  InputRecord record = 4;
+  Durability required_durability = 5;
+}
+
+message AppendResponse {
+  uint64 sequence = 1;
+  uint64 next_sequence = 2;
+  google.protobuf.Timestamp recorded_at = 3;
+  uint64 storage_entry_id = 4;
+  bool deduplicated = 5;
+  Durability durability = 6;
+}
+
+message AppendBatchRequest {
+  StreamRef stream = 1;
+  uint64 expected_sequence = 2;
+  bytes request_id = 3;
+  repeated InputRecord records = 4;
+  Durability required_durability = 5;
+}
+
+message AppendBatchResponse {
+  uint64 first_sequence = 1;
+  uint64 next_sequence = 2;
+  uint32 record_count = 3;
+  google.protobuf.Timestamp first_recorded_at = 4;
+  google.protobuf.Timestamp last_recorded_at = 5;
+  uint64 first_storage_entry_id = 6;
+  uint64 last_storage_entry_id = 7;
+  bool deduplicated = 8;
+  Durability durability = 9;
+}
+
+message ReadRequest {
+  StreamRef stream = 1;
+  uint64 from_sequence = 2;
+  uint32 max_records = 3;
+  uint64 max_bytes = 4;
+}
+
+message ReadResponse {
+  repeated StoredRecord records = 1;
+  uint64 next_sequence = 2;
+  uint64 current_next_sequence = 3;
+}
+
+message SubscribeRequest {
+  StreamRef stream = 1;
+  uint64 from_sequence = 2;
+  uint32 max_batch_records = 3;
+  uint64 max_batch_bytes = 4;
+  google.protobuf.Duration heartbeat_interval = 5;
+}
+
+message SubscribeResponse {
+  repeated StoredRecord records = 1;
+  uint64 next_sequence = 2;
+  uint64 current_next_sequence = 3;
+  bool heartbeat = 4;
+}
+
+message ResolveTimeRequest {
+  StreamRef stream = 1;
+  google.protobuf.Timestamp recorded_at = 2;
+  ResolveTimeMode mode = 3;
+}
+
+message ResolveTimeResponse {
+  bool found = 1;
+  uint64 sequence = 2;
+  google.protobuf.Timestamp actual_recorded_at = 3;
+}
+
+message InspectStreamRequest {
+  StreamRef stream = 1;
+}
+
+message InspectStreamResponse {
+  bool exists = 1;
+  uint64 head_sequence = 2;
+  uint64 next_sequence = 3;
+  uint64 record_count = 4;
+  google.protobuf.Timestamp first_recorded_at = 5;
+  google.protobuf.Timestamp last_recorded_at = 6;
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  HealthStatus status = 1;
+  NodeRole role = 2;
+  optional uint64 term = 3;
+  Durability durability = 4;
+  optional uint64 local_durable_entry_id = 5;
+  optional uint64 commit_entry_id = 6;
+  optional uint64 applied_entry_id = 7;
+  optional uint64 replication_lag_entries = 8;
+  repeated string reasons = 9;
+}
+
+// StreamdError is attached to a gRPC status as an error detail.
+message StreamdError {
+  ErrorCode code = 1;
+  string message = 2;
+  bool retryable = 3;
+  bool result_uncertain = 4;
+  optional uint64 current_next_sequence = 5;
+  optional string leader_hint = 6;
+  optional uint64 required_bytes = 7;
+  optional bytes request_id = 8;
+}

@@ -29,7 +29,7 @@ service StreamService {
 }
 ```
 
-本文固定语义，不固定 protobuf Field Number；`.proto` 合入前必须单独冻结编号且永不复用。
+protobuf Field Number 和枚举值已经在 [`api/streamd/v1/streamd.proto`](../api/streamd/v1/streamd.proto) 冻结，后续版本只能新增，不能修改或复用。
 
 ## 3. 公共类型
 
