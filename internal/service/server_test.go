@@ -2,10 +2,11 @@ package service
 
 import (
 	"context"
-	"errors"
+	"fmt"
 	"testing"
 
 	streamdv1 "github.com/akzj/streamd/api/streamd/v1"
+	"github.com/akzj/streamd/internal/access"
 	"github.com/akzj/streamd/internal/storage/engine"
 	"github.com/akzj/streamd/internal/storage/errdefs"
 	"google.golang.org/grpc/codes"
@@ -18,7 +19,7 @@ func TestUnaryServiceRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	server, err := New(store, func(context.Context) (string, error) { return "tenant/service", nil })
+	server, err := New(store, allow(access.Principal{Tenant: "tenant", Service: "service"}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,7 +85,7 @@ func TestServiceReturnsStructuredErrors(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	server, err := New(store, func(context.Context) (string, error) { return "test", nil })
+	server, err := New(store, allow(access.Principal{Tenant: "test", Service: "client"}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,12 +129,56 @@ func TestProducerResolverFailureIsUnauthenticated(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	server, err := New(store, func(context.Context) (string, error) { return "", errors.New("no identity") })
+	server, err := New(store, access.AuthorizeFunc(func(context.Context, string, string, access.Operation) (access.Principal, error) {
+		return access.Principal{}, fmt.Errorf("%w: no identity", access.ErrUnauthenticated)
+	}))
 	if err != nil {
 		t.Fatal(err)
 	}
 	_, err = server.Append(context.Background(), &streamdv1.AppendRequest{Stream: &streamdv1.StreamRef{Namespace: "n", Stream: "s"}, RequestId: []byte("r"), Record: &streamdv1.InputRecord{}})
 	assertError(t, err, codes.Unauthenticated, streamdv1.ErrorCode_ERROR_CODE_UNAUTHENTICATED, false)
+}
+
+func TestAuthorizationAndWriteLimits(t *testing.T) {
+	store, err := engine.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	principal := access.Principal{Tenant: "tenant", Service: "writer"}
+	authorizer := access.AuthorizeFunc(func(_ context.Context, _, _ string, operation access.Operation) (access.Principal, error) {
+		if operation != access.Append {
+			return access.Principal{}, fmt.Errorf("%w: operation", access.ErrPermissionDenied)
+		}
+		return principal, nil
+	})
+	server, err := NewWithOptions(store, authorizer, Options{Limits: Limits{MaxRecordBytes: 4, WriteRequestsPerSecond: 1, WriteRequestBurst: 1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := &streamdv1.StreamRef{Namespace: "n", Stream: "s"}
+	_, err = server.InspectStream(context.Background(), &streamdv1.InspectStreamRequest{Stream: ref})
+	assertError(t, err, codes.PermissionDenied, streamdv1.ErrorCode_ERROR_CODE_PERMISSION_DENIED, false)
+	_, err = server.Append(context.Background(), &streamdv1.AppendRequest{Stream: ref, RequestId: []byte("large"), Record: &streamdv1.InputRecord{Payload: []byte("12345")}})
+	detail := assertError(t, err, codes.ResourceExhausted, streamdv1.ErrorCode_ERROR_CODE_RECORD_TOO_LARGE, false)
+	if detail.RequiredBytes == nil || *detail.RequiredBytes != 5 {
+		t.Fatalf("record limit detail = %+v", detail)
+	}
+	_, err = server.Append(context.Background(), &streamdv1.AppendRequest{Stream: ref, RequestId: []byte("first"), Record: &streamdv1.InputRecord{Payload: []byte("1")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = server.Append(context.Background(), &streamdv1.AppendRequest{Stream: ref, ExpectedSequence: 1, RequestId: []byte("second"), Record: &streamdv1.InputRecord{Payload: []byte("2")}})
+	detail = assertError(t, err, codes.ResourceExhausted, streamdv1.ErrorCode_ERROR_CODE_RESOURCE_EXHAUSTED, false)
+	if !detail.Retryable {
+		t.Fatalf("rate limit detail = %+v", detail)
+	}
+}
+
+func allow(principal access.Principal) access.Authorizer {
+	return access.AuthorizeFunc(func(context.Context, string, string, access.Operation) (access.Principal, error) {
+		return principal, nil
+	})
 }
 
 func assertError(t *testing.T, err error, grpcCode codes.Code, code streamdv1.ErrorCode, uncertain bool) *streamdv1.StreamdError {

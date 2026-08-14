@@ -7,6 +7,7 @@ import (
 	"time"
 
 	streamdv1 "github.com/akzj/streamd/api/streamd/v1"
+	"github.com/akzj/streamd/internal/access"
 	"github.com/akzj/streamd/internal/storage/engine"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -21,7 +22,7 @@ func TestSubscribeHistoryNotificationAndHeartbeat(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	server, err := New(store, func(context.Context) (string, error) { return "test", nil })
+	server, err := New(store, allow(access.Principal{Tenant: "test", Service: "client"}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,7 +71,7 @@ func TestSubscribeRejectsSlowConsumer(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	server, err := NewWithOptions(store, func(context.Context) (string, error) { return "test", nil }, Options{SubscribeSendTimeout: 10 * time.Millisecond})
+	server, err := NewWithOptions(store, allow(access.Principal{Tenant: "test", Service: "client"}), Options{SubscribeSendTimeout: 10 * time.Millisecond})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -85,6 +86,40 @@ func TestSubscribeRejectsSlowConsumer(t *testing.T) {
 	detail := assertError(t, err, codes.ResourceExhausted, streamdv1.ErrorCode_ERROR_CODE_SLOW_CONSUMER, false)
 	if !detail.Retryable {
 		t.Fatalf("slow consumer detail = %+v", detail)
+	}
+}
+
+func TestSubscribeCountIsBoundedPerPrincipalNamespace(t *testing.T) {
+	store, err := engine.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	server, err := NewWithOptions(store, allow(access.Principal{Tenant: "test", Service: "client"}), Options{Limits: Limits{MaxSubscriptionsPerPrincipalNamespace: 1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := &streamdv1.StreamRef{Namespace: "n", Stream: "s"}
+	if _, err = server.Append(context.Background(), &streamdv1.AppendRequest{Stream: ref, RequestId: []byte("r"), Record: &streamdv1.InputRecord{}}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	first := newTestSubscribeStream(ctx)
+	done := make(chan error, 1)
+	request := &streamdv1.SubscribeRequest{Stream: ref, MaxBatchRecords: 1, MaxBatchBytes: 1024, HeartbeatInterval: durationpb.New(time.Hour)}
+	go func() { done <- server.Subscribe(request, first) }()
+	receiveSubscribe(t, first.sent)
+	second := newTestSubscribeStream(context.Background())
+	err = server.Subscribe(request, second)
+	detail := assertError(t, err, codes.ResourceExhausted, streamdv1.ErrorCode_ERROR_CODE_RESOURCE_EXHAUSTED, false)
+	if !detail.Retryable {
+		t.Fatalf("Subscribe limit detail = %+v", detail)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("first Subscribe did not stop")
 	}
 }
 

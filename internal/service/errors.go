@@ -55,6 +55,15 @@ func recordTooLarge(sequence, required uint64) error {
 	return streamdStatus(codes.ResourceExhausted, streamdv1.ErrorCode_ERROR_CODE_RECORD_TOO_LARGE, message, false, false, nil, &required, nil)
 }
 
+func recordLimit(sequence, required uint64, requestID []byte) error {
+	message := fmt.Sprintf("record at Sequence %d has %d input bytes and exceeds the configured limit", sequence, required)
+	return streamdStatus(codes.ResourceExhausted, streamdv1.ErrorCode_ERROR_CODE_RECORD_TOO_LARGE, message, false, false, nil, &required, requestID)
+}
+
+func resourceExhausted(message string, required *uint64, requestID []byte) error {
+	return streamdStatus(codes.ResourceExhausted, streamdv1.ErrorCode_ERROR_CODE_RESOURCE_EXHAUSTED, message, true, false, nil, required, requestID)
+}
+
 func streamdStatus(grpcCode codes.Code, code streamdv1.ErrorCode, message string, retryable, uncertain bool, current, required *uint64, requestID []byte) error {
 	detail := &streamdv1.StreamdError{Code: code, Message: message, Retryable: retryable, ResultUncertain: uncertain, CurrentNextSequence: current, RequiredBytes: required}
 	if len(requestID) > 0 {

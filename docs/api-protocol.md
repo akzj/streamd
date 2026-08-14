@@ -306,6 +306,8 @@ Principal {
 
 `producer` 从 Principal 生成并持久化，客户端 Header 不能覆盖。
 
+V1 实现只接受 TLS 已验证链中的客户端叶子证书，并通过部署配置把精确 URI SAN 映射为 Principal；不会从任意 SAN 字符串中猜测 tenant、service 或 instance。一个证书若映射到多个不同 Principal，认证失败关闭。
+
 授权粒度：
 
 ```text

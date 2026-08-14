@@ -4,10 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"slices"
+	"sync"
 	"time"
 
 	streamdv1 "github.com/akzj/streamd/api/streamd/v1"
+	"github.com/akzj/streamd/internal/access"
 	"github.com/akzj/streamd/internal/storage/engine"
 	"github.com/akzj/streamd/internal/storage/format"
 	readstore "github.com/akzj/streamd/internal/storage/read"
@@ -25,26 +28,56 @@ type Backend interface {
 	WaitForAppend(context.Context, string, string, uint64) error
 }
 
-type ProducerResolver func(context.Context) (string, error)
-
 type Server struct {
 	streamdv1.UnimplementedStreamServiceServer
-	backend         Backend
-	resolveProducer ProducerResolver
-	sendTimeout     time.Duration
+	backend     Backend
+	authorizer  access.Authorizer
+	sendTimeout time.Duration
+	limits      Limits
+	subMu       sync.Mutex
+	subs        map[subscriptionKey]uint32
+	rateMu      sync.Mutex
+	rateBuckets map[subscriptionKey]rateBucket
 }
 
 type Options struct {
 	SubscribeSendTimeout time.Duration
+	Limits               Limits
 }
 
-func New(backend Backend, resolveProducer ProducerResolver) (*Server, error) {
-	return NewWithOptions(backend, resolveProducer, Options{})
+type Limits struct {
+	MaxRecordBytes                        uint64
+	MaxBatchRecords                       uint32
+	MaxBatchBytes                         uint64
+	MaxReadRecords                        uint32
+	MaxReadBytes                          uint64
+	MaxSubscribeBatchRecords              uint32
+	MaxSubscribeBatchBytes                uint64
+	MaxSubscriptionsPerPrincipalNamespace uint32
+	WriteRequestsPerSecond                uint32
+	WriteRequestBurst                     uint32
+	WriteBytesPerSecond                   uint64
+	WriteByteBurst                        uint64
 }
 
-func NewWithOptions(backend Backend, resolveProducer ProducerResolver, options Options) (*Server, error) {
-	if backend == nil || resolveProducer == nil {
-		return nil, fmt.Errorf("backend and Producer resolver are required")
+type subscriptionKey struct {
+	producer  string
+	namespace string
+}
+
+type rateBucket struct {
+	updated  time.Time
+	requests float64
+	bytes    float64
+}
+
+func New(backend Backend, authorizer access.Authorizer) (*Server, error) {
+	return NewWithOptions(backend, authorizer, Options{})
+}
+
+func NewWithOptions(backend Backend, authorizer access.Authorizer, options Options) (*Server, error) {
+	if backend == nil || authorizer == nil {
+		return nil, fmt.Errorf("backend and Authorizer are required")
 	}
 	if options.SubscribeSendTimeout < 0 {
 		return nil, fmt.Errorf("Subscribe Send timeout cannot be negative")
@@ -52,7 +85,11 @@ func NewWithOptions(backend Backend, resolveProducer ProducerResolver, options O
 	if options.SubscribeSendTimeout == 0 {
 		options.SubscribeSendTimeout = 30 * time.Second
 	}
-	return &Server{backend: backend, resolveProducer: resolveProducer, sendTimeout: options.SubscribeSendTimeout}, nil
+	limits, err := normalizeLimits(options.Limits)
+	if err != nil {
+		return nil, err
+	}
+	return &Server{backend: backend, authorizer: authorizer, sendTimeout: options.SubscribeSendTimeout, limits: limits, subs: make(map[subscriptionKey]uint32), rateBuckets: make(map[subscriptionKey]rateBucket)}, nil
 }
 
 func (s *Server) Append(ctx context.Context, request *streamdv1.AppendRequest) (*streamdv1.AppendResponse, error) {
@@ -107,25 +144,46 @@ func (s *Server) append(ctx context.Context, ref *streamdv1.StreamRef, expected 
 		}
 		return engine.AppendResult{}, invalidArgument("required_durability is invalid for Append", requestID)
 	}
-	producer, err := s.resolveProducer(ctx)
-	if err != nil || producer == "" {
-		return engine.AppendResult{}, streamdStatus(codes.Unauthenticated, streamdv1.ErrorCode_ERROR_CODE_UNAUTHENTICATED, "authenticated producer identity is required", false, false, nil, nil, requestID)
+	principal, err := s.authorize(ctx, ref, access.Append, requestID)
+	if err != nil {
+		return engine.AppendResult{}, err
 	}
 	inputs := make([]engine.InputRecord, len(records))
+	if uint64(len(records)) > uint64(s.limits.MaxBatchRecords) {
+		return engine.AppendResult{}, resourceExhausted("Batch record count exceeds the configured limit", nil, requestID)
+	}
+	var batchBytes uint64
 	for i, record := range records {
 		if record == nil {
 			return engine.AppendResult{}, invalidArgument(fmt.Sprintf("record %d is missing", i), requestID)
 		}
+		recordBytes, overflow := inputRecordSize(record)
+		if overflow {
+			return engine.AppendResult{}, resourceExhausted("record size overflows", nil, requestID)
+		}
+		if recordBytes > s.limits.MaxRecordBytes {
+			return engine.AppendResult{}, recordLimit(expected+uint64(i), recordBytes, requestID)
+		}
+		if batchBytes > math.MaxUint64-recordBytes {
+			return engine.AppendResult{}, resourceExhausted("Batch size overflows", nil, requestID)
+		}
+		batchBytes += recordBytes
 		inputs[i] = engine.InputRecord{Headers: inputHeaders(record.Headers), Payload: slices.Clone(record.Payload)}
 	}
-	result, err := s.backend.Append(ctx, engine.AppendRequest{Namespace: ref.Namespace, Stream: ref.Stream, ExpectedSequence: expected, RequestID: slices.Clone(requestID), Producer: producer, Records: inputs})
+	if batchBytes > s.limits.MaxBatchBytes {
+		return engine.AppendResult{}, resourceExhausted("Batch bytes exceed the configured limit", &batchBytes, requestID)
+	}
+	if !s.allowWrite(principal, ref.Namespace, batchBytes) {
+		return engine.AppendResult{}, resourceExhausted("write rate exceeds the configured limit", nil, requestID)
+	}
+	result, err := s.backend.Append(ctx, engine.AppendRequest{Namespace: ref.Namespace, Stream: ref.Stream, ExpectedSequence: expected, RequestID: slices.Clone(requestID), Producer: principal.Producer(), Records: inputs})
 	if err != nil {
 		return engine.AppendResult{}, mapError(err, requestID)
 	}
 	return result, nil
 }
 
-func (s *Server) Read(_ context.Context, request *streamdv1.ReadRequest) (*streamdv1.ReadResponse, error) {
+func (s *Server) Read(ctx context.Context, request *streamdv1.ReadRequest) (*streamdv1.ReadResponse, error) {
 	if request == nil {
 		return nil, invalidArgument("Read request is required", nil)
 	}
@@ -134,6 +192,12 @@ func (s *Server) Read(_ context.Context, request *streamdv1.ReadRequest) (*strea
 	}
 	if request.MaxRecords == 0 || request.MaxBytes == 0 {
 		return nil, invalidArgument("max_records and max_bytes must be greater than zero", nil)
+	}
+	if _, err := s.authorize(ctx, request.Stream, access.Read, nil); err != nil {
+		return nil, err
+	}
+	if request.MaxRecords > s.limits.MaxReadRecords || request.MaxBytes > s.limits.MaxReadBytes {
+		return nil, resourceExhausted("Read limits exceed the configured maximum", nil, nil)
 	}
 	return s.read(request.Stream, request.FromSequence, request.MaxRecords, request.MaxBytes)
 }
@@ -161,7 +225,7 @@ func (s *Server) read(ref *streamdv1.StreamRef, from uint64, maxRecords uint32, 
 	return response, nil
 }
 
-func (s *Server) ResolveTime(_ context.Context, request *streamdv1.ResolveTimeRequest) (*streamdv1.ResolveTimeResponse, error) {
+func (s *Server) ResolveTime(ctx context.Context, request *streamdv1.ResolveTimeRequest) (*streamdv1.ResolveTimeResponse, error) {
 	if request == nil || request.RecordedAt == nil {
 		return nil, invalidArgument("ResolveTime request and recorded_at are required", nil)
 	}
@@ -170,6 +234,9 @@ func (s *Server) ResolveTime(_ context.Context, request *streamdv1.ResolveTimeRe
 	}
 	if err := request.RecordedAt.CheckValid(); err != nil {
 		return nil, invalidArgument("recorded_at is invalid", nil)
+	}
+	if _, err := s.authorize(ctx, request.Stream, access.Read, nil); err != nil {
+		return nil, err
 	}
 	var mode readstore.TimeMode
 	switch request.Mode {
@@ -192,12 +259,15 @@ func (s *Server) ResolveTime(_ context.Context, request *streamdv1.ResolveTimeRe
 	return response, nil
 }
 
-func (s *Server) InspectStream(_ context.Context, request *streamdv1.InspectStreamRequest) (*streamdv1.InspectStreamResponse, error) {
+func (s *Server) InspectStream(ctx context.Context, request *streamdv1.InspectStreamRequest) (*streamdv1.InspectStreamResponse, error) {
 	if request == nil {
 		return nil, invalidArgument("InspectStream request is required", nil)
 	}
 	if err := validateStream(request.Stream); err != nil {
 		return nil, invalidArgument(err.Error(), nil)
+	}
+	if _, err := s.authorize(ctx, request.Stream, access.Inspect, nil); err != nil {
+		return nil, err
 	}
 	info, err := s.backend.Inspect(request.Stream.Namespace, request.Stream.Stream)
 	if err != nil {
@@ -239,6 +309,20 @@ func validateStream(ref *streamdv1.StreamRef) error {
 		return fmt.Errorf("stream namespace and name are required")
 	}
 	return nil
+}
+
+func (s *Server) authorize(ctx context.Context, ref *streamdv1.StreamRef, operation access.Operation, requestID []byte) (access.Principal, error) {
+	principal, err := s.authorizer.Authorize(ctx, ref.Namespace, ref.Stream, operation)
+	if err == nil {
+		if validateErr := principal.Validate(); validateErr == nil {
+			return principal, nil
+		}
+		err = access.ErrUnauthenticated
+	}
+	if errors.Is(err, access.ErrPermissionDenied) {
+		return access.Principal{}, streamdStatus(codes.PermissionDenied, streamdv1.ErrorCode_ERROR_CODE_PERMISSION_DENIED, "operation is not authorized", false, false, nil, nil, requestID)
+	}
+	return access.Principal{}, streamdStatus(codes.Unauthenticated, streamdv1.ErrorCode_ERROR_CODE_UNAUTHENTICATED, "authenticated identity is required", false, false, nil, nil, requestID)
 }
 
 func inputHeaders(headers map[string][]byte) []format.Header {
@@ -286,6 +370,17 @@ func (s *Server) Subscribe(request *streamdv1.SubscribeRequest, stream streamdv1
 	if err := request.HeartbeatInterval.CheckValid(); err != nil || request.HeartbeatInterval.AsDuration() <= 0 {
 		return invalidArgument("heartbeat_interval must be positive", nil)
 	}
+	principal, err := s.authorize(stream.Context(), request.Stream, access.Subscribe, nil)
+	if err != nil {
+		return err
+	}
+	if request.MaxBatchRecords > s.limits.MaxSubscribeBatchRecords || request.MaxBatchBytes > s.limits.MaxSubscribeBatchBytes {
+		return resourceExhausted("Subscribe batch limits exceed the configured maximum", nil, nil)
+	}
+	if err = s.acquireSubscription(principal, request.Stream.Namespace); err != nil {
+		return err
+	}
+	defer s.releaseSubscription(principal, request.Stream.Namespace)
 	cursor := request.FromSequence
 	heartbeat := request.HeartbeatInterval.AsDuration()
 	for {
@@ -314,6 +409,114 @@ func (s *Server) Subscribe(request *streamdv1.SubscribeRequest, stream streamdv1
 			return mapError(err, nil)
 		}
 	}
+}
+
+func normalizeLimits(limits Limits) (Limits, error) {
+	if limits.MaxRecordBytes == 0 {
+		limits.MaxRecordBytes = 16 << 20
+	}
+	if limits.MaxBatchRecords == 0 {
+		limits.MaxBatchRecords = 1024
+	}
+	if limits.MaxBatchBytes == 0 {
+		limits.MaxBatchBytes = 64 << 20
+	}
+	if limits.MaxReadRecords == 0 {
+		limits.MaxReadRecords = 10_000
+	}
+	if limits.MaxReadBytes == 0 {
+		limits.MaxReadBytes = 64 << 20
+	}
+	if limits.MaxSubscribeBatchRecords == 0 {
+		limits.MaxSubscribeBatchRecords = 1_000
+	}
+	if limits.MaxSubscribeBatchBytes == 0 {
+		limits.MaxSubscribeBatchBytes = 4 << 20
+	}
+	if limits.MaxSubscriptionsPerPrincipalNamespace == 0 {
+		limits.MaxSubscriptionsPerPrincipalNamespace = 64
+	}
+	if limits.WriteRequestsPerSecond == 0 {
+		limits.WriteRequestsPerSecond = 10_000
+	}
+	if limits.WriteRequestBurst == 0 {
+		limits.WriteRequestBurst = limits.WriteRequestsPerSecond
+	}
+	if limits.WriteBytesPerSecond == 0 {
+		limits.WriteBytesPerSecond = 256 << 20
+	}
+	if limits.WriteByteBurst == 0 {
+		limits.WriteByteBurst = limits.WriteBytesPerSecond
+	}
+	if limits.WriteRequestBurst < 1 || limits.WriteByteBurst < 1 {
+		return Limits{}, fmt.Errorf("write rate bursts must be positive")
+	}
+	if limits.MaxRecordBytes > format.MaxFrameLength || limits.MaxBatchRecords > format.MaxBatchRecordCount {
+		return Limits{}, fmt.Errorf("service limits exceed storage format limits")
+	}
+	return limits, nil
+}
+
+func (s *Server) allowWrite(principal access.Principal, namespace string, bytes uint64) bool {
+	key := subscriptionKey{producer: principal.Producer(), namespace: namespace}
+	now := time.Now()
+	s.rateMu.Lock()
+	defer s.rateMu.Unlock()
+	bucket, exists := s.rateBuckets[key]
+	if !exists {
+		bucket = rateBucket{updated: now, requests: float64(s.limits.WriteRequestBurst), bytes: float64(s.limits.WriteByteBurst)}
+	} else {
+		elapsed := now.Sub(bucket.updated).Seconds()
+		bucket.requests = min(float64(s.limits.WriteRequestBurst), bucket.requests+elapsed*float64(s.limits.WriteRequestsPerSecond))
+		bucket.bytes = min(float64(s.limits.WriteByteBurst), bucket.bytes+elapsed*float64(s.limits.WriteBytesPerSecond))
+		bucket.updated = now
+	}
+	charge := bytes
+	if charge == 0 {
+		charge = 1
+	}
+	if bucket.requests < 1 || bucket.bytes < float64(charge) {
+		s.rateBuckets[key] = bucket
+		return false
+	}
+	bucket.requests--
+	bucket.bytes -= float64(charge)
+	s.rateBuckets[key] = bucket
+	return true
+}
+
+func inputRecordSize(record *streamdv1.InputRecord) (uint64, bool) {
+	total := uint64(len(record.Payload))
+	for key, value := range record.Headers {
+		addition := uint64(len(key)) + uint64(len(value))
+		if total > math.MaxUint64-addition {
+			return 0, true
+		}
+		total += addition
+	}
+	return total, false
+}
+
+func (s *Server) acquireSubscription(principal access.Principal, namespace string) error {
+	key := subscriptionKey{producer: principal.Producer(), namespace: namespace}
+	s.subMu.Lock()
+	defer s.subMu.Unlock()
+	if s.subs[key] >= s.limits.MaxSubscriptionsPerPrincipalNamespace {
+		return resourceExhausted("Subscribe count exceeds the configured limit", nil, nil)
+	}
+	s.subs[key]++
+	return nil
+}
+
+func (s *Server) releaseSubscription(principal access.Principal, namespace string) {
+	key := subscriptionKey{producer: principal.Producer(), namespace: namespace}
+	s.subMu.Lock()
+	if s.subs[key] <= 1 {
+		delete(s.subs, key)
+	} else {
+		s.subs[key]--
+	}
+	s.subMu.Unlock()
 }
 
 func (s *Server) send(stream streamdv1.StreamService_SubscribeServer, response *streamdv1.SubscribeResponse) error {
