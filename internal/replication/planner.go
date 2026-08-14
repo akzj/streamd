@@ -22,6 +22,8 @@ const (
 	ErrInvalidState     ErrorCode = "INVALID_STATE"
 	ErrWrongGroup       ErrorCode = "WRONG_GROUP"
 	ErrTermStale        ErrorCode = "TERM_STALE"
+	ErrNotLeader        ErrorCode = "NOT_LEADER"
+	ErrLogGap           ErrorCode = "LOG_GAP"
 	ErrLogDiverged      ErrorCode = "LOG_DIVERGED"
 	ErrNoRecoverySource ErrorCode = "NO_RECOVERY_SOURCE"
 )
