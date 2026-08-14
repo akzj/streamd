@@ -7,17 +7,19 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
+	"slices"
+	"sync"
+	"time"
+
 	"github.com/akzj/streamd/internal/storage/commit"
+	"github.com/akzj/streamd/internal/storage/errdefs"
 	"github.com/akzj/streamd/internal/storage/format"
 	"github.com/akzj/streamd/internal/storage/fsutil"
 	"github.com/akzj/streamd/internal/storage/memtable"
 	readstore "github.com/akzj/streamd/internal/storage/read"
 	"github.com/akzj/streamd/internal/storage/recovery"
 	"github.com/akzj/streamd/internal/storage/registry"
-	"math"
-	"slices"
-	"sync"
-	"time"
 )
 
 type InputRecord struct {
@@ -42,6 +44,10 @@ type AppendResult struct {
 	LastEntryID     uint64
 	Deduplicated    bool
 }
+type Health struct {
+	Watermarks commit.Watermarks
+	Fatal      error
+}
 type Store struct {
 	mu        sync.Mutex
 	root      *fsutil.Root
@@ -54,7 +60,7 @@ type Store struct {
 func (s *Store) Read(namespace, name string, from uint64, maxRecords int, maxBytes uint64) (readstore.Result, error) {
 	mapping, ok := s.state.Registry.Lookup(namespace, name)
 	if !ok {
-		return readstore.Result{}, fmt.Errorf("Stream not found")
+		return readstore.Result{}, errdefs.ErrStreamNotFound
 	}
 	return s.reader.Read(mapping.StreamID, from, maxRecords, maxBytes)
 }
@@ -71,6 +77,9 @@ func (s *Store) ResolveTime(namespace, name string, target int64, mode readstore
 		return 0, 0, false, nil
 	}
 	return s.reader.ResolveTime(mapping.StreamID, target, mode)
+}
+func (s *Store) Health() Health {
+	return Health{Watermarks: s.committer.Watermarks(), Fatal: s.committer.FatalError()}
 }
 
 func Open(path string) (*Store, error) {
@@ -94,17 +103,17 @@ func (s *Store) Append(ctx context.Context, request AppendRequest) (AppendResult
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if request.Namespace == "" || request.Stream == "" || len(request.RequestID) == 0 || len(request.RequestID) > format.MaxRequestIDLength || request.Producer == "" || len(request.Records) == 0 || len(request.Records) > format.MaxBatchRecordCount {
-		return AppendResult{}, fmt.Errorf("invalid Append request")
+		return AppendResult{}, errdefs.ErrInvalidArgument
 	}
 	hash, err := RequestHash(request)
 	if err != nil {
-		return AppendResult{}, err
+		return AppendResult{}, fmt.Errorf("%w: %v", errdefs.ErrInvalidArgument, err)
 	}
 	if _, err = format.MarshalRegistryRecord(format.RegistryRecord{AssignedStreamID: 1, Namespace: request.Namespace, StreamName: request.Stream}); err != nil {
-		return AppendResult{}, err
+		return AppendResult{}, fmt.Errorf("%w: %v", errdefs.ErrInvalidArgument, err)
 	}
 	if err = validateInputRecords(request, hash); err != nil {
-		return AppendResult{}, err
+		return AppendResult{}, fmt.Errorf("%w: %v", errdefs.ErrInvalidArgument, err)
 	}
 	mapping, exists := s.state.Registry.Lookup(request.Namespace, request.Stream)
 	if !exists {
@@ -129,7 +138,7 @@ func (s *Store) Append(ctx context.Context, request AppendRequest) (AppendResult
 		return s.deduplicate(mapping.StreamID, request, hash, tail.NextSequence)
 	}
 	if request.ExpectedSequence > tail.NextSequence {
-		return AppendResult{}, fmt.Errorf("expected Sequence %d is ahead of tail %d", request.ExpectedSequence, tail.NextSequence)
+		return AppendResult{}, &errdefs.SequenceAheadError{Requested: request.ExpectedSequence, CurrentNextSequence: tail.NextSequence}
 	}
 	entryID := s.state.WAL.NextEntryID()
 	previous := s.state.WAL.PreviousEntryCRC32C()
@@ -166,7 +175,7 @@ func (s *Store) Append(ctx context.Context, request AppendRequest) (AppendResult
 	}
 	commitResult, err := s.committer.Commit(ctx, encoded)
 	if err != nil {
-		return AppendResult{}, err
+		return AppendResult{}, &errdefs.WriteError{Err: err, ResultUncertain: commitResult.ResultUncertain}
 	}
 	return AppendResult{FirstSequence: sequence, NextSequence: sequence + uint64(len(encoded)), RecordCount: uint32(len(encoded)), FirstRecordedAt: firstTime, LastRecordedAt: recordedAt, FirstEntryID: commitResult.FirstEntryID, LastEntryID: commitResult.LastEntryID}, nil
 }
@@ -187,10 +196,17 @@ func (s *Store) commitRegistry(ctx context.Context, proposal format.RegistryReco
 	if err != nil {
 		return err
 	}
-	if _, err = s.committer.Commit(ctx, [][]byte{encoded}); err != nil {
-		return err
+	_, commitErr := s.committer.Commit(ctx, [][]byte{encoded})
+	watermarks := s.committer.Watermarks()
+	if watermarks.HasApplied && watermarks.Applied >= entryID {
+		if err = s.state.Registry.ApplyRecord(entryID, payload); err != nil {
+			return err
+		}
 	}
-	return s.state.Registry.ApplyRecord(entryID, payload)
+	if commitErr != nil {
+		return commitErr
+	}
+	return nil
 }
 func (s *Store) deduplicate(streamID uint64, request AppendRequest, hash [32]byte, currentNext uint64) (AppendResult, error) {
 	result, err := s.reader.Read(streamID, request.ExpectedSequence, len(request.Records), 0)
@@ -198,15 +214,15 @@ func (s *Store) deduplicate(streamID uint64, request AppendRequest, hash [32]byt
 		return AppendResult{}, err
 	}
 	if len(result.Records) != len(request.Records) {
-		return AppendResult{}, fmt.Errorf("Sequence conflict")
+		return AppendResult{}, errdefs.ErrSequenceConflict
 	}
 	first := result.Records[0]
 	if first.BatchIndex != 0 || int(first.BatchCount) != len(request.Records) {
-		return AppendResult{}, fmt.Errorf("Sequence conflict")
+		return AppendResult{}, errdefs.ErrSequenceConflict
 	}
 	for _, record := range result.Records {
 		if !bytes.Equal(record.RequestID, request.RequestID) || record.RequestHash != hash || record.BatchCount != first.BatchCount {
-			return AppendResult{}, fmt.Errorf("Sequence conflict")
+			return AppendResult{}, errdefs.ErrSequenceConflict
 		}
 	}
 	last := result.Records[len(result.Records)-1]

@@ -14,11 +14,14 @@ type DurableLog interface {
 	Sync() error
 }
 type Watermarks struct {
-	HasValue     bool
-	Appended     uint64
-	LocalDurable uint64
-	Committed    uint64
-	Applied      uint64
+	HasValue        bool
+	HasLocalDurable bool
+	HasCommitted    bool
+	HasApplied      bool
+	Appended        uint64
+	LocalDurable    uint64
+	Committed       uint64
+	Applied         uint64
 }
 type Result struct {
 	FirstEntryID    uint64
@@ -66,12 +69,15 @@ func (c *Committer) Commit(ctx context.Context, encoded [][]byte) (Result, error
 		return Result{FirstEntryID: entries[0].EntryID, LastEntryID: last, RecordCount: uint32(len(entries)), ResultUncertain: true}, err
 	}
 	c.watermarks.LocalDurable = last
+	c.watermarks.HasLocalDurable = true
 	c.watermarks.Committed = last
+	c.watermarks.HasCommitted = true
 	if err := c.table.ApplyBatch(entries); err != nil {
 		c.fatal = err
 		return Result{FirstEntryID: entries[0].EntryID, LastEntryID: last, RecordCount: uint32(len(entries)), ResultUncertain: true}, fmt.Errorf("durable Batch could not Apply: %w", err)
 	}
 	c.watermarks.Applied = last
+	c.watermarks.HasApplied = true
 	result := Result{FirstEntryID: entries[0].EntryID, LastEntryID: last, RecordCount: uint32(len(entries))}
 	if err := ctx.Err(); err != nil {
 		result.ResultUncertain = true

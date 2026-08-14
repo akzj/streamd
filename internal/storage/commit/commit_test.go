@@ -55,6 +55,10 @@ func TestSyncFailurePoisonsCommitter(t *testing.T) {
 	if !errors.Is(err, stop) || !result.ResultUncertain {
 		t.Fatalf("result %+v error %v", result, err)
 	}
+	water := c.Watermarks()
+	if water.HasLocalDurable || water.HasCommitted || water.HasApplied {
+		t.Fatalf("failed Sync advanced durable watermarks: %+v", water)
+	}
 	if _, err = c.Commit(context.Background(), encodedBatch(t)); err == nil {
 		t.Fatal("poisoned Committer accepted request")
 	}

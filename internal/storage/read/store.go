@@ -3,10 +3,12 @@ package read
 import (
 	"container/list"
 	"fmt"
+	"sync"
+
+	"github.com/akzj/streamd/internal/storage/errdefs"
 	"github.com/akzj/streamd/internal/storage/format"
 	"github.com/akzj/streamd/internal/storage/memtable"
 	"github.com/akzj/streamd/internal/storage/segment"
-	"sync"
 )
 
 type TimeMode uint8
@@ -84,11 +86,11 @@ func (s *Store) extents(streamID uint64) []extent {
 func (s *Store) Read(streamID, from uint64, maxRecords int, maxBytes uint64) (Result, error) {
 	tail, ok := s.table.Tail(streamID)
 	if !ok {
-		return Result{}, fmt.Errorf("Stream %d not found", streamID)
+		return Result{}, fmt.Errorf("Stream %d: %w", streamID, errdefs.ErrStreamNotFound)
 	}
 	result := Result{NextSequence: from, CurrentNextSequence: tail.NextSequence}
 	if from > tail.NextSequence {
-		return result, fmt.Errorf("Sequence %d is ahead of tail %d", from, tail.NextSequence)
+		return result, &errdefs.SequenceAheadError{Requested: from, CurrentNextSequence: tail.NextSequence}
 	}
 	if maxRecords <= 0 || from == tail.NextSequence {
 		return result, nil
@@ -115,7 +117,7 @@ func (s *Store) Read(streamID, from uint64, maxRecords int, maxBytes uint64) (Re
 		}
 		if maxBytes > 0 && uint64(len(encoded)) > maxBytes {
 			if len(result.Records) == 0 {
-				return result, fmt.Errorf("Record at Sequence %d requires %d bytes", sequence, len(encoded))
+				return result, &errdefs.RecordTooLargeError{Sequence: sequence, RequiredBytes: uint64(len(encoded))}
 			}
 			break
 		}
