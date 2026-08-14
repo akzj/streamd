@@ -23,6 +23,15 @@ const (
 	WALFileHeaderLength  = 64
 	WALEntryHeaderLength = 96
 	WALSealFooterLength  = 96
+
+	SegmentSectionAlignment    = 4096
+	SegmentHeaderLength        = 160
+	StreamDirectoryEntryLength = 112
+	DenseIndexEntryLength      = 24
+	SegmentFooterLength        = 104
+	SegmentFooterSectionLength = 4096
+	ManifestHeaderLength       = 136
+	ManifestFooterLength       = 88
 )
 
 var (
@@ -83,6 +92,24 @@ func checkedAdd(parts ...uint64) (uint64, error) {
 	return sum, nil
 }
 
+func checkedMul(left, right uint64, field string) (uint64, error) {
+	if left != 0 && right > ^uint64(0)/left {
+		return 0, invalidf("integer overflow while multiplying %s", field)
+	}
+	return left * right, nil
+}
+
+func alignUp(value, alignment uint64) (uint64, error) {
+	if alignment == 0 || alignment&(alignment-1) != 0 {
+		return 0, invalidf("alignment must be a non-zero power of two")
+	}
+	added, err := checkedAdd(value, alignment-1)
+	if err != nil {
+		return 0, err
+	}
+	return added &^ (alignment - 1), nil
+}
+
 func checkedInt(value uint64, field string) (int, error) {
 	converted := int(value)
 	if converted < 0 || uint64(converted) != value {
@@ -98,4 +125,12 @@ func expectZero(data []byte, field string) error {
 		}
 	}
 	return nil
+}
+
+func isZeroUUID(value UUID) bool {
+	return value == UUID{}
+}
+
+func isZeroDigest(value [32]byte) bool {
+	return value == [32]byte{}
 }

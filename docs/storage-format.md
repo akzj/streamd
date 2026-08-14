@@ -663,6 +663,8 @@ V1 Flags：
 
 至少设置一个 Location Flag。路径是 UTF-8、相对于 streamd 数据根的规范路径，禁止绝对路径和 `..`。Object Location 是不含临时凭据的稳定对象标识；访问凭据不进入 Manifest。
 
+`file_size` 必须是完整 V1 Segment 的 4096 字节对齐长度，最小为 20480 字节。
+
 Reference 按 `segment_id` 字节升序编码，Manifest 的语义不依赖操作系统目录顺序。
 
 ### 7.4 Artifact Reference
@@ -672,7 +674,7 @@ Manifest 可以引用构成同一 Checkpoint 的其他文件：
 ```text
 ArtifactReference {
   entry_length       u32
-  artifact_type      u16   // TAIL_CATALOG, LOCATOR_SNAPSHOT, REGISTRY_SNAPSHOT
+  artifact_type      u16   // 1=TAIL_CATALOG, 2=LOCATOR_SNAPSHOT, 3=REGISTRY_SNAPSHOT
   format_version     u16
   flags              u32
   artifact_id        UUID
@@ -688,13 +690,15 @@ ArtifactReference {
 
 Artifact 是投影。缺失或损坏时允许从 Segment/WAL 重建，但声称“可安装 Snapshot”的 Manifest 必须包含并验证其声明的所有必需 Artifact。
 
+Artifact Reference 按 `(artifact_type, artifact_id)` 严格升序编码，同一键不允许重复。
+
 ### 7.5 Manifest Footer
 
 ```text
 ManifestFooter {
   magic             [8]byte = "MANENDV1"
   format_version    u16 = 1
-  footer_length     u16
+  footer_length     u16 = 88
   flags             u32
   file_id           UUID
   generation        u64
@@ -715,7 +719,7 @@ CURRENT 是指向唯一已发布 Manifest 的小型文件：
 CurrentPointer {
   magic                    [8]byte = "STRMCUR1"
   format_version           u16 = 1
-  length                   u16
+  length                   u16   // V1 为 80 + manifest_name_length
   flags                    u32
   generation               u64
   manifest_file_id         UUID
