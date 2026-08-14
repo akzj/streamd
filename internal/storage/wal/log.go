@@ -231,7 +231,14 @@ func (l *Log) Close() error {
 	l.file = nil
 	return err
 }
-func (l *Log) Scan() ScanResult { return l.scan }
+func (l *Log) Scan() ScanResult    { return l.scan }
+func (l *Log) NextEntryID() uint64 { return l.pointer.FirstEntryID + l.scan.EntryCount }
+func (l *Log) PreviousEntryCRC32C() uint32 {
+	if l.scan.EntryCount > 0 {
+		return l.scan.LastEntryCRC32C
+	}
+	return l.expectedPreviousCRC32C
+}
 func (l *Log) Replay(fn func(format.WALEntry) error) error {
 	pos := int64(format.WALFileHeaderLength)
 	for pos < l.scan.LastGoodOffset {
