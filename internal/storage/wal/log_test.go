@@ -152,7 +152,7 @@ func TestRotatePreservesEntryCRCChain(t *testing.T) {
 	if err != nil || len(files) != 2 {
 		t.Fatalf("files %v %v", files, err)
 	}
-	reopened, err := Open(root.Path())
+	reopened, err := OpenWithPrevious(root.Path(), firstEntry.CRC32C)
 	if err != nil {
 		t.Fatal(err)
 	}

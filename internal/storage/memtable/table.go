@@ -26,8 +26,9 @@ type recordRef struct {
 	recordedAt int64
 }
 type streamData struct {
-	tail    Tail
-	records []recordRef
+	tail         Tail
+	baseSequence uint64
+	records      []recordRef
 }
 type StreamSnapshot struct {
 	StreamID uint64
@@ -69,6 +70,7 @@ func (t *Table) ApplyBatch(entries []format.WALEntry) error {
 		stream = &streamData{}
 		t.streams[entries[0].StreamID] = stream
 	}
+	previousRecordCount := stream.tail.RecordCount
 	refs := make([]recordRef, 0, len(entries))
 	for _, entry := range entries {
 		chunk, start := t.appendFrame(entry.Frame)
@@ -76,7 +78,7 @@ func (t *Table) ApplyBatch(entries []format.WALEntry) error {
 	}
 	stream.records = append(stream.records, refs...)
 	last := entries[len(entries)-1]
-	stream.tail = Tail{NextSequence: last.Sequence + 1, NextByteOffset: last.ByteOffset + uint64(len(last.Frame)), LastRecordedAt: last.RecordedAt, LastEntryID: last.EntryID, RecordCount: uint64(len(stream.records))}
+	stream.tail = Tail{NextSequence: last.Sequence + 1, NextByteOffset: last.ByteOffset + uint64(len(last.Frame)), LastRecordedAt: last.RecordedAt, LastEntryID: last.EntryID, RecordCount: previousRecordCount + uint64(len(entries))}
 	t.records += uint64(len(entries))
 	return nil
 }
@@ -138,6 +140,18 @@ func (t *Table) Tail(streamID uint64) (Tail, bool) {
 	}
 	return s.tail, true
 }
+func (t *Table) SeedTail(streamID uint64, tail Tail) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.frozen {
+		return fmt.Errorf("MemTable is frozen")
+	}
+	if _, exists := t.streams[streamID]; exists {
+		return fmt.Errorf("Stream %d already exists", streamID)
+	}
+	t.streams[streamID] = &streamData{tail: tail, baseSequence: tail.NextSequence}
+	return nil
+}
 func (t *Table) Read(streamID, from uint64, maxRecords int) ([]format.RecordFrame, uint64, error) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
@@ -154,12 +168,16 @@ func (t *Table) Read(streamID, from uint64, maxRecords int) ([]format.RecordFram
 	if from == s.tail.NextSequence {
 		return nil, from, nil
 	}
+	if from < s.baseSequence {
+		return nil, from, fmt.Errorf("Sequence %d precedes active MemTable base %d", from, s.baseSequence)
+	}
 	if maxRecords <= 0 {
 		return nil, from, nil
 	}
-	end := min(uint64(len(s.records)), from+uint64(maxRecords))
-	out := make([]format.RecordFrame, 0, end-from)
-	for _, ref := range s.records[from:end] {
+	start := from - s.baseSequence
+	end := min(uint64(len(s.records)), start+uint64(maxRecords))
+	out := make([]format.RecordFrame, 0, end-start)
+	for _, ref := range s.records[start:end] {
 		frame := t.chunks[ref.chunk][ref.start : ref.start+ref.length]
 		record, err := format.UnmarshalRecordFrame(frame)
 		if err != nil {
@@ -167,7 +185,7 @@ func (t *Table) Read(streamID, from uint64, maxRecords int) ([]format.RecordFram
 		}
 		out = append(out, record)
 	}
-	return out, end, nil
+	return out, s.baseSequence + end, nil
 }
 func (t *Table) Freeze() { t.mu.Lock(); t.frozen = true; t.mu.Unlock() }
 func (t *Table) FreezeSnapshot() []StreamSnapshot {

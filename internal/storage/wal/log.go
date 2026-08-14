@@ -15,12 +15,13 @@ import (
 )
 
 type ScanResult struct {
-	Header          format.WALFileHeader
-	EntryCount      uint64
-	LastEntryID     uint64
-	LastEntryCRC32C uint32
-	LastGoodOffset  int64
-	TruncatedBytes  int64
+	Header                   format.WALFileHeader
+	EntryCount               uint64
+	LastEntryID              uint64
+	LastEntryCRC32C          uint32
+	LastGoodOffset           int64
+	TruncatedBytes           int64
+	FirstEntryPreviousCRC32C uint32
 }
 type Log struct {
 	root                   string
@@ -31,8 +32,11 @@ type Log struct {
 }
 
 func Create(root string, firstEntryID, term uint64, now time.Time) (*Log, error) {
-	if firstEntryID != 0 {
-		return nil, fmt.Errorf("initial WAL must start at Entry 0")
+	return CreateAfter(root, firstEntryID, term, 0, now)
+}
+func CreateAfter(root string, firstEntryID, term uint64, previousCRC32C uint32, now time.Time) (*Log, error) {
+	if firstEntryID == 0 && previousCRC32C != 0 {
+		return nil, fmt.Errorf("Entry 0 cannot have a previous CRC")
 	}
 	var id format.UUID
 	if _, err := rand.Read(id[:]); err != nil {
@@ -70,10 +74,13 @@ func Create(root string, firstEntryID, term uint64, now time.Time) (*Log, error)
 		return nil, err
 	}
 	ok = true
-	return &Log{root: root, file: f, pointer: pointer, scan: ScanResult{Header: header, LastGoodOffset: format.WALFileHeaderLength}}, nil
+	return &Log{root: root, file: f, pointer: pointer, scan: ScanResult{Header: header, LastGoodOffset: format.WALFileHeaderLength}, expectedPreviousCRC32C: previousCRC32C}, nil
 }
 
 func Open(root string) (*Log, error) {
+	return OpenWithPrevious(root, 0)
+}
+func OpenWithPrevious(root string, previousCRC32C uint32) (*Log, error) {
 	pb, err := os.ReadFile(filepath.Join(root, "WAL-CURRENT"))
 	if err != nil {
 		return nil, err
@@ -109,11 +116,14 @@ func Open(root string) (*Log, error) {
 		f.Close()
 		return nil, err
 	}
-	if scan.EntryCount == 0 && pointer.FirstEntryID != 0 {
-		f.Close()
-		return nil, fmt.Errorf("empty rotated WAL requires previous sealed WAL recovery")
+	if pointer.FirstEntryID == 0 {
+		previousCRC32C = 0
 	}
-	return &Log{root: root, file: f, pointer: pointer, scan: scan}, nil
+	if scan.EntryCount > 0 && scan.FirstEntryPreviousCRC32C != previousCRC32C {
+		f.Close()
+		return nil, fmt.Errorf("active WAL does not continue previous CRC")
+	}
+	return &Log{root: root, file: f, pointer: pointer, scan: scan, expectedPreviousCRC32C: previousCRC32C}, nil
 }
 
 func ScanActive(f *os.File) (ScanResult, error) {
@@ -162,6 +172,9 @@ func ScanActive(f *os.File) (ScanResult, error) {
 		entry, err := format.UnmarshalWALEntry(entryBytes)
 		if err != nil {
 			return result, fmt.Errorf("WAL entry at %d: %w", pos, err)
+		}
+		if result.EntryCount == 0 {
+			result.FirstEntryPreviousCRC32C = entry.PreviousEntryCRC32C
 		}
 		if entry.EntryID != next || (result.EntryCount > 0 && entry.PreviousEntryCRC32C != previous) {
 			return result, fmt.Errorf("WAL continuity failure at Entry %d", entry.EntryID)
@@ -219,6 +232,29 @@ func (l *Log) Close() error {
 	return err
 }
 func (l *Log) Scan() ScanResult { return l.scan }
+func (l *Log) Replay(fn func(format.WALEntry) error) error {
+	pos := int64(format.WALFileHeaderLength)
+	for pos < l.scan.LastGoodOffset {
+		head := make([]byte, format.WALEntryHeaderLength)
+		if _, err := l.file.ReadAt(head, pos); err != nil {
+			return err
+		}
+		length := int(binary.LittleEndian.Uint32(head[8:12]))
+		b := make([]byte, length)
+		if _, err := l.file.ReadAt(b, pos); err != nil {
+			return err
+		}
+		entry, err := format.UnmarshalWALEntry(b)
+		if err != nil {
+			return err
+		}
+		if err = fn(entry); err != nil {
+			return err
+		}
+		pos += int64(length)
+	}
+	return nil
+}
 func (l *Log) Seal() error {
 	if l == nil || l.file == nil {
 		return os.ErrClosed
