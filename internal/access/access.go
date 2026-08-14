@@ -22,9 +22,9 @@ const (
 )
 
 type Principal struct {
-	Tenant   string
-	Service  string
-	Instance string
+	Tenant   string `json:"tenant"`
+	Service  string `json:"service"`
+	Instance string `json:"instance,omitempty"`
 }
 
 func (p Principal) Validate() error {

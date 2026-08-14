@@ -64,6 +64,10 @@ func resourceExhausted(message string, required *uint64, requestID []byte) error
 	return streamdStatus(codes.ResourceExhausted, streamdv1.ErrorCode_ERROR_CODE_RESOURCE_EXHAUSTED, message, true, false, nil, required, requestID)
 }
 
+func unavailable(message string, requestID []byte) error {
+	return streamdStatus(codes.Unavailable, streamdv1.ErrorCode_ERROR_CODE_UNSPECIFIED, message, true, false, nil, nil, requestID)
+}
+
 func streamdStatus(grpcCode codes.Code, code streamdv1.ErrorCode, message string, retryable, uncertain bool, current, required *uint64, requestID []byte) error {
 	detail := &streamdv1.StreamdError{Code: code, Message: message, Retryable: retryable, ResultUncertain: uncertain, CurrentNextSequence: current, RequiredBytes: required}
 	if len(requestID) > 0 {

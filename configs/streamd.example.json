@@ -1,0 +1,42 @@
+{
+  "listen_address": "0.0.0.0:7443",
+  "admin_address": "127.0.0.1:9090",
+  "data_directory": "/var/lib/streamd",
+  "shutdown_timeout": "30s",
+  "subscribe_send_timeout": "30s",
+  "tls": {
+    "certificate_file": "/etc/streamd/tls/server.crt",
+    "private_key_file": "/etc/streamd/tls/server.key",
+    "client_ca_file": "/etc/streamd/tls/client-ca.crt"
+  },
+  "principals_by_uri": {
+    "spiffe://example.internal/workload/aegis": {
+      "tenant": "production",
+      "service": "aegis",
+      "instance": "api"
+    }
+  },
+  "authorization": [
+    {
+      "tenant": "production",
+      "service": "aegis",
+      "namespace": "agent",
+      "stream_prefix": "events/",
+      "operations": ["append", "read", "subscribe", "inspect"]
+    }
+  ],
+  "limits": {
+    "max_record_bytes": 16777216,
+    "max_batch_records": 1024,
+    "max_batch_bytes": 67108864,
+    "max_read_records": 10000,
+    "max_read_bytes": 67108864,
+    "max_subscribe_batch_records": 1000,
+    "max_subscribe_batch_bytes": 4194304,
+    "max_subscriptions_per_principal_namespace": 64,
+    "write_requests_per_second": 10000,
+    "write_request_burst": 10000,
+    "write_bytes_per_second": 268435456,
+    "write_byte_burst": 268435456
+  }
+}

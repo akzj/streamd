@@ -6,12 +6,12 @@ import (
 )
 
 type Rule struct {
-	Tenant       string
-	Service      string
-	Instance     string
-	Namespace    string
-	StreamPrefix string
-	Operations   []Operation
+	Tenant       string      `json:"tenant"`
+	Service      string      `json:"service"`
+	Instance     string      `json:"instance,omitempty"`
+	Namespace    string      `json:"namespace"`
+	StreamPrefix string      `json:"stream_prefix"`
+	Operations   []Operation `json:"operations"`
 }
 
 type StaticPolicy struct {

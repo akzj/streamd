@@ -124,6 +124,14 @@ alert thresholds
 
 ## 5. 启动与 Readiness
 
+V1 单节点进程使用 JSON 配置启动：
+
+```bash
+streamd -config /etc/streamd/streamd.json
+```
+
+配置结构见 [`configs/streamd.example.json`](../configs/streamd.example.json)。gRPC 监听强制 TLS 1.3 和已验证客户端证书；管理监听必须绑定 loopback，仅提供 `/livez`、`/readyz` 和 `/metrics`。配置文件中的 URI SAN 到 Principal 映射使用精确匹配，授权规则按 Namespace、Stream Prefix 和 Operation 判断。若配置 `otlp_trace_endpoint`，进程通过 TLS OTLP/gRPC 导出 Trace。
+
 状态：
 
 ```text

@@ -7,6 +7,7 @@ import (
 	"math"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	streamdv1 "github.com/akzj/streamd/api/streamd/v1"
@@ -38,6 +39,9 @@ type Server struct {
 	subs        map[subscriptionKey]uint32
 	rateMu      sync.Mutex
 	rateBuckets map[subscriptionKey]rateBucket
+	drainCtx    context.Context
+	drainCancel context.CancelFunc
+	draining    atomic.Bool
 }
 
 type Options struct {
@@ -46,18 +50,18 @@ type Options struct {
 }
 
 type Limits struct {
-	MaxRecordBytes                        uint64
-	MaxBatchRecords                       uint32
-	MaxBatchBytes                         uint64
-	MaxReadRecords                        uint32
-	MaxReadBytes                          uint64
-	MaxSubscribeBatchRecords              uint32
-	MaxSubscribeBatchBytes                uint64
-	MaxSubscriptionsPerPrincipalNamespace uint32
-	WriteRequestsPerSecond                uint32
-	WriteRequestBurst                     uint32
-	WriteBytesPerSecond                   uint64
-	WriteByteBurst                        uint64
+	MaxRecordBytes                        uint64 `json:"max_record_bytes"`
+	MaxBatchRecords                       uint32 `json:"max_batch_records"`
+	MaxBatchBytes                         uint64 `json:"max_batch_bytes"`
+	MaxReadRecords                        uint32 `json:"max_read_records"`
+	MaxReadBytes                          uint64 `json:"max_read_bytes"`
+	MaxSubscribeBatchRecords              uint32 `json:"max_subscribe_batch_records"`
+	MaxSubscribeBatchBytes                uint64 `json:"max_subscribe_batch_bytes"`
+	MaxSubscriptionsPerPrincipalNamespace uint32 `json:"max_subscriptions_per_principal_namespace"`
+	WriteRequestsPerSecond                uint32 `json:"write_requests_per_second"`
+	WriteRequestBurst                     uint32 `json:"write_request_burst"`
+	WriteBytesPerSecond                   uint64 `json:"write_bytes_per_second"`
+	WriteByteBurst                        uint64 `json:"write_byte_burst"`
 }
 
 type subscriptionKey struct {
@@ -89,7 +93,18 @@ func NewWithOptions(backend Backend, authorizer access.Authorizer, options Optio
 	if err != nil {
 		return nil, err
 	}
-	return &Server{backend: backend, authorizer: authorizer, sendTimeout: options.SubscribeSendTimeout, limits: limits, subs: make(map[subscriptionKey]uint32), rateBuckets: make(map[subscriptionKey]rateBucket)}, nil
+	drainCtx, drainCancel := context.WithCancel(context.Background())
+	return &Server{backend: backend, authorizer: authorizer, sendTimeout: options.SubscribeSendTimeout, limits: limits, subs: make(map[subscriptionKey]uint32), rateBuckets: make(map[subscriptionKey]rateBucket), drainCtx: drainCtx, drainCancel: drainCancel}, nil
+}
+
+func (s *Server) BeginDrain() {
+	if s.draining.CompareAndSwap(false, true) {
+		s.drainCancel()
+	}
+}
+
+func (s *Server) ReadyWrite() bool {
+	return !s.draining.Load() && s.backend.Health().Fatal == nil
 }
 
 func (s *Server) Append(ctx context.Context, request *streamdv1.AppendRequest) (*streamdv1.AppendResponse, error) {
@@ -132,6 +147,9 @@ func (s *Server) AppendBatch(ctx context.Context, request *streamdv1.AppendBatch
 }
 
 func (s *Server) append(ctx context.Context, ref *streamdv1.StreamRef, expected uint64, requestID []byte, records []*streamdv1.InputRecord, required streamdv1.Durability) (engine.AppendResult, error) {
+	if s.draining.Load() {
+		return engine.AppendResult{}, unavailable("server is draining", requestID)
+	}
 	if err := validateStream(ref); err != nil {
 		return engine.AppendResult{}, invalidArgument(err.Error(), requestID)
 	}
@@ -292,6 +310,10 @@ func (s *Server) Health(context.Context, *streamdv1.HealthRequest) (*streamdv1.H
 		response.Status = streamdv1.HealthStatus_HEALTH_STATUS_FAILED
 		response.Reasons = []string{"commit core failed"}
 	}
+	if s.draining.Load() && health.Fatal == nil {
+		response.Status = streamdv1.HealthStatus_HEALTH_STATUS_READY_READ
+		response.Reasons = []string{"server is draining"}
+	}
 	if health.Watermarks.HasLocalDurable {
 		response.LocalDurableEntryId = uint64ptr(health.Watermarks.LocalDurable)
 	}
@@ -358,6 +380,9 @@ func compareStrings(left, right string) int {
 var _ streamdv1.StreamServiceServer = (*Server)(nil)
 
 func (s *Server) Subscribe(request *streamdv1.SubscribeRequest, stream streamdv1.StreamService_SubscribeServer) error {
+	if s.draining.Load() {
+		return unavailable("server is draining", nil)
+	}
 	if request == nil {
 		return invalidArgument("Subscribe request is required", nil)
 	}
@@ -384,6 +409,9 @@ func (s *Server) Subscribe(request *streamdv1.SubscribeRequest, stream streamdv1
 	cursor := request.FromSequence
 	heartbeat := request.HeartbeatInterval.AsDuration()
 	for {
+		if s.draining.Load() {
+			return unavailable("server is draining", nil)
+		}
 		response, err := s.read(request.Stream, cursor, request.MaxBatchRecords, request.MaxBatchBytes)
 		if err != nil {
 			return err
@@ -397,8 +425,13 @@ func (s *Server) Subscribe(request *streamdv1.SubscribeRequest, stream streamdv1
 		}
 
 		waitCtx, cancel := context.WithTimeout(stream.Context(), heartbeat)
+		stopDrain := context.AfterFunc(s.drainCtx, cancel)
 		err = s.backend.WaitForAppend(waitCtx, request.Stream.Namespace, request.Stream.Stream, cursor)
+		stopDrain()
 		cancel()
+		if s.draining.Load() {
+			return unavailable("server is draining", nil)
+		}
 		if errors.Is(err, context.DeadlineExceeded) && stream.Context().Err() == nil {
 			if err = s.send(stream, &streamdv1.SubscribeResponse{NextSequence: cursor, CurrentNextSequence: response.CurrentNextSequence, Heartbeat: true}); err != nil {
 				return err
@@ -529,6 +562,8 @@ func (s *Server) send(stream streamdv1.StreamService_SubscribeServer, response *
 		return err
 	case <-stream.Context().Done():
 		return mapError(stream.Context().Err(), nil)
+	case <-s.drainCtx.Done():
+		return unavailable("server is draining", nil)
 	case <-timer.C:
 		return streamdStatus(codes.ResourceExhausted, streamdv1.ErrorCode_ERROR_CODE_SLOW_CONSUMER, "Subscribe consumer is too slow", true, false, nil, nil, nil)
 	}

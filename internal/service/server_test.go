@@ -175,6 +175,25 @@ func TestAuthorizationAndWriteLimits(t *testing.T) {
 	}
 }
 
+func TestDrainRejectsWritesAndReportsReadOnly(t *testing.T) {
+	store, err := engine.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	server, err := New(store, allow(access.Principal{Tenant: "test", Service: "client"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.BeginDrain()
+	_, err = server.Append(context.Background(), &streamdv1.AppendRequest{Stream: &streamdv1.StreamRef{Namespace: "n", Stream: "s"}, RequestId: []byte("r"), Record: &streamdv1.InputRecord{}})
+	assertError(t, err, codes.Unavailable, streamdv1.ErrorCode_ERROR_CODE_UNSPECIFIED, false)
+	health, err := server.Health(context.Background(), &streamdv1.HealthRequest{})
+	if err != nil || health.Status != streamdv1.HealthStatus_HEALTH_STATUS_READY_READ {
+		t.Fatalf("draining Health = %+v, %v", health, err)
+	}
+}
+
 func allow(principal access.Principal) access.Authorizer {
 	return access.AuthorizeFunc(func(context.Context, string, string, access.Operation) (access.Principal, error) {
 		return principal, nil
