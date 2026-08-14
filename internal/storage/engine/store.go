@@ -48,13 +48,20 @@ type Health struct {
 	Watermarks commit.Watermarks
 	Fatal      error
 }
+type streamKey struct {
+	namespace string
+	stream    string
+}
 type Store struct {
-	mu        sync.Mutex
-	root      *fsutil.Root
-	state     *recovery.Result
-	committer *commit.Committer
-	reader    *readstore.Store
-	now       func() time.Time
+	mu            sync.Mutex
+	notifyMu      sync.Mutex
+	root          *fsutil.Root
+	state         *recovery.Result
+	committer     *commit.Committer
+	reader        *readstore.Store
+	now           func() time.Time
+	notifications map[streamKey]chan struct{}
+	closed        bool
 }
 
 func (s *Store) Read(namespace, name string, from uint64, maxRecords int, maxBytes uint64) (readstore.Result, error) {
@@ -92,11 +99,12 @@ func Open(path string) (*Store, error) {
 		root.Close()
 		return nil, err
 	}
-	return &Store{root: root, state: state, committer: commit.New(state.WAL, state.MemTable), reader: readstore.New(state.MemTable, state.Segments, 1024), now: time.Now}, nil
+	return &Store{root: root, state: state, committer: commit.New(state.WAL, state.MemTable), reader: readstore.New(state.MemTable, state.Segments, 1024), now: time.Now, notifications: make(map[streamKey]chan struct{})}, nil
 }
 func (s *Store) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.closeNotifications()
 	return errors.Join(s.state.Close(), s.root.Close())
 }
 func (s *Store) Append(ctx context.Context, request AppendRequest) (AppendResult, error) {
@@ -175,9 +183,70 @@ func (s *Store) Append(ctx context.Context, request AppendRequest) (AppendResult
 	}
 	commitResult, err := s.committer.Commit(ctx, encoded)
 	if err != nil {
+		watermarks := s.committer.Watermarks()
+		if watermarks.HasApplied && watermarks.Applied >= commitResult.LastEntryID && commitResult.RecordCount > 0 {
+			s.signal(request.Namespace, request.Stream)
+		}
 		return AppendResult{}, &errdefs.WriteError{Err: err, ResultUncertain: commitResult.ResultUncertain}
 	}
+	s.signal(request.Namespace, request.Stream)
 	return AppendResult{FirstSequence: sequence, NextSequence: sequence + uint64(len(encoded)), RecordCount: uint32(len(encoded)), FirstRecordedAt: firstTime, LastRecordedAt: recordedAt, FirstEntryID: commitResult.FirstEntryID, LastEntryID: commitResult.LastEntryID}, nil
+}
+
+func (s *Store) WaitForAppend(ctx context.Context, namespace, name string, after uint64) error {
+	key := streamKey{namespace: namespace, stream: name}
+	s.notifyMu.Lock()
+	if s.closed {
+		s.notifyMu.Unlock()
+		return errdefs.ErrClosed
+	}
+	ch := s.notifications[key]
+	if ch == nil {
+		ch = make(chan struct{})
+		s.notifications[key] = ch
+	}
+	info, err := s.Inspect(namespace, name)
+	if err != nil || (info.Exists && info.NextSequence > after) {
+		s.notifyMu.Unlock()
+		return err
+	}
+	s.notifyMu.Unlock()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-ch:
+		s.notifyMu.Lock()
+		closed := s.closed
+		s.notifyMu.Unlock()
+		if closed {
+			return errdefs.ErrClosed
+		}
+		return nil
+	}
+}
+
+func (s *Store) signal(namespace, name string) {
+	key := streamKey{namespace: namespace, stream: name}
+	s.notifyMu.Lock()
+	if !s.closed {
+		if ch := s.notifications[key]; ch != nil {
+			close(ch)
+		}
+		s.notifications[key] = make(chan struct{})
+	}
+	s.notifyMu.Unlock()
+}
+
+func (s *Store) closeNotifications() {
+	s.notifyMu.Lock()
+	if !s.closed {
+		s.closed = true
+		for key, ch := range s.notifications {
+			close(ch)
+			delete(s.notifications, key)
+		}
+	}
+	s.notifyMu.Unlock()
 }
 func (s *Store) commitRegistry(ctx context.Context, proposal format.RegistryRecord, payload []byte) error {
 	tail, ok := s.state.MemTable.Tail(registry.RegistryStreamID)

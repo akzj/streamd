@@ -37,6 +37,9 @@ func mapError(err error, requestID []byte) error {
 	if errors.As(err, &tooLarge) {
 		return recordTooLarge(tooLarge.Sequence, tooLarge.RequiredBytes)
 	}
+	if errors.Is(err, errdefs.ErrClosed) {
+		return streamdStatus(codes.Unavailable, streamdv1.ErrorCode_ERROR_CODE_UNSPECIFIED, "store is shutting down", true, false, nil, nil, requestID)
+	}
 	if write != nil {
 		return streamdStatus(codes.DataLoss, streamdv1.ErrorCode_ERROR_CODE_DATA_LOSS, "durable write failed", false, write.ResultUncertain, nil, nil, requestID)
 	}

@@ -12,6 +12,7 @@ var (
 	ErrSequenceAhead    = errors.New("sequence ahead")
 	ErrSequenceConflict = errors.New("sequence conflict")
 	ErrRecordTooLarge   = errors.New("record too large")
+	ErrClosed           = errors.New("store closed")
 )
 
 type SequenceAheadError struct {

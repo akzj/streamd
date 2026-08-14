@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"time"
@@ -11,7 +12,6 @@ import (
 	"github.com/akzj/streamd/internal/storage/format"
 	readstore "github.com/akzj/streamd/internal/storage/read"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
@@ -22,6 +22,7 @@ type Backend interface {
 	Inspect(namespace, stream string) (readstore.StreamInfo, error)
 	ResolveTime(namespace, stream string, target int64, mode readstore.TimeMode) (uint64, int64, bool, error)
 	Health() engine.Health
+	WaitForAppend(context.Context, string, string, uint64) error
 }
 
 type ProducerResolver func(context.Context) (string, error)
@@ -30,13 +31,28 @@ type Server struct {
 	streamdv1.UnimplementedStreamServiceServer
 	backend         Backend
 	resolveProducer ProducerResolver
+	sendTimeout     time.Duration
+}
+
+type Options struct {
+	SubscribeSendTimeout time.Duration
 }
 
 func New(backend Backend, resolveProducer ProducerResolver) (*Server, error) {
+	return NewWithOptions(backend, resolveProducer, Options{})
+}
+
+func NewWithOptions(backend Backend, resolveProducer ProducerResolver, options Options) (*Server, error) {
 	if backend == nil || resolveProducer == nil {
 		return nil, fmt.Errorf("backend and Producer resolver are required")
 	}
-	return &Server{backend: backend, resolveProducer: resolveProducer}, nil
+	if options.SubscribeSendTimeout < 0 {
+		return nil, fmt.Errorf("Subscribe Send timeout cannot be negative")
+	}
+	if options.SubscribeSendTimeout == 0 {
+		options.SubscribeSendTimeout = 30 * time.Second
+	}
+	return &Server{backend: backend, resolveProducer: resolveProducer, sendTimeout: options.SubscribeSendTimeout}, nil
 }
 
 func (s *Server) Append(ctx context.Context, request *streamdv1.AppendRequest) (*streamdv1.AppendResponse, error) {
@@ -119,18 +135,22 @@ func (s *Server) Read(_ context.Context, request *streamdv1.ReadRequest) (*strea
 	if request.MaxRecords == 0 || request.MaxBytes == 0 {
 		return nil, invalidArgument("max_records and max_bytes must be greater than zero", nil)
 	}
-	result, err := s.backend.Read(request.Stream.Namespace, request.Stream.Stream, request.FromSequence, int(request.MaxRecords), 0)
+	return s.read(request.Stream, request.FromSequence, request.MaxRecords, request.MaxBytes)
+}
+
+func (s *Server) read(ref *streamdv1.StreamRef, from uint64, maxRecords uint32, maxBytes uint64) (*streamdv1.ReadResponse, error) {
+	result, err := s.backend.Read(ref.Namespace, ref.Stream, from, int(maxRecords), 0)
 	if err != nil {
 		return nil, mapError(err, nil)
 	}
-	response := &streamdv1.ReadResponse{NextSequence: request.FromSequence, CurrentNextSequence: result.CurrentNextSequence}
+	response := &streamdv1.ReadResponse{NextSequence: from, CurrentNextSequence: result.CurrentNextSequence}
 	for _, record := range result.Records {
 		stored := storedRecord(record)
 		candidate := proto.Clone(response).(*streamdv1.ReadResponse)
 		candidate.Records = append(candidate.Records, stored)
 		candidate.NextSequence = record.Sequence + 1
 		required := uint64(proto.Size(candidate))
-		if required > request.MaxBytes {
+		if required > maxBytes {
 			if len(response.Records) == 0 {
 				return nil, recordTooLarge(record.Sequence, required)
 			}
@@ -253,8 +273,60 @@ func compareStrings(left, right string) int {
 
 var _ streamdv1.StreamServiceServer = (*Server)(nil)
 
-// Subscribe is implemented by the subscription module so its notification and
-// backpressure lifecycle cannot accidentally be approximated by polling here.
-func (s *Server) Subscribe(*streamdv1.SubscribeRequest, streamdv1.StreamService_SubscribeServer) error {
-	return status.Error(codes.Unimplemented, "Subscribe is not enabled")
+func (s *Server) Subscribe(request *streamdv1.SubscribeRequest, stream streamdv1.StreamService_SubscribeServer) error {
+	if request == nil {
+		return invalidArgument("Subscribe request is required", nil)
+	}
+	if err := validateStream(request.Stream); err != nil {
+		return invalidArgument(err.Error(), nil)
+	}
+	if request.MaxBatchRecords == 0 || request.MaxBatchBytes == 0 || request.HeartbeatInterval == nil {
+		return invalidArgument("Subscribe limits and heartbeat_interval are required", nil)
+	}
+	if err := request.HeartbeatInterval.CheckValid(); err != nil || request.HeartbeatInterval.AsDuration() <= 0 {
+		return invalidArgument("heartbeat_interval must be positive", nil)
+	}
+	cursor := request.FromSequence
+	heartbeat := request.HeartbeatInterval.AsDuration()
+	for {
+		response, err := s.read(request.Stream, cursor, request.MaxBatchRecords, request.MaxBatchBytes)
+		if err != nil {
+			return err
+		}
+		if len(response.Records) > 0 {
+			if err = s.send(stream, &streamdv1.SubscribeResponse{Records: response.Records, NextSequence: response.NextSequence, CurrentNextSequence: response.CurrentNextSequence}); err != nil {
+				return err
+			}
+			cursor = response.NextSequence
+			continue
+		}
+
+		waitCtx, cancel := context.WithTimeout(stream.Context(), heartbeat)
+		err = s.backend.WaitForAppend(waitCtx, request.Stream.Namespace, request.Stream.Stream, cursor)
+		cancel()
+		if errors.Is(err, context.DeadlineExceeded) && stream.Context().Err() == nil {
+			if err = s.send(stream, &streamdv1.SubscribeResponse{NextSequence: cursor, CurrentNextSequence: response.CurrentNextSequence, Heartbeat: true}); err != nil {
+				return err
+			}
+			continue
+		}
+		if err != nil {
+			return mapError(err, nil)
+		}
+	}
+}
+
+func (s *Server) send(stream streamdv1.StreamService_SubscribeServer, response *streamdv1.SubscribeResponse) error {
+	done := make(chan error, 1)
+	go func() { done <- stream.Send(response) }()
+	timer := time.NewTimer(s.sendTimeout)
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		return err
+	case <-stream.Context().Done():
+		return mapError(stream.Context().Err(), nil)
+	case <-timer.C:
+		return streamdStatus(codes.ResourceExhausted, streamdv1.ErrorCode_ERROR_CODE_SLOW_CONSUMER, "Subscribe consumer is too slow", true, false, nil, nil, nil)
+	}
 }

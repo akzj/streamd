@@ -2,8 +2,11 @@ package engine
 
 import (
 	"context"
+	"errors"
+	"github.com/akzj/streamd/internal/storage/errdefs"
 	"github.com/akzj/streamd/internal/storage/format"
 	"testing"
+	"time"
 )
 
 func TestAppendBatchDeduplicateAndRestart(t *testing.T) {
@@ -54,6 +57,53 @@ func TestAppendBatchDeduplicateAndRestart(t *testing.T) {
 	result, err = store.Append(context.Background(), next)
 	if err != nil || result.FirstSequence != 2 {
 		t.Fatalf("restart append %+v %v", result, err)
+	}
+}
+
+func TestWaitForAppendDoesNotLoseNotifications(t *testing.T) {
+	store, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	woke := make(chan error, 1)
+	go func() { woke <- store.WaitForAppend(context.Background(), "n", "s", 0) }()
+	request := AppendRequest{Namespace: "n", Stream: "s", RequestID: []byte("r"), Producer: "test", Records: []InputRecord{{Payload: []byte("record")}}}
+	if _, err = store.Append(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err = <-woke:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("WaitForAppend did not observe committed Append")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err = store.WaitForAppend(ctx, "n", "s", 0); err != nil {
+		t.Fatalf("already-visible Append was missed: %v", err)
+	}
+}
+
+func TestCloseUnblocksAppendWaiters(t *testing.T) {
+	store, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	woke := make(chan error, 1)
+	go func() { woke <- store.WaitForAppend(context.Background(), "n", "s", 0) }()
+	if err = store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err = <-woke:
+		if !errors.Is(err, errdefs.ErrClosed) {
+			t.Fatalf("wait error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close did not unblock WaitForAppend")
 	}
 }
 func TestRequestHashCanonicalHeaderOrder(t *testing.T) {
