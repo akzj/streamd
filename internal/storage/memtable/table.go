@@ -140,6 +140,15 @@ func (t *Table) Tail(streamID uint64) (Tail, bool) {
 	}
 	return s.tail, true
 }
+func (t *Table) ActiveRange(streamID uint64) (base, next uint64, ok bool) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	s, ok := t.streams[streamID]
+	if !ok {
+		return 0, 0, false
+	}
+	return s.baseSequence, s.tail.NextSequence, true
+}
 func (t *Table) SeedTail(streamID uint64, tail Tail) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
