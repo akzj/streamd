@@ -4,13 +4,71 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"fmt"
+	"strings"
+	"unicode/utf8"
 )
 
 var (
-	walFileMagic  = [8]byte{'S', 'T', 'R', 'M', 'W', 'A', 'L', '1'}
-	walEntryMagic = [4]byte{'S', 'W', 'E', '1'}
-	walSealMagic  = [8]byte{'W', 'A', 'L', 'S', 'E', 'A', 'L', '1'}
+	walFileMagic    = [8]byte{'S', 'T', 'R', 'M', 'W', 'A', 'L', '1'}
+	walEntryMagic   = [4]byte{'S', 'W', 'E', '1'}
+	walSealMagic    = [8]byte{'W', 'A', 'L', 'S', 'E', 'A', 'L', '1'}
+	walCurrentMagic = [8]byte{'W', 'A', 'L', 'C', 'U', 'R', 'V', '1'}
 )
+
+type WALCurrentPointer struct {
+	FileID       UUID
+	FirstEntryID uint64
+	FileName     string
+}
+
+func MarshalWALCurrentPointer(p WALCurrentPointer) ([]byte, error) {
+	if isZeroUUID(p.FileID) || p.FileName == "" || !utf8.ValidString(p.FileName) || strings.ContainsRune(p.FileName, 0) || strings.ContainsAny(p.FileName, "/\\") || p.FileName == "." || p.FileName == ".." {
+		return nil, invalidf("WAL-CURRENT identity or name is invalid")
+	}
+	n := 48 + len(p.FileName)
+	if n > int(^uint16(0)) || len(p.FileName) > int(^uint16(0)) {
+		return nil, fmtTooLarge("WAL-CURRENT", n, ^uint16(0))
+	}
+	b := make([]byte, n)
+	copy(b[:8], walCurrentMagic[:])
+	putU16(b[8:10], VersionV1)
+	putU16(b[10:12], uint16(n))
+	copy(b[16:32], p.FileID[:])
+	putU64(b[32:40], p.FirstEntryID)
+	putU16(b[40:42], uint16(len(p.FileName)))
+	copy(b[44:], p.FileName)
+	putU32(b[n-4:], checksum(b[:n-4]))
+	return b, nil
+}
+func UnmarshalWALCurrentPointer(b []byte) (WALCurrentPointer, error) {
+	var p WALCurrentPointer
+	if len(b) < 48 {
+		return p, truncatedf("WAL-CURRENT is truncated")
+	}
+	if !bytes.Equal(b[:8], walCurrentMagic[:]) {
+		return p, invalidf("WAL-CURRENT magic is invalid")
+	}
+	if v := getU16(b[8:10]); v != VersionV1 {
+		return p, unsupportedVersion("WAL-CURRENT", v)
+	}
+	nameLen := int(getU16(b[40:42]))
+	if int(getU16(b[10:12])) != len(b) || len(b) != 48+nameLen || getU32(b[12:16]) != 0 {
+		return p, invalidf("WAL-CURRENT length or flags are invalid")
+	}
+	if err := expectZero(b[42:44], "WAL-CURRENT reserved"); err != nil {
+		return p, err
+	}
+	if stored, actual := getU32(b[len(b)-4:]), checksum(b[:len(b)-4]); stored != actual {
+		return p, checksumf("WAL-CURRENT CRC mismatch")
+	}
+	copy(p.FileID[:], b[16:32])
+	p.FirstEntryID = getU64(b[32:40])
+	p.FileName = string(bytes.Clone(b[44 : len(b)-4]))
+	if _, err := MarshalWALCurrentPointer(p); err != nil {
+		return WALCurrentPointer{}, err
+	}
+	return p, nil
+}
 
 const (
 	walEntryCRCSize       = 4
@@ -74,6 +132,9 @@ func UnmarshalWALFileHeader(encoded []byte) (WALFileHeader, error) {
 	header.FirstEntryID = getU64(encoded[32:40])
 	header.CreatedTerm = getU64(encoded[40:48])
 	header.CreatedAt = getI64(encoded[48:56])
+	if isZeroUUID(header.FileID) {
+		return WALFileHeader{}, invalidf("WAL file ID is zero")
+	}
 	return header, nil
 }
 
