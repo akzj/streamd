@@ -17,6 +17,7 @@ import (
 	"github.com/akzj/streamd/internal/storage/errdefs"
 	"github.com/akzj/streamd/internal/storage/format"
 	"github.com/akzj/streamd/internal/storage/fsutil"
+	"github.com/akzj/streamd/internal/storage/identity"
 	"github.com/akzj/streamd/internal/storage/lifecycle"
 	"github.com/akzj/streamd/internal/storage/memtable"
 	readstore "github.com/akzj/streamd/internal/storage/read"
@@ -102,9 +103,23 @@ func (s *Store) Health() Health {
 }
 
 func Open(path string) (*Store, error) {
+	return open(path, nil)
+}
+
+func OpenWithIdentity(path string, node format.NodeIdentity) (*Store, error) {
+	return open(path, &node)
+}
+
+func open(path string, node *format.NodeIdentity) (*Store, error) {
 	root, err := fsutil.OpenRoot(path)
 	if err != nil {
 		return nil, err
+	}
+	if node != nil {
+		if _, err = identity.Ensure(root.Path(), *node); err != nil {
+			root.Close()
+			return nil, err
+		}
 	}
 	state, err := recovery.Open(root.Path())
 	if err != nil {

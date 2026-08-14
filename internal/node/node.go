@@ -31,7 +31,8 @@ func Run(ctx context.Context, config Config, logger *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("load mTLS credentials: %w", err)
 	}
-	store, err := engine.Open(config.DataDirectory)
+	nodeIdentity, _ := config.nodeIdentity()
+	store, err := engine.OpenWithIdentity(config.DataDirectory, nodeIdentity)
 	if err != nil {
 		return fmt.Errorf("open storage engine: %w", err)
 	}

@@ -163,6 +163,7 @@ type Reader struct {
 	file        *os.File
 	Header      format.SegmentHeader
 	Directories []format.StreamDirectoryEntry
+	Footer      format.SegmentFooter
 }
 
 func Open(path string) (*Reader, error) {
@@ -199,7 +200,7 @@ func Open(path string) (*Reader, error) {
 			return fail(fmt.Errorf("Segment Footer padding is not zero"))
 		}
 	}
-	if footer.SegmentID != header.SegmentID || footer.FileLength != uint64(info.Size()) || footer.RecordCount != header.RecordCount || footer.StreamCount != header.StreamCount {
+	if footer.SegmentID != header.SegmentID || footer.FileLength != uint64(info.Size()) || footer.ContentLength != header.FooterOffset || footer.RecordCount != header.RecordCount || footer.StreamCount != header.StreamCount {
 		return fail(fmt.Errorf("Segment Footer does not match Header"))
 	}
 	dirs := make([]format.StreamDirectoryEntry, header.StreamCount)
@@ -216,7 +217,7 @@ func Open(path string) (*Reader, error) {
 	if err = format.ValidateSegmentLayout(header, dirs); err != nil {
 		return fail(err)
 	}
-	return &Reader{file: f, Header: header, Directories: dirs}, nil
+	return &Reader{file: f, Header: header, Directories: dirs, Footer: footer}, nil
 }
 func (r *Reader) Close() error { return r.file.Close() }
 func (r *Reader) Read(streamID, sequence uint64) (format.RecordFrame, error) {
@@ -264,4 +265,34 @@ func (r *Reader) ReadFrame(streamID, sequence uint64) ([]byte, error) {
 		return nil, fmt.Errorf("Segment Index does not match Frame")
 	}
 	return frame, nil
+}
+
+func ScrubFile(path string) (Metadata, error) {
+	reader, err := Open(path)
+	if err != nil {
+		return Metadata{}, err
+	}
+	defer reader.Close()
+	hash := sha256.New()
+	if _, err = io.CopyN(hash, io.NewSectionReader(reader.file, 0, int64(reader.Footer.ContentLength)), int64(reader.Footer.ContentLength)); err != nil {
+		return Metadata{}, err
+	}
+	var digest [sha256.Size]byte
+	copy(digest[:], hash.Sum(nil))
+	if digest != reader.Footer.ContentSHA256 {
+		return Metadata{}, fmt.Errorf("Segment content SHA-256 mismatch")
+	}
+	var records uint64
+	for _, directory := range reader.Directories {
+		for sequence := directory.FirstSequence; sequence < directory.FirstSequence+directory.RecordCount; sequence++ {
+			if _, err = reader.ReadFrame(directory.StreamID, sequence); err != nil {
+				return Metadata{}, err
+			}
+			records++
+		}
+	}
+	if records != reader.Header.RecordCount {
+		return Metadata{}, fmt.Errorf("Segment scrub Record count mismatch")
+	}
+	return Metadata{Header: reader.Header, Directories: slices.Clone(reader.Directories), Footer: reader.Footer}, nil
 }

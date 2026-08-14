@@ -48,6 +48,31 @@ func OpenRoot(path string) (*Root, error) {
 	}
 	return &Root{path: abs, lock: lock}, nil
 }
+
+// LockExistingRoot acquires the data-root lock without creating directories or
+// synchronizing metadata. It is intended for read-only offline verification.
+func LockExistingRoot(path string) (*Root, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return nil, err
+	}
+	info, err := os.Stat(abs)
+	if err != nil {
+		return nil, err
+	}
+	if !info.IsDir() {
+		return nil, fmt.Errorf("data root is not a directory: %s", abs)
+	}
+	lock, err := os.OpenFile(filepath.Join(abs, "LOCK"), os.O_RDWR, 0)
+	if err != nil {
+		return nil, err
+	}
+	if err = syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		lock.Close()
+		return nil, fmt.Errorf("%w: %s", ErrLocked, abs)
+	}
+	return &Root{path: abs, lock: lock}, nil
+}
 func (r *Root) Path() string { return r.path }
 func (r *Root) Close() error {
 	if r == nil || r.lock == nil {

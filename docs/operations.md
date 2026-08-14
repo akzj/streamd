@@ -240,6 +240,16 @@ FAILED
 
 ## 9. 备份与 Snapshot
 
+单节点 V1 提供离线工具：
+
+```bash
+streamd-tool scrub -data /var/lib/streamd
+streamd-tool snapshot -data /var/lib/streamd -out /backup/streamd-snapshot-001
+streamd-tool verify-snapshot -path /backup/streamd-snapshot-001
+```
+
+三个命令都会失败关闭。`scrub` 需要取得数据目录独占锁并逐 Frame、Segment SHA-256、Manifest 引用、Stream Extent 和 WAL 链校验；`snapshot` 同样要求节点离线，先完成 Checkpoint，再原子发布包含 CURRENT、Manifest、全部 Segment 和 Snapshot Manifest 的新目录。目标目录不得位于数据根内部且必须尚不存在。
+
 ### 9.1 策略
 
 - 周期生成完整可安装 Snapshot；

@@ -92,6 +92,7 @@ func ScanSealed(path string, fn func(format.WALEntry) error) (ScanResult, error)
 		result.EntryCount++
 		result.LastEntryID = entry.EntryID
 		result.LastEntryCRC32C = entry.CRC32C
+		next++
 		pos += int64(length)
 	}
 	result.LastGoodOffset = pos

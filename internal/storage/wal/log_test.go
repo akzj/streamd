@@ -161,3 +161,51 @@ func TestRotatePreservesEntryCRCChain(t *testing.T) {
 		t.Fatalf("scan %+v", reopened.Scan())
 	}
 }
+
+func TestScanSealedAcceptsMultipleContinuousEntries(t *testing.T) {
+	root, err := fsutil.OpenRoot(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	log, err := Create(root.Path(), 0, 0, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash := sha256.Sum256([]byte("batch"))
+	previous := uint32(0)
+	entries := make([][]byte, 0, 2)
+	for i := 0; i < 2; i++ {
+		frame, frameErr := format.MarshalRecordFrame(format.RecordFrame{EntryID: uint64(i), StreamID: 1, Sequence: uint64(i), RecordedAt: int64(i), BatchIndex: uint32(i), BatchCount: 2, RequestHash: hash, Producer: "p"})
+		if frameErr != nil {
+			t.Fatal(frameErr)
+		}
+		entry, entryErr := format.MarshalWALEntry(0, previous, frame)
+		if entryErr != nil {
+			t.Fatal(entryErr)
+		}
+		decoded, decodeErr := format.UnmarshalWALEntry(entry)
+		if decodeErr != nil {
+			t.Fatal(decodeErr)
+		}
+		previous = decoded.CRC32C
+		entries = append(entries, entry)
+	}
+	if err = log.Append(entries...); err != nil {
+		t.Fatal(err)
+	}
+	if err = log.Seal(); err != nil {
+		t.Fatal(err)
+	}
+	if err = log.Close(); err != nil {
+		t.Fatal(err)
+	}
+	paths, err := filepath.Glob(filepath.Join(root.Path(), "wal", "*.log"))
+	if err != nil || len(paths) != 1 {
+		t.Fatalf("paths = %v, error = %v", paths, err)
+	}
+	scan, err := ScanSealed(paths[0], nil)
+	if err != nil || scan.EntryCount != 2 || scan.LastEntryID != 1 {
+		t.Fatalf("scan = %+v, error = %v", scan, err)
+	}
+}

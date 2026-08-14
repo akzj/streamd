@@ -3,16 +3,19 @@ package node
 import (
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"net/url"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/akzj/streamd/internal/access"
 	"github.com/akzj/streamd/internal/service"
+	"github.com/akzj/streamd/internal/storage/format"
 	"google.golang.org/grpc/credentials"
 )
 
@@ -20,6 +23,9 @@ type Config struct {
 	ListenAddress        string                      `json:"listen_address"`
 	AdminAddress         string                      `json:"admin_address"`
 	DataDirectory        string                      `json:"data_directory"`
+	ClusterID            string                      `json:"cluster_id"`
+	GroupID              string                      `json:"group_id"`
+	NodeID               string                      `json:"node_id"`
 	ShutdownTimeout      string                      `json:"shutdown_timeout"`
 	SubscribeSendTimeout string                      `json:"subscribe_send_timeout"`
 	CheckpointInterval   string                      `json:"checkpoint_interval"`
@@ -67,6 +73,9 @@ func LoadConfig(path string) (Config, error) {
 func (c Config) Validate() error {
 	if c.ListenAddress == "" || c.AdminAddress == "" || c.DataDirectory == "" {
 		return fmt.Errorf("listen_address, admin_address, and data_directory are required")
+	}
+	if _, err := c.nodeIdentity(); err != nil {
+		return err
 	}
 	if c.ListenAddress == c.AdminAddress {
 		return fmt.Errorf("gRPC and admin addresses must differ")
@@ -117,6 +126,40 @@ func (c Config) Validate() error {
 		return err
 	}
 	return nil
+}
+
+func (c Config) nodeIdentity() (format.NodeIdentity, error) {
+	cluster, err := parseUUID(c.ClusterID)
+	if err != nil {
+		return format.NodeIdentity{}, fmt.Errorf("cluster_id: %w", err)
+	}
+	group, err := parseUUID(c.GroupID)
+	if err != nil {
+		return format.NodeIdentity{}, fmt.Errorf("group_id: %w", err)
+	}
+	node, err := parseUUID(c.NodeID)
+	if err != nil {
+		return format.NodeIdentity{}, fmt.Errorf("node_id: %w", err)
+	}
+	identity := format.NodeIdentity{ClusterID: cluster, GroupID: group, NodeID: node, CreatedAt: time.Now().UnixNano()}
+	if _, err = format.MarshalNodeIdentity(identity); err != nil {
+		return format.NodeIdentity{}, err
+	}
+	return identity, nil
+}
+
+func parseUUID(value string) (format.UUID, error) {
+	var id format.UUID
+	compact := strings.ReplaceAll(value, "-", "")
+	if len(compact) != 32 {
+		return id, fmt.Errorf("must contain 32 hexadecimal digits")
+	}
+	decoded, err := hex.DecodeString(compact)
+	if err != nil {
+		return id, fmt.Errorf("must be hexadecimal")
+	}
+	copy(id[:], decoded)
+	return id, nil
 }
 
 func (c Config) checkpointDuration() (time.Duration, error) {
