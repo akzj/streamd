@@ -24,14 +24,27 @@ const (
 	WALEntryHeaderLength = 96
 	WALSealFooterLength  = 96
 
-	SegmentSectionAlignment    = 4096
-	SegmentHeaderLength        = 160
-	StreamDirectoryEntryLength = 112
-	DenseIndexEntryLength      = 24
-	SegmentFooterLength        = 104
-	SegmentFooterSectionLength = 4096
-	ManifestHeaderLength       = 136
-	ManifestFooterLength       = 88
+	SegmentSectionAlignment      = 4096
+	SegmentHeaderLength          = 160
+	StreamDirectoryEntryLength   = 112
+	DenseIndexEntryLength        = 24
+	SegmentFooterLength          = 104
+	SegmentFooterSectionLength   = 4096
+	ManifestHeaderLength         = 136
+	ManifestFooterLength         = 88
+	ArtifactFooterLength         = 88
+	TailCatalogHeaderLength      = 72
+	TailSlotLength               = 128
+	LocatorPackHeaderLength      = 72
+	LocatorPageLength            = 64 << 10
+	ExtentPageHeaderLength       = 112
+	ExtentEntryLength            = 88
+	SkipPointerLength            = 40
+	LocatorSnapshotHeaderLength  = 88
+	LocatorRootEntryLength       = 40
+	RegistrySnapshotHeaderLength = 88
+	SnapshotHeaderLength         = 136
+	NodeIdentityLength           = 80
 )
 
 var (

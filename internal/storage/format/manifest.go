@@ -33,6 +33,10 @@ const (
 	ArtifactTailCatalog      ArtifactType = 1
 	ArtifactLocatorSnapshot  ArtifactType = 2
 	ArtifactRegistrySnapshot ArtifactType = 3
+	ArtifactLocatorPack      ArtifactType = 4
+	ArtifactSnapshotManifest ArtifactType = 5
+	ArtifactManifest         ArtifactType = 6
+	ArtifactSegment          ArtifactType = 7
 )
 
 // ManifestHeader is the fixed V1 checkpoint description.

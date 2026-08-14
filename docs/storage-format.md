@@ -131,6 +131,8 @@ ArtifactFooter {
 
 `content_sha256` 覆盖文件 Offset `[0, content_length)`，`file_length = content_length + 88`。Footer CRC 覆盖此前 Footer 字段，不覆盖自身和 Reserved。拥有该 Footer 且全部校验通过的文件才是可被 Manifest/Snapshot 引用的 Sealed Artifact；Active 投影文件不能被引用。
 
+V1 Artifact Type 编号固定为：`1=TAIL_CATALOG`、`2=LOCATOR_SNAPSHOT`、`3=REGISTRY_SNAPSHOT`、`4=LOCATOR_PACK`、`5=SNAPSHOT_MANIFEST`、`6=MANIFEST`、`7=SEGMENT`。前五种使用通用 Artifact Footer；Manifest 和 Segment 使用各自 Footer。
+
 ## 4. Record Frame V1
 
 ### 4.1 稳定性边界
@@ -674,7 +676,7 @@ Manifest 可以引用构成同一 Checkpoint 的其他文件：
 ```text
 ArtifactReference {
   entry_length       u32
-  artifact_type      u16   // 1=TAIL_CATALOG, 2=LOCATOR_SNAPSHOT, 3=REGISTRY_SNAPSHOT
+  artifact_type      u16   // 使用 3.7 的 Artifact Type 编号
   format_version     u16
   flags              u32
   artifact_id        UUID
