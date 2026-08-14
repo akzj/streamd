@@ -2,7 +2,7 @@
 
 | 属性 | 内容 |
 | --- | --- |
-| 状态 | Draft / 实施前验证基线 |
+| 状态 | V1 基线工具已实现，完整生产验证待执行 |
 | 对照 | yatsdb Stream Store、streamd 单节点、streamd Strict 主备 |
 | 原则 | 固定环境、公布分布、报告尾延迟和资源成本，不只报告峰值吞吐 |
 
@@ -278,3 +278,49 @@ decision supported or rejected
 ```
 
 没有原始数据、配置和正确性结果的吞吐数字不进入设计决策。
+
+## 18. 当前可执行基线
+
+Checkpoint 的三个持久化边界都具备子进程崩溃恢复测试：
+
+```bash
+go test ./internal/storage/engine -run TestCheckpointCrashRecovery -count=1
+```
+
+单请求、单 Record、每次请求同步落盘的 Go Benchmark：
+
+```bash
+go test ./internal/storage/engine \
+  -run '^$' \
+  -bench BenchmarkAppendSingleSync \
+  -benchmem
+```
+
+短时吞吐和周期 Checkpoint 正确性检查：
+
+```bash
+go run ./cmd/streamd-bench \
+  -duration 30s \
+  -workers 8 \
+  -streams 1000 \
+  -batch 10 \
+  -payload-bytes 1024 \
+  -checkpoint-interval 10s
+```
+
+单节点 72 小时基线：
+
+```bash
+go run ./cmd/streamd-bench \
+  -duration 72h \
+  -workers 8 \
+  -streams 100000 \
+  -batch 10 \
+  -payload-bytes 1024 \
+  -checkpoint-interval 1m \
+  -data /mnt/streamd-soak
+```
+
+`streamd-bench` 只接受一个新目录或空目录，避免覆盖既有数据。默认在计时结束后执行最终 Checkpoint 和完整 Scrub，并以 JSON 输出吞吐、错误数和校验结果。
+
+当前工具是 `SINGLE_SYNC` 单节点基线：每个 Append 请求都执行本地同步。它还不代表 Group Commit、主备复制、网络故障、随机重复 Kill、HDR Histogram 或读写混合负载；这些结果必须在相应能力实现后补充，不能从本基线外推。

@@ -57,18 +57,19 @@ type streamKey struct {
 	stream    string
 }
 type Store struct {
-	mu            sync.Mutex
-	viewMu        sync.RWMutex
-	fatalMu       sync.RWMutex
-	notifyMu      sync.Mutex
-	root          *fsutil.Root
-	state         *recovery.Result
-	committer     *commit.Committer
-	reader        *readstore.Store
-	now           func() time.Time
-	notifications map[streamKey]chan struct{}
-	closed        bool
-	fatal         error
+	mu             sync.Mutex
+	viewMu         sync.RWMutex
+	fatalMu        sync.RWMutex
+	notifyMu       sync.Mutex
+	root           *fsutil.Root
+	state          *recovery.Result
+	committer      *commit.Committer
+	reader         *readstore.Store
+	now            func() time.Time
+	notifications  map[streamKey]chan struct{}
+	closed         bool
+	fatal          error
+	checkpointHook fsutil.CrashHook
 }
 
 func (s *Store) Read(namespace, name string, from uint64, maxRecords int, maxBytes uint64) (readstore.Result, error) {
@@ -249,10 +250,21 @@ func (s *Store) Checkpoint() (format.Manifest, bool, error) {
 		s.setFatal(err)
 		return format.Manifest{}, false, err
 	}
+	if s.checkpointHook != nil {
+		if err := s.checkpointHook("after_wal_rotate"); err != nil {
+			return format.Manifest{}, false, err
+		}
+	}
 	manager := lifecycle.New(s.root.Path(), s.state.Manifest)
 	published, err := manager.PublishFlush(flush, lastEntryID, lastCRC)
 	if err != nil {
 		return format.Manifest{}, false, err
+	}
+	if s.checkpointHook != nil {
+		if err = s.checkpointHook("after_manifest_publish"); err != nil {
+			s.setFatal(err)
+			return format.Manifest{}, false, err
+		}
 	}
 	existing := make(map[format.UUID]bool, len(s.state.Segments))
 	for _, reader := range s.state.Segments {
@@ -291,6 +303,11 @@ func (s *Store) Checkpoint() (format.Manifest, bool, error) {
 	s.reader = readstore.New(newTable, s.state.Segments, 1024)
 	s.viewMu.Unlock()
 	oldTable.Freeze()
+	if s.checkpointHook != nil {
+		if err = s.checkpointHook("after_view_install"); err != nil {
+			return published, true, err
+		}
+	}
 	return published, true, nil
 }
 
