@@ -201,6 +201,14 @@ func (t *Table) FreezeSnapshot() []StreamSnapshot {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.frozen = true
+	return t.snapshotLocked()
+}
+func (t *Table) Snapshot() []StreamSnapshot {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.snapshotLocked()
+}
+func (t *Table) snapshotLocked() []StreamSnapshot {
 	ids := make([]uint64, 0, len(t.streams))
 	for id := range t.streams {
 		ids = append(ids, id)

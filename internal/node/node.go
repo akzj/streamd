@@ -76,6 +76,27 @@ func Run(ctx context.Context, config Config, logger *slog.Logger) error {
 	serveErrors := make(chan error, 2)
 	go func() { serveErrors <- grpcServer.Serve(grpcListener) }()
 	go func() { serveErrors <- admin.Serve(adminListener) }()
+	checkpointCtx, stopCheckpoints := context.WithCancel(context.Background())
+	checkpointDone := make(chan struct{})
+	checkpointInterval, _ := config.checkpointDuration()
+	go func() {
+		defer close(checkpointDone)
+		ticker := time.NewTicker(checkpointInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-checkpointCtx.Done():
+				return
+			case <-ticker.C:
+				manifest, created, checkpointErr := store.Checkpoint()
+				if checkpointErr != nil {
+					logger.Error("checkpoint failed", "error", checkpointErr)
+				} else if created {
+					logger.Info("checkpoint published", "generation", manifest.Header.Generation, "entry_id", manifest.Header.LastEntryID)
+				}
+			}
+		}
+	}()
 	logger.Info("streamd started", "grpc_address", grpcListener.Addr().String(), "admin_address", adminListener.Addr().String())
 
 	var serveErr error
@@ -86,6 +107,8 @@ func Run(ctx context.Context, config Config, logger *slog.Logger) error {
 			serveErr = nil
 		}
 	}
+	stopCheckpoints()
+	<-checkpointDone
 	streamService.BeginDrain()
 	shutdownTimeout, _ := config.shutdownDuration()
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)

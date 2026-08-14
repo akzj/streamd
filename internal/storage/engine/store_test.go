@@ -122,3 +122,45 @@ func TestRequestHashCanonicalHeaderOrder(t *testing.T) {
 		t.Fatal("stable request hashes differ")
 	}
 }
+
+func TestCheckpointPublishesSegmentRotatesWALAndRestarts(t *testing.T) {
+	dir := t.TempDir()
+	store, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := AppendRequest{Namespace: "agent", Stream: "events", RequestID: []byte("first"), Producer: "test", Records: []InputRecord{{Payload: []byte("one")}, {Payload: []byte("two")}}}
+	if _, err = store.Append(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	manifest, created, err := store.Checkpoint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !created || manifest.Header.RecordCount != 3 || len(manifest.SegmentReferences) != 1 {
+		t.Fatalf("checkpoint Manifest = %+v, created = %v", manifest, created)
+	}
+	if _, created, err = store.Checkpoint(); err != nil || created {
+		t.Fatalf("empty checkpoint created=%v error=%v", created, err)
+	}
+	read, err := store.Read("agent", "events", 0, 10, 0)
+	if err != nil || len(read.Records) != 2 {
+		t.Fatalf("post-checkpoint Read = %+v, %v", read, err)
+	}
+	second := AppendRequest{Namespace: "agent", Stream: "events", ExpectedSequence: 2, RequestID: []byte("second"), Producer: "test", Records: []InputRecord{{Payload: []byte("three")}}}
+	if _, err = store.Append(context.Background(), second); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	read, err = store.Read("agent", "events", 0, 10, 0)
+	if err != nil || len(read.Records) != 3 || string(read.Records[2].Payload) != "three" {
+		t.Fatalf("restart Read = %+v, %v", read, err)
+	}
+}

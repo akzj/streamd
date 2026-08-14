@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"path/filepath"
 	"slices"
 	"sync"
 	"time"
@@ -16,10 +17,12 @@ import (
 	"github.com/akzj/streamd/internal/storage/errdefs"
 	"github.com/akzj/streamd/internal/storage/format"
 	"github.com/akzj/streamd/internal/storage/fsutil"
+	"github.com/akzj/streamd/internal/storage/lifecycle"
 	"github.com/akzj/streamd/internal/storage/memtable"
 	readstore "github.com/akzj/streamd/internal/storage/read"
 	"github.com/akzj/streamd/internal/storage/recovery"
 	"github.com/akzj/streamd/internal/storage/registry"
+	"github.com/akzj/streamd/internal/storage/segment"
 )
 
 type InputRecord struct {
@@ -54,6 +57,8 @@ type streamKey struct {
 }
 type Store struct {
 	mu            sync.Mutex
+	viewMu        sync.RWMutex
+	fatalMu       sync.RWMutex
 	notifyMu      sync.Mutex
 	root          *fsutil.Root
 	state         *recovery.Result
@@ -62,9 +67,12 @@ type Store struct {
 	now           func() time.Time
 	notifications map[streamKey]chan struct{}
 	closed        bool
+	fatal         error
 }
 
 func (s *Store) Read(namespace, name string, from uint64, maxRecords int, maxBytes uint64) (readstore.Result, error) {
+	s.viewMu.RLock()
+	defer s.viewMu.RUnlock()
 	mapping, ok := s.state.Registry.Lookup(namespace, name)
 	if !ok {
 		return readstore.Result{}, errdefs.ErrStreamNotFound
@@ -72,6 +80,8 @@ func (s *Store) Read(namespace, name string, from uint64, maxRecords int, maxByt
 	return s.reader.Read(mapping.StreamID, from, maxRecords, maxBytes)
 }
 func (s *Store) Inspect(namespace, name string) (readstore.StreamInfo, error) {
+	s.viewMu.RLock()
+	defer s.viewMu.RUnlock()
 	mapping, ok := s.state.Registry.Lookup(namespace, name)
 	if !ok {
 		return readstore.StreamInfo{}, nil
@@ -79,6 +89,8 @@ func (s *Store) Inspect(namespace, name string) (readstore.StreamInfo, error) {
 	return s.reader.Inspect(mapping.StreamID)
 }
 func (s *Store) ResolveTime(namespace, name string, target int64, mode readstore.TimeMode) (uint64, int64, bool, error) {
+	s.viewMu.RLock()
+	defer s.viewMu.RUnlock()
 	mapping, ok := s.state.Registry.Lookup(namespace, name)
 	if !ok {
 		return 0, 0, false, nil
@@ -86,7 +98,7 @@ func (s *Store) ResolveTime(namespace, name string, target int64, mode readstore
 	return s.reader.ResolveTime(mapping.StreamID, target, mode)
 }
 func (s *Store) Health() Health {
-	return Health{Watermarks: s.committer.Watermarks(), Fatal: s.committer.FatalError()}
+	return Health{Watermarks: s.committer.Watermarks(), Fatal: errors.Join(s.committer.FatalError(), s.fatalError())}
 }
 
 func Open(path string) (*Store, error) {
@@ -105,11 +117,16 @@ func (s *Store) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.closeNotifications()
+	s.viewMu.Lock()
+	defer s.viewMu.Unlock()
 	return errors.Join(s.state.Close(), s.root.Close())
 }
 func (s *Store) Append(ctx context.Context, request AppendRequest) (AppendResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.fatalError(); err != nil {
+		return AppendResult{}, fmt.Errorf("engine failed: %w", err)
+	}
 	if request.Namespace == "" || request.Stream == "" || len(request.RequestID) == 0 || len(request.RequestID) > format.MaxRequestIDLength || request.Producer == "" || len(request.Records) == 0 || len(request.Records) > format.MaxBatchRecordCount {
 		return AppendResult{}, errdefs.ErrInvalidArgument
 	}
@@ -191,6 +208,89 @@ func (s *Store) Append(ctx context.Context, request AppendRequest) (AppendResult
 	}
 	s.signal(request.Namespace, request.Stream)
 	return AppendResult{FirstSequence: sequence, NextSequence: sequence + uint64(len(encoded)), RecordCount: uint32(len(encoded)), FirstRecordedAt: firstTime, LastRecordedAt: recordedAt, FirstEntryID: commitResult.FirstEntryID, LastEntryID: commitResult.LastEntryID}, nil
+}
+
+func (s *Store) Checkpoint() (format.Manifest, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.fatalError(); err != nil {
+		return format.Manifest{}, false, fmt.Errorf("engine failed: %w", err)
+	}
+	records, _ := s.state.MemTable.Stats()
+	if records == 0 {
+		current, _ := s.state.Manifest.Current()
+		return current, false, nil
+	}
+	snapshots := s.state.MemTable.Snapshot()
+	flush := make([]memtable.StreamSnapshot, 0, len(snapshots))
+	for _, snapshot := range snapshots {
+		if len(snapshot.Frames) > 0 {
+			flush = append(flush, snapshot)
+		}
+	}
+	lastEntryID := s.state.WAL.NextEntryID() - 1
+	lastCRC := s.state.WAL.PreviousEntryCRC32C()
+	if err := s.state.WAL.Rotate(0, s.now()); err != nil {
+		s.setFatal(err)
+		return format.Manifest{}, false, err
+	}
+	manager := lifecycle.New(s.root.Path(), s.state.Manifest)
+	published, err := manager.PublishFlush(flush, lastEntryID, lastCRC)
+	if err != nil {
+		return format.Manifest{}, false, err
+	}
+	existing := make(map[format.UUID]bool, len(s.state.Segments))
+	for _, reader := range s.state.Segments {
+		existing[reader.Header.SegmentID] = true
+	}
+	var newReference *format.SegmentReference
+	for i := range published.SegmentReferences {
+		if !existing[published.SegmentReferences[i].SegmentID] {
+			newReference = &published.SegmentReferences[i]
+			break
+		}
+	}
+	if newReference == nil {
+		err = fmt.Errorf("published Manifest has no new Segment")
+		s.setFatal(err)
+		return format.Manifest{}, false, err
+	}
+	reader, err := segment.Open(filepath.Join(s.root.Path(), newReference.LocalPath))
+	if err != nil {
+		s.setFatal(err)
+		return format.Manifest{}, false, err
+	}
+	newTable := memtable.New(0)
+	for _, snapshot := range snapshots {
+		if err = newTable.SeedTail(snapshot.StreamID, snapshot.Tail); err != nil {
+			reader.Close()
+			s.setFatal(err)
+			return format.Manifest{}, false, err
+		}
+	}
+	s.viewMu.Lock()
+	oldTable := s.state.MemTable
+	s.state.MemTable = newTable
+	s.state.Segments = append(s.state.Segments, reader)
+	s.committer = commit.New(s.state.WAL, newTable)
+	s.reader = readstore.New(newTable, s.state.Segments, 1024)
+	s.viewMu.Unlock()
+	oldTable.Freeze()
+	return published, true, nil
+}
+
+func (s *Store) fatalError() error {
+	s.fatalMu.RLock()
+	defer s.fatalMu.RUnlock()
+	return s.fatal
+}
+
+func (s *Store) setFatal(err error) {
+	s.fatalMu.Lock()
+	if s.fatal == nil {
+		s.fatal = err
+	}
+	s.fatalMu.Unlock()
 }
 
 func (s *Store) WaitForAppend(ctx context.Context, namespace, name string, after uint64) error {

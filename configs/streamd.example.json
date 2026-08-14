@@ -4,6 +4,7 @@
   "data_directory": "/var/lib/streamd",
   "shutdown_timeout": "30s",
   "subscribe_send_timeout": "30s",
+  "checkpoint_interval": "1m",
   "tls": {
     "certificate_file": "/etc/streamd/tls/server.crt",
     "private_key_file": "/etc/streamd/tls/server.key",

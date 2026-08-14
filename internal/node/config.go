@@ -22,6 +22,7 @@ type Config struct {
 	DataDirectory        string                      `json:"data_directory"`
 	ShutdownTimeout      string                      `json:"shutdown_timeout"`
 	SubscribeSendTimeout string                      `json:"subscribe_send_timeout"`
+	CheckpointInterval   string                      `json:"checkpoint_interval"`
 	TLS                  TLSConfig                   `json:"tls"`
 	PrincipalsByURI      map[string]access.Principal `json:"principals_by_uri"`
 	Authorization        []access.Rule               `json:"authorization"`
@@ -112,7 +113,21 @@ func (c Config) Validate() error {
 	if _, err := c.subscribeSendDuration(); err != nil {
 		return err
 	}
+	if _, err := c.checkpointDuration(); err != nil {
+		return err
+	}
 	return nil
+}
+
+func (c Config) checkpointDuration() (time.Duration, error) {
+	if c.CheckpointInterval == "" {
+		return time.Minute, nil
+	}
+	value, err := time.ParseDuration(c.CheckpointInterval)
+	if err != nil || value <= 0 {
+		return 0, fmt.Errorf("checkpoint_interval must be a positive duration")
+	}
+	return value, nil
 }
 
 func (c Config) shutdownDuration() (time.Duration, error) {
