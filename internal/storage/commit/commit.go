@@ -59,6 +59,7 @@ func (c *Committer) Commit(ctx context.Context, encoded [][]byte) (Result, error
 		return Result{}, err
 	}
 	if err := c.log.Append(encoded...); err != nil {
+		c.fatal = err
 		return Result{ResultUncertain: true}, err
 	}
 	last := entries[len(entries)-1].EntryID

@@ -10,11 +10,12 @@ import (
 )
 
 type fakeLog struct {
-	appended int
-	syncErr  error
+	appended  int
+	appendErr error
+	syncErr   error
 }
 
-func (f *fakeLog) Append(b ...[]byte) error { f.appended += len(b); return nil }
+func (f *fakeLog) Append(b ...[]byte) error { f.appended += len(b); return f.appendErr }
 func (f *fakeLog) Sync() error              { return f.syncErr }
 func encodedBatch(t *testing.T) [][]byte {
 	t.Helper()
@@ -61,5 +62,17 @@ func TestSyncFailurePoisonsCommitter(t *testing.T) {
 	}
 	if _, err = c.Commit(context.Background(), encodedBatch(t)); err == nil {
 		t.Fatal("poisoned Committer accepted request")
+	}
+}
+
+func TestAppendFailurePoisonsCommitter(t *testing.T) {
+	stop := errors.New("append failed")
+	c := New(&fakeLog{appendErr: stop}, memtable.New(0))
+	result, err := c.Commit(context.Background(), encodedBatch(t))
+	if !errors.Is(err, stop) || !result.ResultUncertain {
+		t.Fatalf("result %+v error %v", result, err)
+	}
+	if _, err = c.Commit(context.Background(), encodedBatch(t)); !errors.Is(err, stop) {
+		t.Fatalf("poisoned Committer error = %v", err)
 	}
 }
