@@ -136,6 +136,8 @@ ReplicationState {
 
 WAL 格式预留复制字段：
 
+Record Frame、WAL File 和 WAL Entry 的 V1 精确字节布局见 [V1 存储格式](storage-format.md)。本节定义复制协议需要的逻辑字段。
+
 ```text
 WALEntry {
   format_version

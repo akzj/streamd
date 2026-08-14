@@ -151,7 +151,7 @@ Stream 是一个永久追加的 Record 序列，同时在底层表现为连续�
 Stream {
   namespace
   name
-  stream_id          // internal
+  stream_id          // internal；0 保留给 Registry Stream，用户 Stream 从 1 开始
   head_sequence      // V1 永远为 0
   next_sequence      // 下一次成功 Append 使用的 Sequence
   next_byte_offset   // internal
@@ -229,6 +229,8 @@ Sequence、Byte Offset 和 `recorded_at` 都天然单调：Sequence 每次加 `1
 为了避免系统时钟回拨破坏索引，`recorded_at` 在单个写入域内必须单调不减。V1 可以使用 `max(wall_clock_now, last_recorded_at)`；未来可演进为 Hybrid Logical Clock。
 
 ## 6. Record Frame
+
+Record Frame、WAL、Segment、Manifest、Locator 和 Snapshot 的 V1 字节布局与兼容规则见 [V1 存储格式](docs/storage-format.md)。本节只说明逻辑结构。
 
 Byte Stream 中每条 Record 使用自描述 Frame：
 
@@ -492,6 +494,8 @@ Immutable Segment
 
 WAL 是已确认写入的第一持久事实：
 
+WAL File Header、WAL Entry、Seal Footer 和 checksum 覆盖范围见 [V1 存储格式](docs/storage-format.md)。
+
 - 只顺序追加；
 - 每条 Entry 有长度、类型和 CRC；
 - Entry ID 单调递增；
@@ -528,6 +532,8 @@ MemTable
 ### 9.3 Segment
 
 Segment 是不可变文件，内部按 Stream 排列数据：
+
+Segment V1 的精确 Section、Directory、Dense Index 和 Footer 布局见 [V1 存储格式](docs/storage-format.md)。
 
 ```text
 Segment Header
@@ -582,6 +588,8 @@ Merge 只改变物理布局，不改变逻辑 Stream：
 ### 9.6 Manifest
 
 不应仅通过扫描目录猜测当前有效 Segment 集合。V1 应设计版本化 Manifest：
+
+Manifest Generation、Artifact Reference 和 CURRENT 原子指针格式见 [V1 存储格式](docs/storage-format.md)。
 
 ```text
 Manifest {
@@ -769,6 +777,8 @@ SegmentHandleCache {
 ```
 
 Registry 自身必须使用同等级持久性保证。可以作为特殊系统 Stream 实现，从而避免第二套事实存储。
+
+V1 按 [V1 存储格式](docs/storage-format.md) 固定 `StreamID=0` 为内部 Registry Stream。名称分配记录先进入同一 WAL；Registry Snapshot 只是可重建 Checkpoint，不拥有第二份事实。
 
 ## 11. 读取路径
 
@@ -1139,6 +1149,7 @@ Primary -- WAL replication --> Standby
 - 固定 Record Frame V1；
 - 固定 WAL Entry V1；
 - 固定 Segment V1；
+- 评审并冻结 [V1 存储格式](docs/storage-format.md)；
 - 编写文件格式 golden tests；
 - 明确所有 Crash Point 的预期行为；
 - 建立与 yatsdb 的基准对照。
