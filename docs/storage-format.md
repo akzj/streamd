@@ -1011,18 +1011,40 @@ registry/
 RegistrySnapshotHeader {
   magic              [8]byte = "STRMREGR"
   format_version     u16 = 1
-  header_length      u16 = 64
+  header_length      u16 = 88
   flags              u32 = 0
   artifact_id        UUID
   covered_entry_id   u64
   entry_count        u64
+  block_count        u32
+  reserved_0         u32
+  block_index_offset u64
+  entries_offset     u64
   created_at         i64
   header_crc32c      u32
-  reserved           u32
+  reserved_1         u32
 }
 ```
 
-Entry 按 `(namespace bytes, stream_name bytes)` 字典序排列：
+Header 后保存 Sparse Block Index，再保存按 `(namespace bytes, stream_name bytes)` 字典序排列的 Registry Entry：
+
+```text
+RegistryBlockIndexEntry {
+  entry_length        u32
+  entry_count         u32
+  entries_offset      u64
+  namespace_length    u16
+  stream_name_length  u16
+  reserved            u32
+  first_namespace     bytes
+  first_stream_name   bytes
+  entry_crc32c        u32
+}
+```
+
+Block Index 保存每个 Block 的第一组完整 Key，按相同字节序排序。`entries_offset` 是该 Block 第一条 Registry Entry 的绝对文件 Offset；Block 内 Entry 数不得超过格式配置的 `registry_block_entries`。
+
+Registry Entry：
 
 ```text
 RegistryEntry {
@@ -1088,6 +1110,8 @@ Snapshot 对以下文件逐一引用：
 - Registry Snapshot；
 - 必需的格式/状态元数据。
 
+NODE Identity 永远不进入可安装 Snapshot，也不能从来源节点复制。目标节点保留自己的 NODE；Replication State 根据本地 Node ID、Snapshot Checkpoint 和当前 Coordinator Term 重新生成，不能照抄来源节点的 Role/Lease。
+
 ```text
 SnapshotArtifact {
   entry_length             u32
@@ -1120,7 +1144,7 @@ Snapshot 只有同时满足以下条件才可以用于 WAL GC 或 Standby 恢复
 6. Artifact 被 Pin，安装 Lease 内不能被 GC；
 7. 安装到 Staging 后完成文件和目录 `fsync`，再原子切换 CURRENT。
 
-V1 建议 Snapshot 中的投影全部覆盖到 Checkpoint，避免引入 Snapshot 内部 WAL。若未来允许落后投影，必须在 Snapshot Manifest 明确包含重放 WAL 范围。
+V1 要求 Snapshot 中的投影全部覆盖到 Checkpoint，不引入 Snapshot 内部 WAL。未来若允许落后投影，必须使用新 Snapshot Format 并明确包含重放 WAL 范围。
 
 ## 12. Node 与 Replication State
 
@@ -1164,7 +1188,7 @@ State Checkpoint 保存主备协议定义的：
 - 每个可选水位的 `has_value` Flag；
 - Generation、前一 State SHA-256、自身 CRC/SHA-256。
 
-它使用与 Manifest 相同的“新文件 + CURRENT 指针”发布方式，禁止原地覆盖。高频 Commit 水位是否使用独立 Metadata WAL，再周期生成 State Checkpoint，由 Append Commit Protocol 决定；无论实现如何，都必须能恢复出相同状态，且不能要求修改已发布 Segment。
+它使用与 Manifest 相同的“新文件 + CURRENT 指针”发布方式，禁止原地覆盖。V1 不为每个 Group Commit 增加独立 Metadata WAL 同步，而是周期生成 State Checkpoint，并按 Append Commit Protocol 的 durable suffix 规则恢复；State Checkpoint 是下界，不能要求修改已发布 Segment。
 
 ## 13. 数据目录
 
@@ -1279,7 +1303,7 @@ Fuzz Target 至少包括：
 
 Parser 必须在任意输入下满足：不 panic、不越界、不按攻击者声明进行无界分配、不返回未经 CRC/边界验证的数据。
 
-## 17. V1 已固定与待评审项
+## 17. V1 已固定与验证门槛
 
 ### 17.1 本文建议固定
 
@@ -1294,13 +1318,14 @@ Parser 必须在任意输入下满足：不 panic、不越界、不按攻击者�
 - Manifest/Snapshot 使用不可变 Generation + 原子 CURRENT；
 - AppendBatch 信息进入每条永久 Frame，Batch 不跨 WAL 文件。
 
-### 17.2 实现前仍需评审
+### 17.2 已收敛
 
-1. 256 MiB Frame 硬上限是否需要降低到 64 MiB；
-2. Request Hash 是否固定 SHA-256，还是采用带算法 ID 的字段；
-3. WAL `previous_entry_crc32c` 是否足够，是否值得承担密码学 Hash Chain 成本；
-4. Tail Catalog V1 是否直接 mmap 原地更新，还是只写 Checkpoint 文件；
-5. Extent Page 固定 64 KiB 是否适合目标 SSD 与 mmap 模型；
-6. Segment Directory 是否需要保存 Entry ID Min/Max，还是只从 Frame 获取；
-7. Replication Commit 水位采用 Metadata WAL 还是批量 State Checkpoint；
-8. Snapshot 是否允许投影落后并携带短 WAL，还是 V1 强制全部覆盖 Checkpoint。
+- Frame 格式硬上限保持 256 MiB，API/部署默认限制必须更小；
+- Request Hash 固定 SHA-256；
+- V1 使用 `previous_entry_crc32c`，不引入密码学 WAL Hash Chain；
+- Tail 使用可变 Active mmap 文件，Snapshot 只引用已 Seal Checkpoint；
+- Segment Directory 保存 Entry ID Min/Max；
+- Commit State 周期 Checkpoint，不为每个 Group 增加 Metadata WAL 同步；
+- V1 Snapshot 的全部投影覆盖 Checkpoint，不携带隐式短 WAL。
+
+Extent Page V1 采用 64 KiB 作为实现初值；在格式冻结前必须按 [基准与可靠性验证计划](benchmark-plan.md) 对照 16/32/128 KiB。若结果要求改变，只修改尚未发布的 V1 常量；一旦产生生产文件只能通过新 Format Version 演进。

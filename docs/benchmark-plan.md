@@ -1,0 +1,280 @@
+# streamd 基准与可靠性验证计划
+
+| 属性 | 内容 |
+| --- | --- |
+| 状态 | Draft / 实施前验证基线 |
+| 对照 | yatsdb Stream Store、streamd 单节点、streamd Strict 主备 |
+| 原则 | 固定环境、公布分布、报告尾延迟和资源成本，不只报告峰值吞吐 |
+
+## 1. 目标
+
+基准用于回答设计问题，不用于制造单一漂亮数字：
+
+- 新 Record/Index 格式相对 yatsdb 增加多少 CPU、空间和延迟；
+- Group Commit 如何平衡吞吐与 P99/P999；
+- Dense Index 和 Tail/Extent Cache 是否保持稳定读延迟；
+- Segment Flush/Merge/Snapshot 是否造成前台抖动；
+- Strict 复制的网络和双 `fsync` 成本；
+- 恢复时间和最大 WAL/Snapshot 大小是否可运维；
+- pread、mmap、Page Size 和 API 默认 Record Limit 如何选择。
+
+## 2. 基准纪律
+
+- 每次结果记录 Git Commit、配置 Hash、Binary Hash；
+- 独占机器，关闭不相关后台任务；
+- 固定 CPU Governor、NUMA、文件系统和 Mount Option；
+- 报告 SSD 型号、Firmware、容量、使用率和写入历史；
+- 每组至少一次 Warmup、五次正式运行；
+- 报告 Median、Min/Max 和置信区间；
+- 不丢弃失败、超时或校验错误样本；
+- 原始 HDR Histogram/Prometheus/系统指标归档；
+- yatsdb 对照使用同硬件、同 Payload、同 durability。
+
+## 3. 环境矩阵
+
+### 3.1 最小环境
+
+```text
+CPU model / cores / SMT
+RAM / NUMA
+Local NVMe model / filesystem
+Kernel / Go version
+Network NIC / MTU / RTT
+Coordinator version
+Object storage implementation
+```
+
+### 3.2 部署
+
+- 单进程单 Shard；
+- 单节点多 Shard；
+- Primary/Standby 同机架低 RTT；
+- Primary/Standby 人工注入 1/5/20/50 ms RTT；
+- 对象存储本地模拟和真实远端。
+
+生产结论不能只来自容器 OverlayFS 或共享 CI Runner。
+
+## 4. 数据集
+
+### 4.1 Record 大小
+
+```text
+64 B, 256 B, 1 KiB, 4 KiB, 16 KiB, 1 MiB, 16 MiB
+```
+
+分别测试固定大小和真实长尾分布。默认 Payload 使用不可压缩随机字节，另设可压缩数据但 V1 不启用压缩。
+
+### 4.2 Stream 数
+
+```text
+1
+1,000
+100,000
+1,000,000
+10,000,000 metadata-only feasibility
+```
+
+### 4.3 热度
+
+- 单热点 Stream；
+- Uniform；
+- Zipf 0.8/1.0/1.2；
+- 1% Stream 承担 99% 流量；
+- 长时间不访问后随机冷读。
+
+### 4.4 历史规模
+
+- Active MemTable only；
+- 10/100/1,000/100,000 Segment；
+- 每 Stream 1/10/1,000/100,000 Extent；
+- WAL Replay 1 GiB、10 GiB、100 GiB；
+- Snapshot 100 GiB、1 TiB（可使用生成器）。
+
+## 5. 写入基准
+
+### 5.1 场景
+
+- 单 Stream 顺序 Append；
+- 多 Stream 并发 Append；
+- AppendBatch 1/10/100/1,000 Records；
+- Expected Sequence 冲突；
+- 响应丢失 Dedup Retry；
+- 新 Stream 高频创建；
+- SINGLE_SYNC 与 REPLICATED_STRICT；
+- Group Commit Delay/Bytes/Requests 参数扫描。
+
+### 5.2 指标
+
+- Records/s、MiB/s；
+- enqueue、WAL write、local fsync、remote fsync、commit、apply 分段延迟；
+- P50/P95/P99/P999/Max；
+- Group size 和 deadline miss；
+- CPU cycles/record、allocations/record、GC pause；
+- WAL bytes/record、write amplification；
+- Sequence conflict/dedup throughput。
+
+### 5.3 正确性伴随检查
+
+每轮后扫描所有测试 Stream：Sequence 连续、Request Hash 一致、Record Count 正确。吞吐测试发现一条错误即判整轮失败。
+
+## 6. 读取基准
+
+- Active Tail Read；
+- Hot Segment Sequence Random Read；
+- Cold Segment Random Read；
+- 连续 1/10/1,000 Record Range Read；
+- ResolveTime 命中/边界/大量相同时间；
+- Locator 1/10/100 Page Hop；
+- pread vs index-only mmap vs full mmap；
+- 本地 Segment vs 对象 Range Read。
+
+记录 API latency、实际读取字节、Page Fault、FD/mmap 数、Cache Hit 和 Extent Hop。
+
+## 7. Subscribe 基准
+
+- 1/1,000/100,000 空闲 Subscriber；
+- 多 Subscriber 订阅同一热点 Stream；
+- 历史 Catch-up 后进入 Tail；
+- 快、慢、暂停消费者混合；
+- 服务端断开与 Cursor 重连；
+- Primary Failover 后继续订阅。
+
+验证慢消费者不影响 WAL Commit latency，内存始终受限。
+
+## 8. 后台任务干扰
+
+分别在稳定前台负载下启动：
+
+- MemTable Flush；
+- 1/2/4 并发 Merge；
+- Full Scrub；
+- Snapshot Generation；
+- Object Upload；
+- Standby Snapshot Catch-up。
+
+比较任务前、中、后的 P99/P999 和吞吐，报告最大抖动窗口，而不是只报告平均值。
+
+## 9. Cache 与规模
+
+- Hot Cache 容量扫描；
+- Zipf 热集合命中稳定性；
+- 一次全历史扫描后的 Cache 污染；
+- Locator Page 64 KiB 与候选 16/32/128 KiB 对照；
+- Segment Handle 上限和 FD 压力；
+- 百万 Stream Tail Catalog RSS/Page Fault；
+- Cache 全清空后的冷启动曲线。
+
+Extent Page Size 只有在查询 Hop、IO 放大、内存和构建成本综合结果明确后才能冻结。
+
+## 10. 空间效率
+
+对每种 Record 大小报告：
+
+```text
+logical payload bytes
+record frame bytes
+WAL bytes
+dense index bytes
+segment padding bytes
+manifest/locator bytes
+total local bytes
+remote snapshot bytes
+```
+
+计算 Metadata Amplification、Write Amplification 和双副本总成本。与 yatsdb 的差异必须拆到具体字段/索引，不能只报目录大小。
+
+## 11. 恢复基准
+
+- Clean Restart；
+- 1/10/100 GiB WAL Replay；
+- Tail/Locator Checkpoint 有效和全部重建；
+- 百万/千万 Stream Registry 加载；
+- Segment 1千/10万文件 Open Check；
+- Snapshot 下载、校验、安装和后续追赶；
+- Standby 短/长时间离线；
+- 单个损坏 Artifact 的检测时间。
+
+指标：Ready Read、Ready Write、Peak RSS、读取/写入字节、CPU 和恢复阶段耗时。
+
+## 12. 故障性能
+
+- Standby 网络丢包/延迟/断连；
+- Primary/Standby fsync latency spike；
+- Coordinator 短时不可达和 Lease 到期；
+- 磁盘 80/90/95/99% 使用率；
+- Object Storage throttling；
+- Manifest/Snapshot 目录大量历史文件。
+
+必须同时报告正确故障行为：停止写、背压、切换或恢复，而不仅是 latency。
+
+## 13. Soak Test
+
+至少包含：
+
+- 72 小时持续混合读写；
+- 周期 Flush/Merge/Snapshot/Scrub；
+- 随机进程 Kill；
+- 随机网络分区；
+- Subscribe 重连；
+- 每小时抽样全链路 Record 校验；
+- 结束后全量 Sequence/CRC/SHA 验证。
+
+观察 RSS 漂移、FD 泄漏、Pin 泄漏、Segment 数、WAL/Snapshot GC、P999 漂移和磁盘增长。
+
+## 14. yatsdb 对照
+
+只比较两者共同能力：
+
+- `Append(streamID, bytes)` 数据路径；
+- WAL sync/group commit；
+- MemTable 聚合；
+- Segment 顺序读取；
+- 多 Stream 分布。
+
+streamd 的 Record Header、CRC、Dense Index、Registry 和主备复制开销单独列出。不能用 yatsdb 不提供的可靠性能力反向宣称吞吐优势，也不能忽略 streamd 的额外语义成本。
+
+## 15. Profile
+
+每个关键场景采集：
+
+- CPU Profile；
+- Allocation/Heap Profile；
+- Mutex/Block Profile；
+- `perf` cycles/cache-miss/context-switch；
+- `iostat` latency/queue/utilization；
+- Network throughput/retransmit；
+- Filesystem/Block trace（仅诊断轮次）。
+
+Profile 采集轮次与正常基准轮次分开，避免工具扰动结果。
+
+## 16. 发布门槛
+
+V1 不在设计文档预设绝对吞吐数字。实现进入生产候选前必须满足：
+
+1. 所有正确性和 Crash Injection 通过；
+2. 72 小时 Soak 无数据错误、资源泄漏和无界增长；
+3. 目标硬件上的 P99/P999 满足业务 SLO；
+4. Strict 复制下单节点故障 RPO=0；
+5. 恢复时间满足部署设定的 RTO；
+6. 相比 yatsdb 的开销可以由新增可靠性字段解释；
+7. 后台 Merge/Snapshot 不使前台超过约定 Error Budget；
+8. 容量模型可以预测磁盘耗尽时间。
+
+## 17. 结果格式
+
+每份报告包含：
+
+```text
+commit/config/environment
+workload generator version
+dataset and distributions
+warmup/duration/repetitions
+throughput and HDR histograms
+CPU/memory/disk/network
+correctness result
+profiles and raw data locations
+known anomalies
+decision supported or rejected
+```
+
+没有原始数据、配置和正确性结果的吞吐数字不进入设计决策。

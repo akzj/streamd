@@ -7,6 +7,8 @@
 | 项目定位 | 独立、通用、高性能、永久追加的 Record Stream 服务 |
 | 设计来源 | 借鉴 yatsdb 已验证的 WAL、Stream Offset、MemTable、Segment 和 mmap 读取模型 |
 
+完整专题文档和推荐阅读顺序见 [设计文档索引](docs/README.md)。
+
 ## 1. 摘要
 
 `streamd` 是一个独立于具体业务的追加式流存储服务。它为大量逻辑 Stream 提供：
@@ -197,7 +199,7 @@ StoredRecord {
 - `sequence` 是 Stream 内从 `0` 开始连续递增的公共 Cursor。
 - `request_id` 标识一次 Compare-And-Append 请求，只与请求的 `expected_sequence` 共同用于识别响应丢失后的重试，不承诺在全部历史中全局唯一。
 - `request_hash` 用于确认重试内容与原请求完全相同。
-- `entry_id` 是存储引擎内的全局单调 ID，用于 WAL、Segment 和恢复；是否作为稳定公共字段需要评审。
+- `entry_id` 是复制组内稳定的全局单调 ID，用于 WAL、Segment、恢复和审计诊断，但不作为跨 Stream 分页或订阅 Cursor。
 - `recorded_at` 由服务端生成，不能由调用者伪造。
 - `producer` 来自认证身份，而不是调用者 Header。
 - `payload` 对 streamd 完全不透明。
@@ -265,13 +267,15 @@ Byte Stream 中每条 Record 使用自描述 Frame：
 - CRC32C 覆盖 Header 和 Payload。
 - Version 决定 Frame 解码方式。
 - 未识别的未来 Header 可以跳过。
-- Record 不跨 WAL Entry；是否允许跨 MemTable Block 由底层实现决定。
+- Record 不跨 WAL Entry，也不跨 MemTable Chunk；超过常规 Chunk 大小的合法 Record 使用独占 Chunk。
 
 `next_byte_offset` 不必持久化，可由 `byte_offset + frame_length` 计算。
 
 ## 7. 公共服务契约
 
 传输协议可以使用 gRPC，另外提供轻量 HTTP Gateway。以下先定义语义，不固定 protobuf 字段编号。
+
+V1 以 gRPC 为规范传输；完整请求、响应、错误和 SDK 语义见 [V1 API 协议](docs/api-protocol.md)。HTTP Gateway 不阻塞核心 V1。
 
 ### 7.1 Append
 
@@ -339,7 +343,7 @@ ReadResult {
 - `from_sequence == current_next_sequence` 返回空结果，不是错误。
 - `from_sequence > current_next_sequence` 返回 `SEQUENCE_AHEAD`。
 - 返回受到 Record 数量和字节数双重限制。
-- 单条 Record 超过 `max_bytes` 时仍可单独返回，或明确返回 `RECORD_TOO_LARGE`；该行为需在协议中固定。
+- 单条 Record 超过 `max_bytes` 时返回 `RECORD_TOO_LARGE` 和所需字节，不返回部分 Record。
 
 ### 7.4 Subscribe
 
@@ -407,6 +411,8 @@ CompactByKey
 
 ## 8. 一致性与幂等语义
 
+字段分配、Request Hash、Group Commit、Batch 原子可见和错误恢复语义见 [Append 与提交协议](docs/append-commit-protocol.md)。
+
 ### 8.1 单 Stream 顺序
 
 同一写入域内，Stream 的 Append 必须串行分配 Sequence。已提交 Sequence 从 `0` 开始连续且无空洞；并发客户端通过 Compare-And-Append 决定最终顺序。
@@ -465,6 +471,8 @@ streamd 可以识别遵守 Compare-And-Append 协议的请求重试，但不能�
 
 ## 9. 存储引擎架构
 
+MemTable Freeze、Flush、Merge、Snapshot Pin、对象存储和物理回收见 [Segment 生命周期](docs/segment-lifecycle.md)。
+
 ```text
 Append Request
      |
@@ -505,7 +513,7 @@ WAL File Header、WAL Entry、Seal Footer 和 checksum 覆盖范围见 [V1 存�
 - 启动时只允许截断最后一个 WAL 的尾部半条 Entry；
 - 中间 WAL 损坏必须失败关闭。
 
-默认 `durability=sync`。未来可以提供明确命名的异步模式用于可丢失场景，但不能静默降低保证。
+单节点默认 `SINGLE_SYNC`；生产主备默认 `REPLICATED_STRICT`。可丢失场景只能使用显式、可审计且默认关闭的 `DEGRADED_LOCAL_ONLY`，不能静默降低保证。
 
 ### 9.2 MemTable
 
@@ -605,6 +613,8 @@ Manifest 使用写临时文件、`fsync`、rename、目录 `fsync` 的方式原�
 
 ## 10. 索引与缓存
 
+各级查询算法、Cache 淘汰、内存预算和并发边界见 [索引与缓存设计](docs/index-cache-design.md)。
+
 索引分为两级：
 
 ```text
@@ -641,7 +651,7 @@ StreamRecordIndex {
 - 物理位置由 `stream_data_base + relative_byte_offset` 计算。
 - 不需要为三个维度分别排序，也不需要通用 LSM。
 
-V1 优先采用 Dense Index，即每条 Record 一个固定大小索引项，以换取 Sequence 的直接定位。文件格式保留 `index_stride`，后续可针对极小 Record 场景使用 Sparse Index。
+V1 只采用 Dense Index，即每条 Record 一个固定大小索引项，以换取 Sequence 的直接定位。未来 Sparse Index 必须使用新的明确格式版本，不能改变 V1 Index 解释。
 
 ### 10.2 Stream Extent
 
@@ -832,6 +842,8 @@ Subscribe 不是另一套消息存储，只是 Read + Wakeup：
 
 ## 13. 崩溃恢复
 
+启动状态机、Manifest/WAL 选择、Commit 边界、投影重建和失败关闭条件见 [崩溃恢复协议](docs/recovery-protocol.md)。
+
 启动恢复顺序：
 
 ```text
@@ -879,7 +891,7 @@ Manifest checksum / generation
 record_hash = H(previous_hash, immutable_record_fields)
 ```
 
-Hash Chain 对审计有价值，但会让同一 Stream 的 Append 更难并行，也会增加 Frame 成本。是否进入 V1 需要基准测试和威胁模型决定。
+Hash Chain 对审计有价值，但会让同一 Stream 的 Append 更难并行，也会增加 Frame 成本。V1 不启用 Stream Hash Chain；未来只有在明确威胁模型和基准结果支持时才通过新格式版本增加。
 
 后台 Scrubber 应周期性读取冷 Segment 并验证校验和，以发现静默磁盘损坏。发现损坏后从备份恢复，而不是跳过数据继续服务。
 
@@ -931,7 +943,7 @@ Object Storage
 - 远端读取路径经过验证；
 - 不存在尚未迁移的唯一副本。
 
-永久保存会与隐私删除和秘密泄露处理产生冲突。streamd 不应接收密码、Token、私钥等秘密；上游必须在 Append 前脱敏。Namespace 级加密密钥销毁是否作为合规删除手段，需要单独设计。
+永久保存会与隐私删除和秘密泄露处理产生冲突。streamd 不应接收密码、Token、私钥等秘密；上游必须在 Append 前脱敏。V1 不提供 Namespace 级删除或密钥销毁式删除，需要此类合规能力的部署不能在未完成独立威胁与法规设计前写入相关数据。
 
 ## 17. 安全与多租户
 
@@ -1005,6 +1017,8 @@ Aegis 的用户 RBAC 仍由 Aegis API Server 负责。Aegis 作为生产者访�
 索引可以从 WAL 和 Segment 重建。重建期间服务可以处于只读或不可用状态，但不得返回未经验证的数据。
 
 ## 19. 可观测性
+
+生产 Dashboard、告警分级和 Runbook 见 [生产运维设计](docs/operations.md)。
 
 核心指标：
 
@@ -1219,6 +1233,8 @@ Primary -- WAL replication --> Standby
 
 ### 24.3 性能
 
+完整环境矩阵、工作负载、yatsdb 对照、故障与 Soak 方法见 [基准与可靠性验证计划](docs/benchmark-plan.md)。
+
 需要使用统一硬件分别测试：
 
 - 单 Stream 顺序写；
@@ -1234,24 +1250,32 @@ Primary -- WAL replication --> Standby
 
 设计阶段不预设吞吐数字，基准环境和数据分布固定后再定义 SLO。
 
-## 25. 待评审问题
+## 25. V1 已决策事项与验证输入
 
-1. 项目最终名称和仓库路径是否统一为 `streamd`？
-2. 公共 Cursor 已确定使用从 `0` 连续递增的 Sequence；是否需要提供仅用于诊断的内部 Byte Offset？
-3. `entry_id` 是否需要对外成为永久稳定的全局位置？
-4. 是否强制所有可靠 Append 使用 Expected Sequence，还是提供无幂等保证的 Blind Append？
-5. 同 Stream AppendBatch 是否必须具备严格的全有或全无语义？
-6. V1 是否只提供 gRPC，还是同步提供 HTTP Gateway？
-7. Unified Record Index V1 使用 Dense Index；是否还需支持可配置的 Sparse `index_stride`？
-8. V1 是否启用 Stream Hash Chain？
-9. “永不删除”是否允许在验证等价副本后回收旧物理 Segment？
-10. V1 是否直接对接对象存储备份？
-11. 热 Segment 默认使用 mmap 还是 pread？
-12. Stream Registry 是否作为系统 Stream 实现？Tail Catalog 的固定槽位大小是多少？
-13. 单 Namespace 和单 Stream 的预期数量级是多少？
-14. 典型 Record 大小和最大 Record 大小是多少？
-15. 目标 RPO、RTO 以及何时需要复制？
-16. 之前消息中间件实现中哪些 Record、Cursor 和订阅语义应当继承？
+### 25.1 已决策
+
+- 项目和仓库名为 `streamd`；
+- Sequence 是唯一公共 Cursor，Byte Offset 只用于内部诊断；
+- Entry ID 是复制组内稳定审计字段，不作为跨 Stream Cursor；
+- 所有可靠 Append 强制 Expected Sequence，不提供 Blind Append；
+- 单 Stream AppendBatch 严格全部可见或全部不可见；
+- gRPC 是 V1 规范协议，HTTP Gateway 可独立增加；
+- V1 只实现 Dense Unified Index，不实现 Sparse Index；
+- V1 不启用 Stream Hash Chain；WAL 使用 CRC32C 连续链；
+- Record 永不逻辑删除，等价替换并解除全部引用后可以回收旧物理副本；
+- 对象存储是 Snapshot/归档能力，不参与前台 Strict Commit；
+- 热读取默认以 pread 为实现基线，mmap 只作为 Benchmark 候选；
+- `StreamID=0` 是 Registry Stream，Tail Slot 固定 128 bytes；
+- 主备生产模式默认 REPLICATED_STRICT，Standby Read 和自动 Degraded 默认关闭。
+
+### 25.2 必须由环境提供
+
+- 典型/最大 Record 分布和单 Namespace/Stream 数量级；
+- 目标硬件、文件系统、网络 RTT 和对象存储；
+- Append/Read/Subscribe SLO 和部署 RTO；
+- Coordinator 实现、Lease 时长、时钟漂移预算和 Fencing 能力；
+- protobuf Field Number 和 API Package Name；
+- yatsdb/旧消息实现中可用于对照的真实数据集与基准结果。
 
 ## 26. 核心结论
 

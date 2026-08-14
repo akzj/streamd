@@ -160,7 +160,7 @@ WALEntry {
 - `entry_id` 必须等于前一 Entry ID 加 `1`；
 - Stream 内 `sequence` 必须等于该 Stream 的当前 `next_sequence`；
 - `byte_offset` 必须等于该 Stream 的当前 `next_byte_offset`；
-- `previous_entry_hash` 可用于快速确认日志前缀，V1 是否启用由格式评审决定；
+- `previous_entry_hash` 在 V1 不编码；V1 使用存储格式定义的 `previous_entry_crc32c` 检查连续前缀；
 - 即使不启用 Hash Chain，每条 Entry 也必须有长度边界和 checksum。
 
 复制 WAL Entry，而不是 `Append(namespace, stream, payload)`，可以保证 Standby 不重新执行时间生成、名称分配、Sequence 分配或业务校验。
@@ -680,16 +680,17 @@ Subscribe 的公共 Cursor 仍是每个 Stream 的 `Sequence`，不暴露 WAL En
 5. 实现 Snapshot Checkpoint、Pin、安装和增量追赶；
 6. 实现 WAL 有界保留与 NEEDS_SNAPSHOT；
 7. 实现 Promotion、旧主 Rejoin 和故障注入；
-8. 最后评估是否需要显式 Degraded 模式。
+8. V1 保持 Degraded 默认禁用；只有产品明确接受非零 RPO 后再实现显式运维入口。
 
-## 18. 待评审问题
+## 18. V1 决策与部署参数
 
-以下问题不影响协议主干，但需要在实现前固定：
+V1 固定：
 
-1. V1 采用哪一种协调器，以及 Lease 的时钟漂移和续约参数；
-2. WAL 是否启用 `previous_entry_hash`，还是仅用 Entry checksum + Snapshot checkpoint checksum；
-3. Snapshot 文件走复制连接还是对象存储，是否两者都支持；
-4. Primary 的 Commit 水位使用独立元数据 WAL，还是可以完全由 durable suffix promotion 规则恢复；
-5. 是否在 V1 暴露 Standby Read；
-6. 是否完全不提供 Degraded 模式，以保持“成功即双副本持久”的单一契约；
-7. 一个 WAL Entry 是否只包含一条 Record，AppendBatch 如何编码为不可分割提交单元。
+- WAL 使用 Entry CRC32C 连续链，不启用密码学 Entry Hash Chain；
+- 一条 Record 对应一条 WAL Entry，Batch 使用连续 Entry 和 Frame Batch 字段形成不可分割可见单元；
+- Commit Checkpoint 是恢复下界，不为每次提交增加第二次元数据 `fsync`；尾部按双方 durable 前缀和 Promotion 规则决议；
+- Snapshot 优先通过对象存储传输，也允许相同校验语义的直接节点传输；
+- 公共 Standby Read 默认关闭；
+- REPLICATED_STRICT 是生产默认，Degraded 默认禁用且绝不自动进入。
+
+部署必须另外固定：Coordinator 实现、Lease/续约参数、最大时钟漂移、Fencing 手段、目标 RTO 和 Snapshot 传输带宽。它们是环境参数，不改变协议不变量。
