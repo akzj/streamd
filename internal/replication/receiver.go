@@ -20,6 +20,7 @@ type ChecksumLookup func(entryID uint64) (uint32, bool)
 type EntryLookup func(entryID uint64) (format.WALEntry, bool)
 type TermObserver func(term uint64, leaderID format.UUID) error
 type ApplyThrough func(firstEntryID, lastEntryID uint64) error
+type ApplyEntries func([]format.WALEntry) error
 
 type ReceiverState struct {
 	Term          uint64
@@ -39,6 +40,7 @@ type ReceiverConfig struct {
 	EntryAt      EntryLookup
 	ObserveTerm  TermObserver
 	ApplyThrough ApplyThrough
+	ApplyEntries ApplyEntries
 }
 
 type Receiver struct {
@@ -50,6 +52,7 @@ type Receiver struct {
 	entryAt      EntryLookup
 	observeTerm  TermObserver
 	applyThrough ApplyThrough
+	applyEntries ApplyEntries
 	checksums    map[uint64]uint32
 	entries      map[uint64]format.WALEntry
 	state        ReceiverState
@@ -84,7 +87,7 @@ type CommitAdvance struct {
 }
 
 func NewReceiver(log StandbyLog, config ReceiverConfig) (*Receiver, error) {
-	if log == nil || zeroUUID(config.GroupID) || zeroUUID(config.NodeID) || zeroUUID(config.State.LeaderID) || config.ChecksumAt == nil || config.EntryAt == nil || config.ObserveTerm == nil || config.ApplyThrough == nil {
+	if log == nil || zeroUUID(config.GroupID) || zeroUUID(config.NodeID) || zeroUUID(config.State.LeaderID) || config.ChecksumAt == nil || config.EntryAt == nil || config.ObserveTerm == nil || (config.ApplyThrough == nil && config.ApplyEntries == nil) {
 		return nil, protocolError(ErrInvalidState, "Standby log, identities, and protocol callbacks are required")
 	}
 	if config.NodeID == config.State.LeaderID {
@@ -104,7 +107,7 @@ func NewReceiver(log StandbyLog, config ReceiverConfig) (*Receiver, error) {
 			}
 		}
 	}
-	return &Receiver{groupID: config.GroupID, nodeID: config.NodeID, log: log, checksumAt: config.ChecksumAt, entryAt: config.EntryAt, observeTerm: config.ObserveTerm, applyThrough: config.ApplyThrough, checksums: make(map[uint64]uint32), entries: make(map[uint64]format.WALEntry), state: config.State}, nil
+	return &Receiver{groupID: config.GroupID, nodeID: config.NodeID, log: log, checksumAt: config.ChecksumAt, entryAt: config.EntryAt, observeTerm: config.ObserveTerm, applyThrough: config.ApplyThrough, applyEntries: config.ApplyEntries, checksums: make(map[uint64]uint32), entries: make(map[uint64]format.WALEntry), state: config.State}, nil
 }
 
 func (r *Receiver) State() (ReceiverState, error) {
@@ -247,8 +250,28 @@ func (r *Receiver) advanceCommitted() error {
 	}
 	r.state.Committed = Position{Valid: true, EntryID: target, CRC32C: checksum}
 	if first <= target {
-		if err := r.applyThrough(first, target); err != nil {
-			r.fatal = fmt.Errorf("apply committed Standby WAL: %w", err)
+		var applyErr error
+		if r.applyEntries != nil {
+			entries := make([]format.WALEntry, 0)
+			for entryID := first; entryID <= target; entryID++ {
+				entry, found := r.lookupEntry(entryID)
+				if !found {
+					applyErr = fmt.Errorf("committed Entry %d metadata is unavailable", entryID)
+					break
+				}
+				entries = append(entries, entry)
+				if entryID == math.MaxUint64 {
+					break
+				}
+			}
+			if applyErr == nil {
+				applyErr = r.applyEntries(entries)
+			}
+		} else {
+			applyErr = r.applyThrough(first, target)
+		}
+		if applyErr != nil {
+			r.fatal = fmt.Errorf("apply committed Standby WAL: %w", applyErr)
 			return r.fatal
 		}
 		r.state.Applied = r.state.Committed

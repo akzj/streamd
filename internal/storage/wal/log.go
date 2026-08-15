@@ -297,10 +297,14 @@ func (l *Log) Rotate(term uint64, now time.Time) error {
 	if l == nil || l.file == nil {
 		return os.ErrClosed
 	}
-	if err := l.Seal(); err != nil {
+	oldPath := filepath.Join(l.root, "wal", l.pointer.FileName)
+	oldEntryCount := l.scan.EntryCount
+	previous := l.scan.LastEntryCRC32C
+	if oldEntryCount == 0 {
+		previous = l.expectedPreviousCRC32C
+	} else if err := l.Seal(); err != nil {
 		return err
 	}
-	previous := l.scan.LastEntryCRC32C
 	first := l.pointer.FirstEntryID + l.scan.EntryCount
 	if err := l.file.Close(); err != nil {
 		return err
@@ -347,6 +351,13 @@ func (l *Log) Rotate(term uint64, now time.Time) error {
 	l.pointer = pointer
 	l.scan = ScanResult{Header: header, LastGoodOffset: format.WALFileHeaderLength}
 	l.expectedPreviousCRC32C = previous
+	if oldEntryCount == 0 {
+		// The old active WAL was empty and never part of history. Removal is
+		// best-effort after the new pointer is durable; crash recovery ignores
+		// an unpublished header-only orphan.
+		_ = os.Remove(oldPath)
+		_ = fsutil.SyncDir(walDir)
+	}
 	return nil
 }
 func writeFull(w io.Writer, b []byte) error {

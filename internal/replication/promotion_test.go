@@ -94,6 +94,13 @@ func TestPromoteValidatesAndCommitsDurableSuffix(t *testing.T) {
 	if !health.Watermarks.HasCommitted || health.Watermarks.Committed != 1 || !health.Watermarks.HasReplicated {
 		t.Fatalf("recovered Health = %+v", health)
 	}
+	if _, err = reopened.Append(context.Background(), engine.AppendRequest{Namespace: "n", Stream: "s", ExpectedSequence: 1, RequestID: []byte("after-promotion"), Producer: "test", Records: []engine.InputRecord{{Payload: []byte("next")}}}); err != nil {
+		t.Fatal(err)
+	}
+	checkpoint, err := reopened.CheckpointReplicationState(stateStore)
+	if err != nil || checkpoint.Header.Committed.EntryID != 2 || checkpoint.Header.Replicated.EntryID != 2 {
+		t.Fatalf("Replication checkpoint = %+v, %v", checkpoint.Header, err)
+	}
 	if err = reopened.Close(); err != nil {
 		t.Fatal(err)
 	}

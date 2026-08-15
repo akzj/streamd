@@ -151,6 +151,15 @@ func scrubWAL(root string, manifest format.Manifest, hasManifest bool, report *R
 		}
 		scan, scanErr := wal.ScanSealed(path, nil)
 		if scanErr != nil {
+			file, openErr := os.Open(path)
+			if openErr != nil {
+				return openErr
+			}
+			orphan, activeErr := wal.ScanActive(file)
+			file.Close()
+			if activeErr == nil && orphan.EntryCount == 0 {
+				continue
+			}
 			return scanErr
 		}
 		report.SealedWALs++

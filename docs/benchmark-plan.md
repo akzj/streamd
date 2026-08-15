@@ -296,6 +296,15 @@ go test ./internal/storage/engine \
   -benchmem
 ```
 
+同进程、两套独立文件系统 WAL 的 Strict 双 `fsync` 基准：
+
+```bash
+go test ./internal/storage/engine \
+  -run '^$' \
+  -bench BenchmarkAppendReplicatedStrict \
+  -benchmem
+```
+
 短时吞吐和周期 Checkpoint 正确性检查：
 
 ```bash
@@ -321,6 +330,32 @@ go run ./cmd/streamd-bench \
   -data /mnt/streamd-soak
 ```
 
+Strict 双 WAL 72 小时基线（两个目录必须位于计划测试的独立磁盘）：
+
+```bash
+go run ./cmd/streamd-bench \
+  -mode strict \
+  -duration 72h \
+  -workers 8 \
+  -streams 100000 \
+  -batch 10 \
+  -payload-bytes 1024 \
+  -checkpoint-interval 1m \
+  -data /mnt/primary/streamd-soak \
+  -standby-data /mnt/standby/streamd-soak
+```
+
+可重复 HA 语义演练：
+
+```bash
+go test ./internal/replication ./internal/storage/engine ./internal/storage/snapshot \
+  -run 'HADrill|InstallAndCrashResume|Promote' \
+  -count=100
+```
+
 `streamd-bench` 只接受一个新目录或空目录，避免覆盖既有数据。默认在计时结束后执行最终 Checkpoint 和完整 Scrub，并以 JSON 输出吞吐、错误数和校验结果。
 
-当前工具是 `SINGLE_SYNC` 单节点基线：每个 Append 请求都执行本地同步。它还不代表 Group Commit、主备复制、网络故障、随机重复 Kill、HDR Histogram 或读写混合负载；这些结果必须在相应能力实现后补充，不能从本基线外推。
+`single` 模式是 `SINGLE_SYNC` 基线；`strict` 模式通过两套独立 WAL 执行真实双 `fsync`、Group Commit 和
+Strict 客户端完成条件，并在结束时校验 Primary 数据与 Standby WAL 连续性。CLI Strict 基线不包含真实网络 RTT、
+mTLS 或 Standby Apply 成本；这些必须使用双进程部署基准补充。当前工具也不注入随机 Kill、网络分区、
+HDR Histogram 或读写混合负载，不能从单次结果外推 72 小时门槛已经满足。

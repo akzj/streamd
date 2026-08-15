@@ -209,3 +209,36 @@ func TestScanSealedAcceptsMultipleContinuousEntries(t *testing.T) {
 		t.Fatalf("scan = %+v, error = %v", scan, err)
 	}
 }
+
+func TestRotateEmptyWALPreservesSnapshotCRCBase(t *testing.T) {
+	root, err := fsutil.OpenRoot(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	const previous = uint32(12345)
+	log, err := CreateAfter(root.Path(), 5, 1, previous, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer log.Close()
+	if err = log.Rotate(2, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	hash := sha256.Sum256([]byte("after-snapshot"))
+	frame, err := format.MarshalRecordFrame(format.RecordFrame{EntryID: 5, StreamID: 1, Sequence: 0, RecordedAt: 1, BatchCount: 1, RequestHash: hash, Producer: "p"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry, err := format.MarshalWALEntry(2, previous, frame)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = log.Append(entry); err != nil {
+		t.Fatal(err)
+	}
+	files, err := filepath.Glob(filepath.Join(root.Path(), "wal", "*.log"))
+	if err != nil || len(files) != 1 {
+		t.Fatalf("empty rotated WAL was retained: %v, %v", files, err)
+	}
+}

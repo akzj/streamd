@@ -25,6 +25,7 @@ import (
 	"github.com/akzj/streamd/internal/storage/registry"
 	"github.com/akzj/streamd/internal/storage/replicationstate"
 	"github.com/akzj/streamd/internal/storage/segment"
+	"github.com/akzj/streamd/internal/storage/wal"
 )
 
 type InputRecord struct {
@@ -476,6 +477,80 @@ func (s *Store) Checkpoint() (format.Manifest, bool, error) {
 		}
 	}
 	return published, true, nil
+}
+
+// CheckpointReplicationState publishes a crash-recovery lower bound without
+// adding metadata fsync to every Group Commit.
+func (s *Store) CheckpointReplicationState(states *replicationstate.Store) (format.ReplicationState, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if states == nil || s.role == format.ReplicationRoleSingle {
+		return format.ReplicationState{}, fmt.Errorf("replicated State store is required")
+	}
+	if err := s.committer.Barrier(context.Background()); err != nil {
+		return format.ReplicationState{}, err
+	}
+	history, err := wal.OpenHistory(s.root.Path())
+	if err != nil {
+		return format.ReplicationState{}, err
+	}
+	watermarks := s.committer.Watermarks()
+	current, _ := states.Current()
+	position := func(present bool, entryID uint64, fallback format.ReplicationPosition) (format.ReplicationPosition, error) {
+		if !present {
+			return format.ReplicationPosition{}, nil
+		}
+		checksum, ok, lookupErr := history.ChecksumAt(entryID)
+		if lookupErr != nil {
+			return format.ReplicationPosition{}, lookupErr
+		}
+		if ok {
+			return format.ReplicationPosition{Present: true, EntryID: entryID, CRC32C: checksum}, nil
+		}
+		if fallback.Present && fallback.EntryID == entryID {
+			return fallback, nil
+		}
+		if current.Header.HasInstalledSnapshot && current.Header.InstalledSnapshotEntry.EntryID == entryID {
+			return current.Header.InstalledSnapshotEntry, nil
+		}
+		return format.ReplicationPosition{}, fmt.Errorf("checksum for replication watermark %d is unavailable", entryID)
+	}
+	last, err := position(watermarks.HasValue, watermarks.Appended, current.Header.LastAppended)
+	if err != nil {
+		return format.ReplicationState{}, err
+	}
+	local, err := position(watermarks.HasLocalDurable, watermarks.LocalDurable, current.Header.LocalDurable)
+	if err != nil {
+		return format.ReplicationState{}, err
+	}
+	replicated, err := position(watermarks.HasReplicated, watermarks.Replicated, current.Header.Replicated)
+	if err != nil {
+		return format.ReplicationState{}, err
+	}
+	committed, err := position(watermarks.HasCommitted, watermarks.Committed, current.Header.Committed)
+	if err != nil {
+		return format.ReplicationState{}, err
+	}
+	applied, err := position(watermarks.HasApplied, watermarks.Applied, current.Header.Applied)
+	if err != nil {
+		return format.ReplicationState{}, err
+	}
+	return states.Update(s.now(), func(header *format.ReplicationStateHeader) error {
+		if header.Term != s.term || header.Role != s.role || header.Durability != s.durability {
+			return fmt.Errorf("engine role does not match durable Replication State")
+		}
+		header.LastAppended = last
+		header.LocalDurable = local
+		header.Replicated = replicated
+		header.Committed = committed
+		header.Applied = applied
+		if earliest, next, present := history.Bounds(); present {
+			header.EarliestWALEntryID = earliest
+		} else {
+			header.EarliestWALEntryID = next
+		}
+		return nil
+	})
 }
 
 func (s *Store) fatalError() error {
