@@ -58,6 +58,7 @@ type streamKey struct {
 }
 type Store struct {
 	mu             sync.Mutex
+	gateMu         sync.Mutex
 	viewMu         sync.RWMutex
 	fatalMu        sync.RWMutex
 	notifyMu       sync.Mutex
@@ -67,8 +68,13 @@ type Store struct {
 	reader         *readstore.Store
 	now            func() time.Time
 	notifications  map[streamKey]chan struct{}
+	appendGates    map[streamKey]chan struct{}
 	closed         bool
+	shutdown       bool
 	fatal          error
+	nextEntryID    uint64
+	previousCRC32C uint32
+	lastRecordedAt int64
 	checkpointHook fsutil.CrashHook
 }
 
@@ -100,6 +106,8 @@ func (s *Store) ResolveTime(namespace, name string, target int64, mode readstore
 	return s.reader.ResolveTime(mapping.StreamID, target, mode)
 }
 func (s *Store) Health() Health {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return Health{Watermarks: s.committer.Watermarks(), Fatal: errors.Join(s.committer.FatalError(), s.fatalError())}
 }
 
@@ -127,11 +135,21 @@ func open(path string, node *format.NodeIdentity) (*Store, error) {
 		root.Close()
 		return nil, err
 	}
-	return &Store{root: root, state: state, committer: commit.New(state.WAL, state.MemTable), reader: readstore.New(state.MemTable, state.Segments, 1024), now: time.Now, notifications: make(map[streamKey]chan struct{})}, nil
+	var lastRecordedAt int64
+	for _, snapshot := range state.MemTable.Snapshot() {
+		if snapshot.Tail.RecordCount > 0 && snapshot.Tail.LastRecordedAt > lastRecordedAt {
+			lastRecordedAt = snapshot.Tail.LastRecordedAt
+		}
+	}
+	return &Store{root: root, state: state, committer: commit.New(state.WAL, state.MemTable), reader: readstore.New(state.MemTable, state.Segments, 1024), now: time.Now, notifications: make(map[streamKey]chan struct{}), appendGates: make(map[streamKey]chan struct{}), nextEntryID: state.WAL.NextEntryID(), previousCRC32C: state.WAL.PreviousEntryCRC32C(), lastRecordedAt: lastRecordedAt}, nil
 }
 func (s *Store) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.shutdown {
+		return nil
+	}
+	s.shutdown = true
 	s.closeNotifications()
 	commitErr := s.committer.Close()
 	s.viewMu.Lock()
@@ -139,11 +157,6 @@ func (s *Store) Close() error {
 	return errors.Join(commitErr, s.state.Close(), s.root.Close())
 }
 func (s *Store) Append(ctx context.Context, request AppendRequest) (AppendResult, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if err := s.fatalError(); err != nil {
-		return AppendResult{}, fmt.Errorf("engine failed: %w", err)
-	}
 	if request.Namespace == "" || request.Stream == "" || len(request.RequestID) == 0 || len(request.RequestID) > format.MaxRequestIDLength || request.Producer == "" || len(request.Records) == 0 || len(request.Records) > format.MaxBatchRecordCount {
 		return AppendResult{}, errdefs.ErrInvalidArgument
 	}
@@ -157,69 +170,118 @@ func (s *Store) Append(ctx context.Context, request AppendRequest) (AppendResult
 	if err = validateInputRecords(request, hash); err != nil {
 		return AppendResult{}, fmt.Errorf("%w: %v", errdefs.ErrInvalidArgument, err)
 	}
+	release, err := s.acquireAppendGate(ctx, streamKey{namespace: request.Namespace, stream: request.Stream})
+	if err != nil {
+		return AppendResult{}, err
+	}
+	releaseOnReturn := true
+	defer func() {
+		if releaseOnReturn {
+			release()
+		}
+	}()
+	s.mu.Lock()
+	if s.shutdown {
+		s.mu.Unlock()
+		return AppendResult{}, errdefs.ErrClosed
+	}
+	if err = s.fatalError(); err != nil {
+		s.mu.Unlock()
+		return AppendResult{}, fmt.Errorf("engine failed: %w", err)
+	}
 	mapping, exists := s.state.Registry.Lookup(request.Namespace, request.Stream)
 	if !exists {
 		proposal, _, err := s.state.Registry.NextAssignment(request.Namespace, request.Stream)
 		if err != nil {
+			s.mu.Unlock()
 			return AppendResult{}, err
 		}
 		payload, err := format.MarshalRegistryRecord(proposal)
 		if err != nil {
+			s.mu.Unlock()
 			return AppendResult{}, err
 		}
-		if err = s.commitRegistry(ctx, proposal, payload); err != nil {
+		if err = s.commitRegistry(proposal, payload); err != nil {
+			s.mu.Unlock()
 			return AppendResult{}, err
 		}
 		mapping, _ = s.state.Registry.Lookup(request.Namespace, request.Stream)
+	}
+	if err = ctx.Err(); err != nil {
+		s.mu.Unlock()
+		return AppendResult{}, err
 	}
 	tail, ok := s.state.MemTable.Tail(mapping.StreamID)
 	if !ok {
 		tail = zeroTail()
 	}
 	if request.ExpectedSequence < tail.NextSequence {
-		return s.deduplicate(mapping.StreamID, request, hash, tail.NextSequence)
+		result, deduplicateErr := s.deduplicate(mapping.StreamID, request, hash, tail.NextSequence)
+		s.mu.Unlock()
+		return result, deduplicateErr
 	}
 	if request.ExpectedSequence > tail.NextSequence {
+		s.mu.Unlock()
 		return AppendResult{}, &errdefs.SequenceAheadError{Requested: request.ExpectedSequence, CurrentNextSequence: tail.NextSequence}
 	}
-	entryID := s.state.WAL.NextEntryID()
-	previous := s.state.WAL.PreviousEntryCRC32C()
+	entryID := s.nextEntryID
+	previous := s.previousCRC32C
 	sequence, offset := tail.NextSequence, tail.NextByteOffset
 	count := uint64(len(request.Records))
 	if count-1 > math.MaxUint64-entryID || count-1 > math.MaxUint64-sequence {
+		s.mu.Unlock()
 		return AppendResult{}, fmt.Errorf("Append identifiers overflow")
 	}
 	recordedAt := s.now().UnixNano()
-	if tail.RecordCount > 0 && recordedAt < tail.LastRecordedAt {
-		recordedAt = tail.LastRecordedAt
+	if recordedAt < s.lastRecordedAt {
+		recordedAt = s.lastRecordedAt
 	}
 	encoded := make([][]byte, 0, len(request.Records))
 	firstTime := recordedAt
 	for i, input := range request.Records {
 		frame, err := format.MarshalRecordFrame(format.RecordFrame{EntryID: entryID + uint64(i), StreamID: mapping.StreamID, Sequence: sequence + uint64(i), ByteOffset: offset, RecordedAt: recordedAt, BatchIndex: uint32(i), BatchCount: uint32(len(request.Records)), RequestHash: hash, RequestID: request.RequestID, Producer: request.Producer, Headers: input.Headers, Payload: input.Payload})
 		if err != nil {
+			s.mu.Unlock()
 			return AppendResult{}, err
 		}
 		walEntry, err := format.MarshalWALEntry(0, previous, frame)
 		if err != nil {
+			s.mu.Unlock()
 			return AppendResult{}, err
 		}
 		decoded, err := format.UnmarshalWALEntry(walEntry)
 		if err != nil {
+			s.mu.Unlock()
 			return AppendResult{}, err
 		}
 		encoded = append(encoded, walEntry)
 		previous = decoded.CRC32C
 		if uint64(len(frame)) > math.MaxUint64-offset {
+			s.mu.Unlock()
 			return AppendResult{}, fmt.Errorf("Stream Byte Offset overflows")
 		}
 		offset += uint64(len(frame))
 	}
-	commitResult, err := s.committer.Commit(ctx, encoded)
+	committer := s.committer
+	future, err := committer.Enqueue(encoded)
 	if err != nil {
-		watermarks := s.committer.Watermarks()
+		s.setFatal(err)
+		s.mu.Unlock()
+		return AppendResult{}, err
+	}
+	s.nextEntryID = entryID + count
+	s.previousCRC32C = previous
+	s.lastRecordedAt = recordedAt
+	s.mu.Unlock()
+	commitResult, err := future.Wait(ctx)
+	if err != nil {
+		watermarks := committer.Watermarks()
 		if watermarks.HasApplied && watermarks.Applied >= commitResult.LastEntryID && commitResult.RecordCount > 0 {
 			s.signal(request.Namespace, request.Stream)
+		}
+		if commitResult.ResultUncertain && commitResult.RecordCount == 0 {
+			releaseOnReturn = false
+			go s.finishAppend(future, request.Namespace, request.Stream, release)
 		}
 		return AppendResult{}, &errdefs.WriteError{Err: err, ResultUncertain: commitResult.ResultUncertain}
 	}
@@ -230,8 +292,15 @@ func (s *Store) Append(ctx context.Context, request AppendRequest) (AppendResult
 func (s *Store) Checkpoint() (format.Manifest, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.shutdown {
+		return format.Manifest{}, false, errdefs.ErrClosed
+	}
 	if err := s.fatalError(); err != nil {
 		return format.Manifest{}, false, fmt.Errorf("engine failed: %w", err)
+	}
+	if err := s.committer.Barrier(context.Background()); err != nil {
+		s.setFatal(err)
+		return format.Manifest{}, false, err
 	}
 	records, _ := s.state.MemTable.Stats()
 	if records == 0 {
@@ -257,6 +326,7 @@ func (s *Store) Checkpoint() (format.Manifest, bool, error) {
 	}
 	if s.checkpointHook != nil {
 		if err := s.checkpointHook("after_wal_rotate"); err != nil {
+			s.setFatal(err)
 			return format.Manifest{}, false, err
 		}
 	}
@@ -386,34 +456,73 @@ func (s *Store) closeNotifications() {
 	}
 	s.notifyMu.Unlock()
 }
-func (s *Store) commitRegistry(ctx context.Context, proposal format.RegistryRecord, payload []byte) error {
+func (s *Store) commitRegistry(proposal format.RegistryRecord, payload []byte) error {
 	tail, ok := s.state.MemTable.Tail(registry.RegistryStreamID)
 	if !ok {
 		tail = zeroTail()
 	}
-	entryID := s.state.WAL.NextEntryID()
+	entryID := s.nextEntryID
 	recorded := s.now().UnixNano()
+	if recorded < s.lastRecordedAt {
+		recorded = s.lastRecordedAt
+	}
 	hash := sha256.Sum256(payload)
 	requestID := []byte(fmt.Sprintf("registry/%d", proposal.AssignedStreamID))
 	frame, err := format.MarshalRecordFrame(format.RecordFrame{EntryID: entryID, StreamID: registry.RegistryStreamID, Sequence: tail.NextSequence, ByteOffset: tail.NextByteOffset, RecordedAt: recorded, BatchCount: 1, RequestHash: hash, RequestID: requestID, Producer: "streamd/registry", Payload: payload})
 	if err != nil {
 		return err
 	}
-	encoded, err := format.MarshalWALEntry(0, s.state.WAL.PreviousEntryCRC32C(), frame)
+	encoded, err := format.MarshalWALEntry(0, s.previousCRC32C, frame)
 	if err != nil {
 		return err
 	}
-	_, commitErr := s.committer.Commit(ctx, [][]byte{encoded})
-	watermarks := s.committer.Watermarks()
-	if watermarks.HasApplied && watermarks.Applied >= entryID {
+	decoded, err := format.UnmarshalWALEntry(encoded)
+	if err != nil {
+		return err
+	}
+	future, err := s.committer.Enqueue([][]byte{encoded})
+	if err != nil {
+		s.setFatal(err)
+		return err
+	}
+	s.nextEntryID++
+	s.previousCRC32C = decoded.CRC32C
+	s.lastRecordedAt = recorded
+	result, err := future.Wait(context.Background())
+	if err != nil {
+		return err
+	}
+	if !result.ResultUncertain && result.LastEntryID == entryID {
 		if err = s.state.Registry.ApplyRecord(entryID, payload); err != nil {
+			s.setFatal(err)
 			return err
 		}
 	}
-	if commitErr != nil {
-		return commitErr
-	}
 	return nil
+}
+
+func (s *Store) acquireAppendGate(ctx context.Context, key streamKey) (func(), error) {
+	s.gateMu.Lock()
+	gate := s.appendGates[key]
+	if gate == nil {
+		gate = make(chan struct{}, 1)
+		s.appendGates[key] = gate
+	}
+	s.gateMu.Unlock()
+	select {
+	case gate <- struct{}{}:
+		return func() { <-gate }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (s *Store) finishAppend(future *commit.Future, namespace, stream string, release func()) {
+	defer release()
+	result, err := future.Wait(context.Background())
+	if err == nil && result.RecordCount > 0 {
+		s.signal(namespace, stream)
+	}
 }
 func (s *Store) deduplicate(streamID uint64, request AppendRequest, hash [32]byte, currentNext uint64) (AppendResult, error) {
 	result, err := s.reader.Read(streamID, request.ExpectedSequence, len(request.Records), 0)

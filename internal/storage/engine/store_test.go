@@ -3,8 +3,10 @@ package engine
 import (
 	"context"
 	"errors"
+	"fmt"
 	"github.com/akzj/streamd/internal/storage/errdefs"
 	"github.com/akzj/streamd/internal/storage/format"
+	"sync"
 	"testing"
 	"time"
 )
@@ -57,6 +59,84 @@ func TestAppendBatchDeduplicateAndRestart(t *testing.T) {
 	result, err = store.Append(context.Background(), next)
 	if err != nil || result.FirstSequence != 2 {
 		t.Fatalf("restart append %+v %v", result, err)
+	}
+}
+
+func TestConcurrentAppendsAcrossStreams(t *testing.T) {
+	store, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	const streams = 24
+	for i := 0; i < streams; i++ {
+		name := fmt.Sprintf("stream-%02d", i)
+		if _, err = store.Append(context.Background(), AppendRequest{Namespace: "concurrent", Stream: name, RequestID: []byte("initial"), Producer: "test", Records: []InputRecord{{Payload: []byte("zero")}}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	start := make(chan struct{})
+	errorsByStream := make(chan error, streams)
+	var wait sync.WaitGroup
+	for i := 0; i < streams; i++ {
+		wait.Add(1)
+		go func(i int) {
+			defer wait.Done()
+			<-start
+			name := fmt.Sprintf("stream-%02d", i)
+			_, appendErr := store.Append(context.Background(), AppendRequest{Namespace: "concurrent", Stream: name, ExpectedSequence: 1, RequestID: []byte("second"), Producer: "test", Records: []InputRecord{{Payload: []byte("one")}}})
+			errorsByStream <- appendErr
+		}(i)
+	}
+	close(start)
+	wait.Wait()
+	close(errorsByStream)
+	for appendErr := range errorsByStream {
+		if appendErr != nil {
+			t.Fatal(appendErr)
+		}
+	}
+	for i := 0; i < streams; i++ {
+		name := fmt.Sprintf("stream-%02d", i)
+		result, readErr := store.Read("concurrent", name, 0, 10, 0)
+		if readErr != nil || len(result.Records) != 2 || result.Records[1].Sequence != 1 {
+			t.Fatalf("%s Read = %+v, error = %v", name, result, readErr)
+		}
+	}
+}
+
+func TestConcurrentSameSequenceHasSingleWinner(t *testing.T) {
+	store, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err = store.Append(context.Background(), AppendRequest{Namespace: "n", Stream: "s", RequestID: []byte("initial"), Producer: "test", Records: []InputRecord{{Payload: []byte("zero")}}}); err != nil {
+		t.Fatal(err)
+	}
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		go func(i int) {
+			<-start
+			_, appendErr := store.Append(context.Background(), AppendRequest{Namespace: "n", Stream: "s", ExpectedSequence: 1, RequestID: []byte(fmt.Sprintf("request-%d", i)), Producer: "test", Records: []InputRecord{{Payload: []byte{byte(i)}}}})
+			results <- appendErr
+		}(i)
+	}
+	close(start)
+	var successes, conflicts int
+	for i := 0; i < 2; i++ {
+		appendErr := <-results
+		if appendErr == nil {
+			successes++
+		} else if errors.Is(appendErr, errdefs.ErrSequenceConflict) {
+			conflicts++
+		} else {
+			t.Fatalf("unexpected Append error = %v", appendErr)
+		}
+	}
+	if successes != 1 || conflicts != 1 {
+		t.Fatalf("successes = %d, conflicts = %d", successes, conflicts)
 	}
 }
 
