@@ -14,10 +14,28 @@ import (
 )
 
 var (
-	ErrNotRetained   = errors.New("WAL Entry is not retained")
-	ErrHistoryAhead  = errors.New("WAL Entry is ahead of history")
-	ErrEntryTooLarge = errors.New("WAL Entry exceeds range byte limit")
+	ErrNotRetained       = errors.New("WAL Entry is not retained")
+	ErrHistoryAhead      = errors.New("WAL Entry is ahead of history")
+	ErrEntryTooLarge     = errors.New("WAL Entry exceeds range byte limit")
+	ErrRetentionPressure = errors.New("WAL retention exceeds its configured bound")
 )
+
+type GCOptions struct {
+	SegmentedThrough uint64
+	SnapshotThrough  uint64
+	SnapshotVerified bool
+	ReplicaDurable   HistoryPosition
+	MaxRetainedBytes uint64
+}
+
+type GCResult struct {
+	DeletedFiles      []string
+	DeletedBytes      uint64
+	RetainedBytes     uint64
+	EarliestWAL       uint64
+	NeedsSnapshot     bool
+	RetentionPressure bool
+}
 
 type HistoryPosition struct {
 	Present bool
@@ -283,6 +301,66 @@ func (h *History) RetainedFiles() []string {
 		result[i] = file.name
 	}
 	return result
+}
+
+// Collect removes only a contiguous sealed WAL prefix covered by both local
+// Segments and a verified installable Snapshot. A pin stops collection at that
+// file so the retained history can never acquire a hole.
+func (h *History) Collect(options GCOptions) (GCResult, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	result := GCResult{}
+	if len(h.files) == 0 {
+		return result, fmt.Errorf("WAL history is empty")
+	}
+	through := options.SegmentedThrough
+	if options.SnapshotThrough < through {
+		through = options.SnapshotThrough
+	}
+	deleteCount := 0
+	if options.SnapshotVerified {
+		for _, file := range h.files {
+			if !file.sealed || file.count == 0 || file.last > through || h.pins[file.name] > 0 {
+				break
+			}
+			if err := os.Remove(file.path); err != nil {
+				return result, err
+			}
+			result.DeletedFiles = append(result.DeletedFiles, file.name)
+			result.DeletedBytes += uint64(file.size)
+			delete(h.sealedCache, file.path)
+			deleteCount++
+		}
+	}
+	if deleteCount > 0 {
+		h.files = append([]historyFile(nil), h.files[deleteCount:]...)
+		if err := syncWALDir(h.root); err != nil {
+			return result, err
+		}
+	}
+	for _, file := range h.files {
+		if file.size > 0 {
+			result.RetainedBytes += uint64(file.size)
+		}
+	}
+	result.EarliestWAL = h.files[0].first
+	if result.EarliestWAL > 0 && (!options.ReplicaDurable.Present || options.ReplicaDurable.EntryID < result.EarliestWAL-1) {
+		result.NeedsSnapshot = true
+	}
+	result.RetentionPressure = options.MaxRetainedBytes > 0 && result.RetainedBytes > options.MaxRetainedBytes
+	if result.RetentionPressure {
+		return result, ErrRetentionPressure
+	}
+	return result, nil
+}
+
+func syncWALDir(root string) error {
+	directory, err := os.Open(filepath.Join(root, "wal"))
+	if err != nil {
+		return err
+	}
+	defer directory.Close()
+	return directory.Sync()
 }
 
 func scanHistoryFile(path string, sealed bool) (historyFile, error) {

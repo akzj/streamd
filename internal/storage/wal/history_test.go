@@ -197,6 +197,83 @@ func TestHistoryIgnoresUnpublishedHeaderOnlyWAL(t *testing.T) {
 	}
 }
 
+func TestHistoryGCRequiresSnapshotCoverageAndHonorsPins(t *testing.T) {
+	root, err := fsutil.OpenRoot(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	log, err := Create(root.Path(), 0, 1, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer log.Close()
+	previous, _ := appendHistoryEntries(t, log, 0, 2, 0, 1)
+	if err = log.Rotate(1, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	previous, _ = appendHistoryEntries(t, log, 2, 2, previous, 1)
+	if err = log.Rotate(1, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = appendHistoryEntries(t, log, 4, 2, previous, 1)
+	if err = log.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	history, err := OpenHistory(root.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := history.Collect(GCOptions{SegmentedThrough: 3, SnapshotThrough: 3})
+	if err != nil || len(result.DeletedFiles) != 0 {
+		t.Fatalf("unverified Snapshot GC = %+v, %v", result, err)
+	}
+	release, err := history.PinRange(0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err = history.Collect(GCOptions{SegmentedThrough: 3, SnapshotThrough: 3, SnapshotVerified: true})
+	if err != nil || len(result.DeletedFiles) != 0 {
+		t.Fatalf("pinned GC = %+v, %v", result, err)
+	}
+	release()
+	result, err = history.Collect(GCOptions{SegmentedThrough: 3, SnapshotThrough: 3, SnapshotVerified: true, ReplicaDurable: HistoryPosition{Present: true, EntryID: 1}})
+	if err != nil || len(result.DeletedFiles) != 2 || result.EarliestWAL != 4 || !result.NeedsSnapshot {
+		t.Fatalf("GC = %+v, %v", result, err)
+	}
+	if files := history.RetainedFiles(); len(files) != 1 {
+		t.Fatalf("retained files = %v", files)
+	}
+	if _, statErr := os.Stat(filepath.Join(root.Path(), "wal", result.DeletedFiles[0])); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("deleted file still exists: %v", statErr)
+	}
+}
+
+func TestHistoryGCReportsRetentionPressure(t *testing.T) {
+	root, err := fsutil.OpenRoot(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	log, err := Create(root.Path(), 0, 1, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer log.Close()
+	_, _ = appendHistoryEntries(t, log, 0, 1, 0, 1)
+	if err = log.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	history, err := OpenHistory(root.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := history.Collect(GCOptions{MaxRetainedBytes: 1})
+	if !errors.Is(err, ErrRetentionPressure) || !result.RetentionPressure || len(result.DeletedFiles) != 0 {
+		t.Fatalf("pressure = %+v, %v", result, err)
+	}
+}
+
 func appendHistoryEntries(t *testing.T, log *Log, first uint64, count int, previous uint32, term uint64) (uint32, [][]byte) {
 	t.Helper()
 	entries := make([][]byte, 0, count)

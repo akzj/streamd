@@ -26,6 +26,7 @@ const (
 	ErrLogGap           ErrorCode = "LOG_GAP"
 	ErrLogDiverged      ErrorCode = "LOG_DIVERGED"
 	ErrNoRecoverySource ErrorCode = "NO_RECOVERY_SOURCE"
+	ErrNeedsSnapshot    ErrorCode = "NEEDS_SNAPSHOT"
 )
 
 type ProtocolError struct {

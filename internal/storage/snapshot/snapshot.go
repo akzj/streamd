@@ -20,8 +20,11 @@ import (
 type Result struct {
 	Path               string
 	SnapshotID         format.UUID
+	GroupID            format.UUID
+	Term               uint64
 	ManifestGeneration uint64
 	CheckpointEntryID  uint64
+	CheckpointCRC32C   uint32
 	Artifacts          uint64
 }
 
@@ -50,7 +53,7 @@ func CreateOnline(store *engine.Store, destination string) (result Result, err e
 	if err != nil {
 		return result, err
 	}
-	if inside(dataAbs, destination) {
+	if inside(dataAbs, destination) && filepath.Dir(destination) != filepath.Join(dataAbs, "snapshots") {
 		return result, fmt.Errorf("Snapshot destination cannot be inside the data root")
 	}
 	if _, err = os.Stat(destination); !errors.Is(err, os.ErrNotExist) {
@@ -150,7 +153,7 @@ func CreateOnline(store *engine.Store, destination string) (result Result, err e
 	if err = fsutil.SyncDir(parent); err != nil {
 		return result, err
 	}
-	return Result{Path: destination, SnapshotID: snapshotID, ManifestGeneration: manifest.Header.Generation, CheckpointEntryID: manifest.Header.LastEntryID, Artifacts: uint64(len(artifacts))}, nil
+	return Result{Path: destination, SnapshotID: snapshotID, GroupID: node.GroupID, Term: store.Health().Term, ManifestGeneration: manifest.Header.Generation, CheckpointEntryID: manifest.Header.LastEntryID, CheckpointCRC32C: manifest.Header.LastEntryCRC32C, Artifacts: uint64(len(artifacts))}, nil
 }
 
 func Verify(path string) (Result, error) {
@@ -213,7 +216,7 @@ func Verify(path string) (Result, error) {
 			return Result{}, fmt.Errorf("Snapshot is missing Segment %x", reference.SegmentID)
 		}
 	}
-	return Result{Path: path, SnapshotID: snapshot.Header.SnapshotID, ManifestGeneration: snapshot.Header.ManifestGeneration, CheckpointEntryID: snapshot.Header.CheckpointEntryID, Artifacts: snapshot.Header.ArtifactCount}, nil
+	return Result{Path: path, SnapshotID: snapshot.Header.SnapshotID, GroupID: snapshot.Header.GroupID, Term: snapshot.Header.Term, ManifestGeneration: snapshot.Header.ManifestGeneration, CheckpointEntryID: snapshot.Header.CheckpointEntryID, CheckpointCRC32C: snapshot.Header.CheckpointEntryCRC32C, Artifacts: snapshot.Header.ArtifactCount}, nil
 }
 
 func copyFile(destination, source string) error {

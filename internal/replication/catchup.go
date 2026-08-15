@@ -2,6 +2,7 @@ package replication
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/akzj/streamd/internal/storage/format"
@@ -23,6 +24,9 @@ func (p *Primary) CatchUp(ctx context.Context, history CatchUpHistory, start, du
 	if start <= durableThrough {
 		release, err := history.PinRange(start, durableThrough)
 		if err != nil {
+			if errors.Is(err, wal.ErrNotRetained) {
+				return protocolError(ErrNeedsSnapshot, "catch-up WAL is no longer retained")
+			}
 			return fmt.Errorf("pin catch-up WAL: %w", err)
 		}
 		defer release()
@@ -30,6 +34,9 @@ func (p *Primary) CatchUp(ctx context.Context, history CatchUpHistory, start, du
 		for next <= durableThrough {
 			batch, err := history.ReadRange(next, maxEntries, maxBytes)
 			if err != nil {
+				if errors.Is(err, wal.ErrNotRetained) {
+					return protocolError(ErrNeedsSnapshot, "catch-up WAL was collected")
+				}
 				return fmt.Errorf("read catch-up WAL: %w", err)
 			}
 			if len(batch.Entries) == 0 {

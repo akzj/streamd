@@ -251,7 +251,7 @@ func rpcError(err error) error {
 		return nil
 	}
 	code := codes.FailedPrecondition
-	if !IsCode(err, ErrInvalidState) && !IsCode(err, ErrWrongGroup) && !IsCode(err, ErrTermStale) && !IsCode(err, ErrNotLeader) && !IsCode(err, ErrLogGap) && !IsCode(err, ErrLogDiverged) && !IsCode(err, ErrNoRecoverySource) {
+	if !IsCode(err, ErrInvalidState) && !IsCode(err, ErrWrongGroup) && !IsCode(err, ErrTermStale) && !IsCode(err, ErrNotLeader) && !IsCode(err, ErrLogGap) && !IsCode(err, ErrLogDiverged) && !IsCode(err, ErrNoRecoverySource) && !IsCode(err, ErrNeedsSnapshot) {
 		return status.Error(codes.Internal, "replication operation failed")
 	}
 	if IsCode(err, ErrInvalidState) || IsCode(err, ErrWrongGroup) {
