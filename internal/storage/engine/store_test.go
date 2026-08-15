@@ -4,12 +4,38 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/akzj/streamd/internal/storage/errdefs"
-	"github.com/akzj/streamd/internal/storage/format"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/akzj/streamd/internal/storage/errdefs"
+	"github.com/akzj/streamd/internal/storage/format"
 )
+
+type engineGuard struct {
+	err error
+}
+
+func (g *engineGuard) CanCommit() error { return g.err }
+
+type engineReplica struct {
+	terms []uint64
+}
+
+func (r *engineReplica) Replicate(_ context.Context, encoded [][]byte) (uint64, error) {
+	var last uint64
+	for _, value := range encoded {
+		entry, err := format.UnmarshalWALEntry(value)
+		if err != nil {
+			return 0, err
+		}
+		r.terms = append(r.terms, entry.Term)
+		last = entry.EntryID
+	}
+	return last, nil
+}
+
+func (*engineReplica) AdvanceCommit(context.Context, uint64) error { return nil }
 
 func TestAppendBatchDeduplicateAndRestart(t *testing.T) {
 	dir := t.TempDir()
@@ -60,6 +86,39 @@ func TestAppendBatchDeduplicateAndRestart(t *testing.T) {
 	if err != nil || result.FirstSequence != 2 {
 		t.Fatalf("restart append %+v %v", result, err)
 	}
+}
+
+func TestReplicatedEngineUsesTermGuardAndStrictWatermarks(t *testing.T) {
+	identity := format.NodeIdentity{ClusterID: engineID(1), GroupID: engineID(2), NodeID: engineID(3), CreatedAt: 1}
+	guard := &engineGuard{}
+	replica := &engineReplica{}
+	store, err := OpenReplicated(t.TempDir(), identity, ReplicationOptions{Term: 7, Role: format.ReplicationRolePrimary, Durability: format.ReplicationDurabilityStrict, Replica: replica, Guard: guard})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	_, err = store.Append(context.Background(), AppendRequest{Namespace: "strict", Stream: "events", RequestID: []byte("one"), Producer: "test", Records: []InputRecord{{Payload: []byte("value")}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(replica.terms) != 2 || replica.terms[0] != 7 || replica.terms[1] != 7 {
+		t.Fatalf("replicated Terms = %v", replica.terms)
+	}
+	health := store.Health()
+	if health.Role != format.ReplicationRolePrimary || health.Durability != format.ReplicationDurabilityStrict || health.Term != 7 || !health.Watermarks.HasReplicated || health.Watermarks.Replicated != health.Watermarks.Committed {
+		t.Fatalf("Health = %+v", health)
+	}
+	guard.err = errors.New("lease expired")
+	_, err = store.Append(context.Background(), AppendRequest{Namespace: "strict", Stream: "events", ExpectedSequence: 1, RequestID: []byte("two"), Producer: "test", Records: []InputRecord{{}}})
+	if !errors.Is(err, errdefs.ErrNotLeader) {
+		t.Fatalf("expired Lease error = %v", err)
+	}
+}
+
+func engineID(value byte) format.UUID {
+	var id format.UUID
+	id[15] = value
+	return id
 }
 
 func TestConcurrentAppendsAcrossStreams(t *testing.T) {

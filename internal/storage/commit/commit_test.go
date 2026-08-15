@@ -31,6 +31,23 @@ type fakeReplica struct {
 	replicateBlock chan struct{}
 }
 
+type callGuard struct {
+	mu     sync.Mutex
+	calls  int
+	failAt int
+	err    error
+}
+
+func (g *callGuard) CanCommit() error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.calls++
+	if g.calls == g.failAt {
+		return g.err
+	}
+	return nil
+}
+
 func (f *fakeReplica) Replicate(ctx context.Context, entries [][]byte) (uint64, error) {
 	if f.replicateBlock != nil {
 		select {
@@ -199,6 +216,36 @@ func TestStrictCommitAdvanceFailureDoesNotRevokeCommit(t *testing.T) {
 	}
 	if fatal := c.FatalError(); fatal != nil {
 		t.Fatalf("CommitAdvance poisoned Committer: %v", fatal)
+	}
+}
+
+func TestCommitGuardRejectsBeforeAllocationWithoutPoisoning(t *testing.T) {
+	stop := errors.New("lease unavailable")
+	guard := &callGuard{failAt: 1, err: stop}
+	log := &fakeLog{}
+	c := NewWithOptions(log, memtable.New(0), Options{Guard: guard})
+	defer c.Close()
+	result, err := c.Commit(context.Background(), encodedBatch(t))
+	if !errors.Is(err, stop) || result.ResultUncertain || c.FatalError() != nil {
+		t.Fatalf("result %+v, error %v, fatal %v", result, err, c.FatalError())
+	}
+	if log.appended != 0 {
+		t.Fatal("guarded request reached WAL")
+	}
+}
+
+func TestCommitGuardExpiryAfterDurabilityFailsClosed(t *testing.T) {
+	stop := errors.New("lease expired")
+	guard := &callGuard{failAt: 3, err: stop}
+	c := NewWithOptions(&fakeLog{}, memtable.New(0), Options{Guard: guard, Replica: &fakeReplica{ack: 0}})
+	defer c.Close()
+	result, err := c.Commit(context.Background(), encodedBatch(t))
+	if !errors.Is(err, stop) || !result.ResultUncertain || !errors.Is(c.FatalError(), stop) {
+		t.Fatalf("result %+v, error %v, fatal %v", result, err, c.FatalError())
+	}
+	water := c.Watermarks()
+	if !water.HasReplicated || water.HasCommitted || water.HasApplied {
+		t.Fatalf("watermarks = %+v", water)
 	}
 }
 

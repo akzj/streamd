@@ -24,6 +24,10 @@ type Replica interface {
 	AdvanceCommit(context.Context, uint64) error
 }
 
+type Guard interface {
+	CanCommit() error
+}
+
 type Options struct {
 	MaxDelay       time.Duration
 	MaxRequests    int
@@ -31,6 +35,7 @@ type Options struct {
 	QueueCapacity  int
 	Replica        Replica
 	ReplicaTimeout time.Duration
+	Guard          Guard
 }
 
 type Watermarks struct {
@@ -105,6 +110,7 @@ type Committer struct {
 	fatal      error
 	watermarks Watermarks
 	replica    Replica
+	guard      Guard
 }
 
 func New(log DurableLog, table *memtable.Table) *Committer {
@@ -127,7 +133,7 @@ func NewWithOptions(log DurableLog, table *memtable.Table, options Options) *Com
 	if options.ReplicaTimeout <= 0 {
 		options.ReplicaTimeout = 30 * time.Second
 	}
-	committer := &Committer{log: log, table: table, options: options, queue: make(chan *pending, options.QueueCapacity), done: make(chan struct{}), replica: options.Replica}
+	committer := &Committer{log: log, table: table, options: options, queue: make(chan *pending, options.QueueCapacity), done: make(chan struct{}), replica: options.Replica, guard: options.Guard}
 	go committer.run()
 	return committer
 }
@@ -282,6 +288,12 @@ func (c *Committer) process(group []*pending) {
 		completeGroup(group, false, fmt.Errorf("commit core failed: %w", fatal))
 		return
 	}
+	if c.guard != nil {
+		if err := c.guard.CanCommit(); err != nil {
+			completeGroup(group, false, fmt.Errorf("commit guard rejected WAL allocation: %w", err))
+			return
+		}
+	}
 	var flattened [][]byte
 	for _, request := range group {
 		if err := c.table.ValidateBatch(request.entries); err != nil {
@@ -310,6 +322,14 @@ func (c *Committer) process(group []*pending) {
 	c.watermarks.HasLocalDurable = true
 	c.watermarks.LocalDurable = last
 	c.stateMu.Unlock()
+	if c.guard != nil {
+		if err := c.guard.CanCommit(); err != nil {
+			wrapped := fmt.Errorf("commit guard expired after local durability: %w", err)
+			c.setFatal(wrapped)
+			completeGroup(group, true, wrapped)
+			return
+		}
+	}
 	if c.replica != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), c.options.ReplicaTimeout)
 		replicated, err := c.replica.Replicate(ctx, flattened)
@@ -330,6 +350,14 @@ func (c *Committer) process(group []*pending) {
 		c.watermarks.HasReplicated = true
 		c.watermarks.Replicated = last
 		c.stateMu.Unlock()
+	}
+	if c.guard != nil {
+		if err := c.guard.CanCommit(); err != nil {
+			wrapped := fmt.Errorf("commit guard expired before commit advance: %w", err)
+			c.setFatal(wrapped)
+			completeGroup(group, true, wrapped)
+			return
+		}
 	}
 	c.stateMu.Lock()
 	c.watermarks.HasCommitted = true

@@ -49,8 +49,21 @@ type AppendResult struct {
 	Deduplicated    bool
 }
 type Health struct {
-	Watermarks commit.Watermarks
-	Fatal      error
+	Watermarks       commit.Watermarks
+	Fatal            error
+	WriteUnavailable error
+	Role             format.ReplicationRole
+	Durability       format.ReplicationDurability
+	Term             uint64
+}
+
+type ReplicationOptions struct {
+	Term           uint64
+	Role           format.ReplicationRole
+	Durability     format.ReplicationDurability
+	Replica        commit.Replica
+	Guard          commit.Guard
+	ReplicaTimeout time.Duration
 }
 type streamKey struct {
 	namespace string
@@ -76,6 +89,11 @@ type Store struct {
 	previousCRC32C uint32
 	lastRecordedAt int64
 	checkpointHook fsutil.CrashHook
+	term           uint64
+	role           format.ReplicationRole
+	durability     format.ReplicationDurability
+	guard          commit.Guard
+	commitOptions  commit.Options
 }
 
 func (s *Store) Read(namespace, name string, from uint64, maxRecords int, maxBytes uint64) (readstore.Result, error) {
@@ -108,18 +126,28 @@ func (s *Store) ResolveTime(namespace, name string, target int64, mode readstore
 func (s *Store) Health() Health {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return Health{Watermarks: s.committer.Watermarks(), Fatal: errors.Join(s.committer.FatalError(), s.fatalError())}
+	return Health{Watermarks: s.committer.Watermarks(), Fatal: errors.Join(s.committer.FatalError(), s.fatalError()), WriteUnavailable: s.writeUnavailable(), Role: s.role, Durability: s.durability, Term: s.term}
 }
 
 func Open(path string) (*Store, error) {
-	return open(path, nil)
+	return open(path, nil, nil)
 }
 
 func OpenWithIdentity(path string, node format.NodeIdentity) (*Store, error) {
-	return open(path, &node)
+	return open(path, &node, nil)
 }
 
-func open(path string, node *format.NodeIdentity) (*Store, error) {
+func OpenReplicated(path string, node format.NodeIdentity, options ReplicationOptions) (*Store, error) {
+	if options.Term == 0 || options.Role == 0 || options.Durability == 0 || options.Guard == nil {
+		return nil, fmt.Errorf("replicated engine requires Term, Role, durability, and commit guard")
+	}
+	if options.Role == format.ReplicationRolePrimary && options.Durability == format.ReplicationDurabilityStrict && options.Replica == nil {
+		return nil, fmt.Errorf("Strict Primary requires a replica")
+	}
+	return open(path, &node, &options)
+}
+
+func open(path string, node *format.NodeIdentity, replication *ReplicationOptions) (*Store, error) {
 	root, err := fsutil.OpenRoot(path)
 	if err != nil {
 		return nil, err
@@ -135,13 +163,28 @@ func open(path string, node *format.NodeIdentity) (*Store, error) {
 		root.Close()
 		return nil, err
 	}
+	if replication != nil && state.WAL.Scan().Header.CreatedTerm != replication.Term {
+		if err = state.WAL.Rotate(replication.Term, time.Now()); err != nil {
+			state.Close()
+			root.Close()
+			return nil, fmt.Errorf("rotate WAL for Term %d: %w", replication.Term, err)
+		}
+	}
 	var lastRecordedAt int64
 	for _, snapshot := range state.MemTable.Snapshot() {
 		if snapshot.Tail.RecordCount > 0 && snapshot.Tail.LastRecordedAt > lastRecordedAt {
 			lastRecordedAt = snapshot.Tail.LastRecordedAt
 		}
 	}
-	return &Store{root: root, state: state, committer: commit.New(state.WAL, state.MemTable), reader: readstore.New(state.MemTable, state.Segments, 1024), now: time.Now, notifications: make(map[streamKey]chan struct{}), appendGates: make(map[streamKey]chan struct{}), nextEntryID: state.WAL.NextEntryID(), previousCRC32C: state.WAL.PreviousEntryCRC32C(), lastRecordedAt: lastRecordedAt}, nil
+	role, durability := format.ReplicationRoleSingle, format.ReplicationDurabilitySingleSync
+	var term uint64
+	var guard commit.Guard
+	var commitOptions commit.Options
+	if replication != nil {
+		term, role, durability, guard = replication.Term, replication.Role, replication.Durability, replication.Guard
+		commitOptions = commit.Options{Replica: replication.Replica, Guard: replication.Guard, ReplicaTimeout: replication.ReplicaTimeout}
+	}
+	return &Store{root: root, state: state, committer: commit.NewWithOptions(state.WAL, state.MemTable, commitOptions), reader: readstore.New(state.MemTable, state.Segments, 1024), now: time.Now, notifications: make(map[streamKey]chan struct{}), appendGates: make(map[streamKey]chan struct{}), nextEntryID: state.WAL.NextEntryID(), previousCRC32C: state.WAL.PreviousEntryCRC32C(), lastRecordedAt: lastRecordedAt, term: term, role: role, durability: durability, guard: guard, commitOptions: commitOptions}, nil
 }
 func (s *Store) Close() error {
 	s.mu.Lock()
@@ -159,6 +202,9 @@ func (s *Store) Close() error {
 func (s *Store) Append(ctx context.Context, request AppendRequest) (AppendResult, error) {
 	if request.Namespace == "" || request.Stream == "" || len(request.RequestID) == 0 || len(request.RequestID) > format.MaxRequestIDLength || request.Producer == "" || len(request.Records) == 0 || len(request.Records) > format.MaxBatchRecordCount {
 		return AppendResult{}, errdefs.ErrInvalidArgument
+	}
+	if err := s.writeUnavailable(); err != nil {
+		return AppendResult{}, err
 	}
 	hash, err := RequestHash(request)
 	if err != nil {
@@ -188,6 +234,10 @@ func (s *Store) Append(ctx context.Context, request AppendRequest) (AppendResult
 	if err = s.fatalError(); err != nil {
 		s.mu.Unlock()
 		return AppendResult{}, fmt.Errorf("engine failed: %w", err)
+	}
+	if err = s.writeUnavailable(); err != nil {
+		s.mu.Unlock()
+		return AppendResult{}, err
 	}
 	mapping, exists := s.state.Registry.Lookup(request.Namespace, request.Stream)
 	if !exists {
@@ -244,7 +294,7 @@ func (s *Store) Append(ctx context.Context, request AppendRequest) (AppendResult
 			s.mu.Unlock()
 			return AppendResult{}, err
 		}
-		walEntry, err := format.MarshalWALEntry(0, previous, frame)
+		walEntry, err := format.MarshalWALEntry(s.term, previous, frame)
 		if err != nil {
 			s.mu.Unlock()
 			return AppendResult{}, err
@@ -320,7 +370,7 @@ func (s *Store) Checkpoint() (format.Manifest, bool, error) {
 		s.setFatal(err)
 		return format.Manifest{}, false, err
 	}
-	if err := s.state.WAL.Rotate(0, s.now()); err != nil {
+	if err := s.state.WAL.Rotate(s.term, s.now()); err != nil {
 		s.setFatal(err)
 		return format.Manifest{}, false, err
 	}
@@ -375,7 +425,7 @@ func (s *Store) Checkpoint() (format.Manifest, bool, error) {
 	oldTable := s.state.MemTable
 	s.state.MemTable = newTable
 	s.state.Segments = append(s.state.Segments, reader)
-	s.committer = commit.New(s.state.WAL, newTable)
+	s.committer = commit.NewWithOptions(s.state.WAL, newTable, s.commitOptions)
 	s.reader = readstore.New(newTable, s.state.Segments, 1024)
 	s.viewMu.Unlock()
 	oldTable.Freeze()
@@ -391,6 +441,18 @@ func (s *Store) fatalError() error {
 	s.fatalMu.RLock()
 	defer s.fatalMu.RUnlock()
 	return s.fatal
+}
+
+func (s *Store) writeUnavailable() error {
+	if s.role != format.ReplicationRoleSingle {
+		if s.role != format.ReplicationRolePrimary || s.guard == nil {
+			return errdefs.ErrNotLeader
+		}
+		if err := s.guard.CanCommit(); err != nil {
+			return fmt.Errorf("%w: %v", errdefs.ErrNotLeader, err)
+		}
+	}
+	return nil
 }
 
 func (s *Store) setFatal(err error) {
@@ -472,7 +534,7 @@ func (s *Store) commitRegistry(proposal format.RegistryRecord, payload []byte) e
 	if err != nil {
 		return err
 	}
-	encoded, err := format.MarshalWALEntry(0, s.previousCRC32C, frame)
+	encoded, err := format.MarshalWALEntry(s.term, s.previousCRC32C, frame)
 	if err != nil {
 		return err
 	}

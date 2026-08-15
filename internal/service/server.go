@@ -104,7 +104,8 @@ func (s *Server) BeginDrain() {
 }
 
 func (s *Server) ReadyWrite() bool {
-	return !s.draining.Load() && s.backend.Health().Fatal == nil
+	health := s.backend.Health()
+	return !s.draining.Load() && health.Fatal == nil && health.WriteUnavailable == nil
 }
 
 func (s *Server) Append(ctx context.Context, request *streamdv1.AppendRequest) (*streamdv1.AppendResponse, error) {
@@ -121,7 +122,7 @@ func (s *Server) Append(ctx context.Context, request *streamdv1.AppendRequest) (
 		RecordedAt:     timestamp(result.FirstRecordedAt),
 		StorageEntryId: result.FirstEntryID,
 		Deduplicated:   result.Deduplicated,
-		Durability:     streamdv1.Durability_DURABILITY_SINGLE_SYNC,
+		Durability:     durabilityProto(s.backend.Health().Durability),
 	}, nil
 }
 
@@ -142,7 +143,7 @@ func (s *Server) AppendBatch(ctx context.Context, request *streamdv1.AppendBatch
 		FirstStorageEntryId: result.FirstEntryID,
 		LastStorageEntryId:  result.LastEntryID,
 		Deduplicated:        result.Deduplicated,
-		Durability:          streamdv1.Durability_DURABILITY_SINGLE_SYNC,
+		Durability:          durabilityProto(s.backend.Health().Durability),
 	}, nil
 }
 
@@ -156,8 +157,9 @@ func (s *Server) append(ctx context.Context, ref *streamdv1.StreamRef, expected 
 	if len(requestID) == 0 {
 		return engine.AppendResult{}, invalidArgument("request_id is required", nil)
 	}
-	if required != streamdv1.Durability_DURABILITY_UNSPECIFIED && required != streamdv1.Durability_DURABILITY_SINGLE_SYNC {
-		if required == streamdv1.Durability_DURABILITY_REPLICATED_STRICT {
+	available := durabilityProto(s.backend.Health().Durability)
+	if required != streamdv1.Durability_DURABILITY_UNSPECIFIED && required != streamdv1.Durability_DURABILITY_SINGLE_SYNC && required != available {
+		if required == streamdv1.Durability_DURABILITY_REPLICATED_STRICT || required == streamdv1.Durability_DURABILITY_DEGRADED_LOCAL_ONLY {
 			return engine.AppendResult{}, streamdStatus(codes.FailedPrecondition, streamdv1.ErrorCode_ERROR_CODE_DURABILITY_UNAVAILABLE, "required durability is unavailable", false, false, nil, nil, requestID)
 		}
 		return engine.AppendResult{}, invalidArgument("required_durability is invalid for Append", requestID)
@@ -303,8 +305,11 @@ func (s *Server) Health(context.Context, *streamdv1.HealthRequest) (*streamdv1.H
 	health := s.backend.Health()
 	response := &streamdv1.HealthResponse{
 		Status:     streamdv1.HealthStatus_HEALTH_STATUS_READY_WRITE,
-		Role:       streamdv1.NodeRole_NODE_ROLE_SINGLE,
-		Durability: streamdv1.Durability_DURABILITY_SINGLE_SYNC,
+		Role:       roleProto(health.Role),
+		Durability: durabilityProto(health.Durability),
+	}
+	if health.Term > 0 {
+		response.Term = uint64ptr(health.Term)
 	}
 	if health.Fatal != nil {
 		response.Status = streamdv1.HealthStatus_HEALTH_STATUS_FAILED
@@ -313,6 +318,10 @@ func (s *Server) Health(context.Context, *streamdv1.HealthRequest) (*streamdv1.H
 	if s.draining.Load() && health.Fatal == nil {
 		response.Status = streamdv1.HealthStatus_HEALTH_STATUS_READY_READ
 		response.Reasons = []string{"server is draining"}
+	}
+	if health.WriteUnavailable != nil && health.Fatal == nil && !s.draining.Load() {
+		response.Status = streamdv1.HealthStatus_HEALTH_STATUS_READY_READ
+		response.Reasons = []string{health.WriteUnavailable.Error()}
 	}
 	if health.Watermarks.HasLocalDurable {
 		response.LocalDurableEntryId = uint64ptr(health.Watermarks.LocalDurable)
@@ -323,7 +332,34 @@ func (s *Server) Health(context.Context, *streamdv1.HealthRequest) (*streamdv1.H
 	if health.Watermarks.HasApplied {
 		response.AppliedEntryId = uint64ptr(health.Watermarks.Applied)
 	}
+	if health.Watermarks.HasLocalDurable && health.Watermarks.HasReplicated && health.Watermarks.LocalDurable >= health.Watermarks.Replicated {
+		response.ReplicationLagEntries = uint64ptr(health.Watermarks.LocalDurable - health.Watermarks.Replicated)
+	}
 	return response, nil
+}
+
+func durabilityProto(value format.ReplicationDurability) streamdv1.Durability {
+	switch value {
+	case format.ReplicationDurabilityStrict:
+		return streamdv1.Durability_DURABILITY_REPLICATED_STRICT
+	case format.ReplicationDurabilityDegraded:
+		return streamdv1.Durability_DURABILITY_DEGRADED_LOCAL_ONLY
+	default:
+		return streamdv1.Durability_DURABILITY_SINGLE_SYNC
+	}
+}
+
+func roleProto(value format.ReplicationRole) streamdv1.NodeRole {
+	switch value {
+	case format.ReplicationRolePrimary:
+		return streamdv1.NodeRole_NODE_ROLE_PRIMARY
+	case format.ReplicationRoleStandby:
+		return streamdv1.NodeRole_NODE_ROLE_STANDBY
+	case format.ReplicationRoleRecovering:
+		return streamdv1.NodeRole_NODE_ROLE_RECOVERING
+	default:
+		return streamdv1.NodeRole_NODE_ROLE_SINGLE
+	}
 }
 
 func validateStream(ref *streamdv1.StreamRef) error {

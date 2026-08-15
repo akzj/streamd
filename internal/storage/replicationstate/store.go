@@ -2,11 +2,13 @@
 package replicationstate
 
 import (
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/akzj/streamd/internal/storage/format"
 	"github.com/akzj/streamd/internal/storage/fsutil"
@@ -69,6 +71,36 @@ func (s *Store) Current() (format.ReplicationState, bool) {
 func (s *Store) Publish(next format.ReplicationState) (format.ReplicationState, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.publishLocked(next)
+}
+
+// Update serializes a read-modify-publish transition and fills the immutable
+// State identity and generation chain. The callback owns semantic fields but
+// cannot accidentally fork the checkpoint chain.
+func (s *Store) Update(now time.Time, mutate func(*format.ReplicationStateHeader) error) (format.ReplicationState, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if mutate == nil {
+		return format.ReplicationState{}, fmt.Errorf("Replication State mutation is required")
+	}
+	header := format.ReplicationStateHeader{GroupID: s.groupID, NodeID: s.nodeID}
+	if s.current != nil {
+		header = s.current.Header
+		header.Generation++
+		header.PreviousGeneration = s.current.Header.Generation
+		header.PreviousStateSHA256 = s.current.Footer.ContentSHA256
+	}
+	if _, err := rand.Read(header.StateID[:]); err != nil {
+		return format.ReplicationState{}, err
+	}
+	header.CreatedAt = now.UnixNano()
+	if err := mutate(&header); err != nil {
+		return format.ReplicationState{}, err
+	}
+	return s.publishLocked(format.ReplicationState{Header: header})
+}
+
+func (s *Store) publishLocked(next format.ReplicationState) (format.ReplicationState, error) {
 	if next.Header.GroupID != s.groupID || next.Header.NodeID != s.nodeID {
 		return format.ReplicationState{}, fmt.Errorf("Replication State identity does not match NODE")
 	}

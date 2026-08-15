@@ -13,6 +13,7 @@ var (
 	ErrSequenceConflict = errors.New("sequence conflict")
 	ErrRecordTooLarge   = errors.New("record too large")
 	ErrClosed           = errors.New("store closed")
+	ErrNotLeader        = errors.New("node is not a writable leader")
 )
 
 type SequenceAheadError struct {

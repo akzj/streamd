@@ -5,7 +5,9 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/akzj/streamd/internal/storage/format"
 	"github.com/akzj/streamd/internal/storage/fsutil"
@@ -134,6 +136,43 @@ func TestOpenRejectsPointerIdentityMismatch(t *testing.T) {
 	other.NodeID = id(9)
 	if _, err = Open(root.Path(), other); err == nil {
 		t.Fatal("foreign NODE accepted Replication State")
+	}
+}
+
+func TestUpdateSerializesGenerationChain(t *testing.T) {
+	root, err := fsutil.OpenRoot(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	store, err := Open(root.Path(), testIdentity())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wait sync.WaitGroup
+	errorsOut := make(chan error, 8)
+	for range 8 {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			_, updateErr := store.Update(time.Unix(1, 0), func(header *format.ReplicationStateHeader) error {
+				header.Role = format.ReplicationRoleRecovering
+				header.Durability = format.ReplicationDurabilityStrict
+				return nil
+			})
+			errorsOut <- updateErr
+		}()
+	}
+	wait.Wait()
+	close(errorsOut)
+	for updateErr := range errorsOut {
+		if updateErr != nil {
+			t.Fatal(updateErr)
+		}
+	}
+	current, ok := store.Current()
+	if !ok || current.Header.Generation != 7 || current.Header.PreviousGeneration != 6 {
+		t.Fatalf("current = %+v, ok = %v", current.Header, ok)
 	}
 }
 
