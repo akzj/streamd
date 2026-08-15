@@ -21,6 +21,37 @@ type fakeLog struct {
 	syncErr     error
 }
 
+type fakeReplica struct {
+	mu             sync.Mutex
+	ack            uint64
+	replicateErr   error
+	advanceErr     error
+	replicated     int
+	advanced       []uint64
+	replicateBlock chan struct{}
+}
+
+func (f *fakeReplica) Replicate(ctx context.Context, entries [][]byte) (uint64, error) {
+	if f.replicateBlock != nil {
+		select {
+		case <-f.replicateBlock:
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.replicated += len(entries)
+	return f.ack, f.replicateErr
+}
+
+func (f *fakeReplica) AdvanceCommit(_ context.Context, entryID uint64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.advanced = append(f.advanced, entryID)
+	return f.advanceErr
+}
+
 func (f *fakeLog) Append(entries ...[]byte) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -92,6 +123,82 @@ func TestAppendFailurePoisonsCommitter(t *testing.T) {
 	}
 	if _, err = c.Commit(context.Background(), encodedBatch(t)); !errors.Is(err, stop) {
 		t.Fatalf("poisoned Committer error = %v", err)
+	}
+}
+
+func TestStrictCommitWaitsForReplicaDurability(t *testing.T) {
+	release := make(chan struct{})
+	replica := &fakeReplica{ack: 0, replicateBlock: release}
+	table := memtable.New(0)
+	c := NewWithOptions(&fakeLog{}, table, Options{Replica: replica, ReplicaTimeout: time.Second})
+	defer c.Close()
+	future, err := c.Enqueue(encodedBatch(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case completed := <-future.completion:
+		t.Fatalf("commit completed before replica durability: %+v", completed)
+	case <-time.After(20 * time.Millisecond):
+	}
+	if _, ok := table.Tail(1); ok {
+		t.Fatal("Entry became visible before replica durability")
+	}
+	water := c.Watermarks()
+	if !water.HasLocalDurable || water.HasReplicated || water.HasCommitted || water.HasApplied {
+		t.Fatalf("watermarks before ACK = %+v", water)
+	}
+	close(release)
+	if _, err = future.Wait(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	water = c.Watermarks()
+	if !water.HasReplicated || water.Replicated != 0 || !water.HasCommitted || !water.HasApplied {
+		t.Fatalf("watermarks after ACK = %+v", water)
+	}
+	replica.mu.Lock()
+	defer replica.mu.Unlock()
+	if len(replica.advanced) != 1 || replica.advanced[0] != 0 {
+		t.Fatalf("commit advances = %v", replica.advanced)
+	}
+}
+
+func TestStrictReplicaFailureDoesNotCommit(t *testing.T) {
+	stop := errors.New("standby unavailable")
+	c := NewWithOptions(&fakeLog{}, memtable.New(0), Options{Replica: &fakeReplica{replicateErr: stop}})
+	defer c.Close()
+	result, err := c.Commit(context.Background(), encodedBatch(t))
+	if !errors.Is(err, stop) || !result.ResultUncertain {
+		t.Fatalf("result %+v, error %v", result, err)
+	}
+	water := c.Watermarks()
+	if !water.HasLocalDurable || water.HasReplicated || water.HasCommitted || water.HasApplied {
+		t.Fatalf("failed replication watermarks = %+v", water)
+	}
+}
+
+func TestStrictRejectsMismatchedAck(t *testing.T) {
+	c := NewWithOptions(&fakeLog{}, memtable.New(0), Options{Replica: &fakeReplica{ack: 9}})
+	defer c.Close()
+	result, err := c.Commit(context.Background(), encodedBatch(t))
+	if err == nil || !result.ResultUncertain {
+		t.Fatalf("result %+v, error %v", result, err)
+	}
+	if c.Watermarks().HasCommitted {
+		t.Fatal("mismatched ACK committed the group")
+	}
+}
+
+func TestStrictCommitAdvanceFailureDoesNotRevokeCommit(t *testing.T) {
+	stop := errors.New("commit advance lost")
+	replica := &fakeReplica{ack: 0, advanceErr: stop}
+	c := NewWithOptions(&fakeLog{}, memtable.New(0), Options{Replica: replica})
+	defer c.Close()
+	if _, err := c.Commit(context.Background(), encodedBatch(t)); err != nil {
+		t.Fatalf("committed write failed after lost CommitAdvance: %v", err)
+	}
+	if fatal := c.FatalError(); fatal != nil {
+		t.Fatalf("CommitAdvance poisoned Committer: %v", fatal)
 	}
 }
 

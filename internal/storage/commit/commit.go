@@ -15,21 +15,34 @@ type DurableLog interface {
 	Sync() error
 }
 
+// Replica durably copies an already encoded local WAL group. Replicate must
+// return the exact last Entry ID acknowledged by the replica. AdvanceCommit is
+// cumulative notification; a failure does not revoke an already established
+// two-copy commit and is retried by subsequent groups.
+type Replica interface {
+	Replicate(context.Context, [][]byte) (uint64, error)
+	AdvanceCommit(context.Context, uint64) error
+}
+
 type Options struct {
-	MaxDelay      time.Duration
-	MaxRequests   int
-	MaxBytes      uint64
-	QueueCapacity int
+	MaxDelay       time.Duration
+	MaxRequests    int
+	MaxBytes       uint64
+	QueueCapacity  int
+	Replica        Replica
+	ReplicaTimeout time.Duration
 }
 
 type Watermarks struct {
 	HasValue        bool
 	HasLocalDurable bool
 	HasCommitted    bool
+	HasReplicated   bool
 	HasApplied      bool
 	Appended        uint64
 	LocalDurable    uint64
 	Committed       uint64
+	Replicated      uint64
 	Applied         uint64
 }
 
@@ -91,6 +104,7 @@ type Committer struct {
 	closed     bool
 	fatal      error
 	watermarks Watermarks
+	replica    Replica
 }
 
 func New(log DurableLog, table *memtable.Table) *Committer {
@@ -110,7 +124,10 @@ func NewWithOptions(log DurableLog, table *memtable.Table, options Options) *Com
 	if options.QueueCapacity <= 0 {
 		options.QueueCapacity = 1024
 	}
-	committer := &Committer{log: log, table: table, options: options, queue: make(chan *pending, options.QueueCapacity), done: make(chan struct{})}
+	if options.ReplicaTimeout <= 0 {
+		options.ReplicaTimeout = 30 * time.Second
+	}
+	committer := &Committer{log: log, table: table, options: options, queue: make(chan *pending, options.QueueCapacity), done: make(chan struct{}), replica: options.Replica}
 	go committer.run()
 	return committer
 }
@@ -292,6 +309,29 @@ func (c *Committer) process(group []*pending) {
 	c.stateMu.Lock()
 	c.watermarks.HasLocalDurable = true
 	c.watermarks.LocalDurable = last
+	c.stateMu.Unlock()
+	if c.replica != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), c.options.ReplicaTimeout)
+		replicated, err := c.replica.Replicate(ctx, flattened)
+		cancel()
+		if err != nil {
+			wrapped := fmt.Errorf("replicate durable WAL group: %w", err)
+			c.setFatal(wrapped)
+			completeGroup(group, true, wrapped)
+			return
+		}
+		if replicated != last {
+			wrapped := fmt.Errorf("replica acknowledged Entry %d, want %d", replicated, last)
+			c.setFatal(wrapped)
+			completeGroup(group, true, wrapped)
+			return
+		}
+		c.stateMu.Lock()
+		c.watermarks.HasReplicated = true
+		c.watermarks.Replicated = last
+		c.stateMu.Unlock()
+	}
+	c.stateMu.Lock()
 	c.watermarks.HasCommitted = true
 	c.watermarks.Committed = last
 	c.stateMu.Unlock()
@@ -307,6 +347,11 @@ func (c *Committer) process(group []*pending) {
 		c.watermarks.HasApplied = true
 		c.watermarks.Applied = applied
 		c.stateMu.Unlock()
+	}
+	if c.replica != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), c.options.ReplicaTimeout)
+		_ = c.replica.AdvanceCommit(ctx, last)
+		cancel()
 	}
 	for _, request := range group {
 		first := request.entries[0].EntryID
