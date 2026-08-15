@@ -628,6 +628,16 @@ Subscribe 的公共 Cursor 仍是每个 Stream 的 `Sequence`，不暴露 WAL En
 - Snapshot 对象地址使用短期凭据，Manifest checksum 通过已认证控制通道传递；
 - Payload 默认不进入复制日志的诊断输出。
 
+V1 数据节点证书的 URI SAN 固定为：
+
+```text
+spiffe://streamd/cluster/<32 lowercase hex>/group/<32 lowercase hex>/node/<32 lowercase hex>
+```
+
+复制服务必须在 TLS 证书链验证通过后，将 URI SAN 中的 `cluster_id/group_id/node_id`
+与本地配置及每条复制消息声明的身份逐项比较。身份缺失、重复冲突或不匹配均失败关闭。
+内部 `ReplicationService` 只允许节点证书访问，不复用公共 Stream API 的用户授权规则。
+
 ### 15.3 指标
 
 至少暴露：

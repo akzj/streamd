@@ -1,0 +1,99 @@
+syntax = "proto3";
+
+package streamd.v1;
+
+option go_package = "github.com/akzj/streamd/api/streamd/v1;streamdv1";
+
+// ReplicationService is an internal, mTLS-authenticated node-to-node API.
+// Public clients must never be authorized to call it.
+service ReplicationService {
+  rpc Negotiate(ReplicationServiceNegotiateRequest) returns (ReplicationServiceNegotiateResponse);
+  rpc Append(ReplicationServiceAppendRequest) returns (ReplicationServiceAppendResponse);
+  rpc Barrier(ReplicationServiceBarrierRequest) returns (ReplicationServiceBarrierResponse);
+  rpc AdvanceCommit(ReplicationServiceAdvanceCommitRequest) returns (ReplicationServiceAdvanceCommitResponse);
+}
+
+enum ReplicationPlanMode {
+  REPLICATION_PLAN_MODE_UNSPECIFIED = 0;
+  REPLICATION_PLAN_MODE_INCREMENTAL = 1;
+  REPLICATION_PLAN_MODE_SNAPSHOT = 2;
+}
+
+message ReplicationPosition {
+  bool valid = 1;
+  uint64 entry_id = 2;
+  fixed32 crc32c = 3;
+}
+
+message ReplicationServiceNegotiateRequest {
+  uint32 protocol_version = 1;
+  bytes group_id = 2;
+  bytes node_id = 3;
+  uint64 known_term = 4;
+  bytes installed_snapshot_id = 5;
+  ReplicationPosition snapshot = 6;
+  ReplicationPosition last_appended = 7;
+  ReplicationPosition local_durable = 8;
+  ReplicationPosition committed = 9;
+  ReplicationPosition applied = 10;
+}
+
+message ReplicationServiceNegotiateResponse {
+  uint32 protocol_version = 1;
+  uint64 term = 2;
+  bytes leader_id = 3;
+  ReplicationPlanMode mode = 4;
+  uint64 start_entry_id = 5;
+  bytes snapshot_id = 6;
+  ReplicationPosition checkpoint = 7;
+  uint64 earliest_wal_entry_id = 8;
+  ReplicationPosition committed = 9;
+  bytes group_id = 10;
+}
+
+message ReplicationServiceAppendRequest {
+  uint32 protocol_version = 1;
+  bytes group_id = 2;
+  uint64 term = 3;
+  bytes leader_id = 4;
+  ReplicationPosition previous = 5;
+  repeated bytes entries = 6;
+}
+
+message ReplicationServiceAppendResponse {
+  uint32 protocol_version = 1;
+  bytes group_id = 2;
+  bytes node_id = 3;
+  uint64 term = 4;
+}
+
+message ReplicationServiceBarrierRequest {
+  uint32 protocol_version = 1;
+  bytes group_id = 2;
+  uint64 term = 3;
+  bytes leader_id = 4;
+  uint64 through_entry_id = 5;
+}
+
+message ReplicationServiceBarrierResponse {
+  uint64 term = 1;
+  ReplicationPosition durable = 2;
+  uint32 protocol_version = 3;
+  bytes group_id = 4;
+  bytes node_id = 5;
+}
+
+message ReplicationServiceAdvanceCommitRequest {
+  uint32 protocol_version = 1;
+  bytes group_id = 2;
+  uint64 term = 3;
+  bytes leader_id = 4;
+  uint64 commit_entry_id = 5;
+}
+
+message ReplicationServiceAdvanceCommitResponse {
+  uint32 protocol_version = 1;
+  bytes group_id = 2;
+  bytes node_id = 3;
+  uint64 term = 4;
+}
