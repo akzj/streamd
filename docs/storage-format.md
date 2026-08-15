@@ -1300,7 +1300,7 @@ applied <= committed <= local_durable <= last_appended
 replicated <= last_appended
 ```
 
-`REPLICATED_STRICT` Primary 还必须满足 `committed <= replicated`。`STANDBY` 不设置 `HAS_REPLICATED` 和 `HAS_LEASE`；`PRIMARY` 的 `leader_id` 必须等于本地 `node_id` 并拥有 Lease；`SINGLE` 不设置 Leader、Lease、Replicated 或 Snapshot 复制状态。`RECOVERING` 不拥有 Lease。
+`REPLICATED_STRICT` Primary 还必须满足 `committed <= replicated`。`STANDBY` 不设置 `HAS_REPLICATED` 和 `HAS_LEASE`；`PRIMARY` 的 `leader_id` 必须等于本地 `node_id` 并拥有 Lease；`SINGLE` 不设置 Leader、Lease 或 Replicated，但可以记录用于本地恢复和 WAL GC 的已验证 Snapshot。`RECOVERING` 不拥有 Lease。
 
 同一 Entry ID 出现在多个水位时 CRC32C 必须相同。Installed Snapshot Checkpoint 必须不晚于 Commit 水位；若 Snapshot 与 Commit 指向同一 Entry，CRC 必须相同。只要 `earliest_wal_entry_id > 0`，就必须存在覆盖到至少 `earliest_wal_entry_id - 1` 的已安装、已验证 Snapshot。空日志的所有可选水位均无值，`earliest_wal_entry_id = 0`。
 

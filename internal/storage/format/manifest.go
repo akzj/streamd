@@ -37,6 +37,7 @@ const (
 	ArtifactSnapshotManifest ArtifactType = 5
 	ArtifactManifest         ArtifactType = 6
 	ArtifactSegment          ArtifactType = 7
+	ArtifactReplicationState ArtifactType = 8
 )
 
 // ManifestHeader is the fixed V1 checkpoint description.

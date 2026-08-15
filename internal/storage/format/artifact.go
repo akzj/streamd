@@ -98,7 +98,7 @@ func VerifyArtifact(content, footerBytes []byte, expectedType ArtifactType, expe
 }
 
 func validateArtifactFooter(footer ArtifactFooter) error {
-	if footer.ArtifactType < ArtifactTailCatalog || footer.ArtifactType > ArtifactSnapshotManifest {
+	if (footer.ArtifactType < ArtifactTailCatalog || footer.ArtifactType > ArtifactSnapshotManifest) && footer.ArtifactType != ArtifactReplicationState {
 		return invalidf("Artifact footer type %d is invalid", footer.ArtifactType)
 	}
 	if isZeroUUID(footer.ArtifactID) || isZeroDigest(footer.ContentSHA256) {

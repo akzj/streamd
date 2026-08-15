@@ -45,6 +45,8 @@ const (
 	RegistrySnapshotHeaderLength = 88
 	SnapshotHeaderLength         = 136
 	NodeIdentityLength           = 80
+	ReplicationStateHeaderLength = 320
+	ReplicationCurrentMinLength  = 80
 )
 
 var (
