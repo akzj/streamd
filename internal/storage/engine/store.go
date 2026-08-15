@@ -133,9 +133,10 @@ func (s *Store) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.closeNotifications()
+	commitErr := s.committer.Close()
 	s.viewMu.Lock()
 	defer s.viewMu.Unlock()
-	return errors.Join(s.state.Close(), s.root.Close())
+	return errors.Join(commitErr, s.state.Close(), s.root.Close())
 }
 func (s *Store) Append(ctx context.Context, request AppendRequest) (AppendResult, error) {
 	s.mu.Lock()
@@ -246,6 +247,10 @@ func (s *Store) Checkpoint() (format.Manifest, bool, error) {
 	}
 	lastEntryID := s.state.WAL.NextEntryID() - 1
 	lastCRC := s.state.WAL.PreviousEntryCRC32C()
+	if err := s.committer.Close(); err != nil {
+		s.setFatal(err)
+		return format.Manifest{}, false, err
+	}
 	if err := s.state.WAL.Rotate(0, s.now()); err != nil {
 		s.setFatal(err)
 		return format.Manifest{}, false, err
@@ -258,6 +263,7 @@ func (s *Store) Checkpoint() (format.Manifest, bool, error) {
 	manager := lifecycle.New(s.root.Path(), s.state.Manifest)
 	published, err := manager.PublishFlush(flush, lastEntryID, lastCRC)
 	if err != nil {
+		s.setFatal(err)
 		return format.Manifest{}, false, err
 	}
 	if s.checkpointHook != nil {
