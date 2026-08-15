@@ -1152,6 +1152,36 @@ Snapshot 只有同时满足以下条件才可以用于 WAL GC 或 Standby 恢复
 
 V1 要求 Snapshot 中的投影全部覆盖到 Checkpoint，不引入 Snapshot 内部 WAL。未来若允许落后投影，必须使用新 Snapshot Format 并明确包含重放 WAL 范围。
 
+### 11.4 Snapshot 安装事务
+
+Snapshot 安装跨越 Manifest `CURRENT`、`WAL-CURRENT` 和 `REPLICATION-CURRENT` 三个指针，
+因此使用一个可恢复的安装意图文件串联，而不假设三个 rename 能组成文件系统事务：
+
+```text
+SNAPSHOT-INSTALL.json
+staging/snapshot-install-<snapshot_id>/
+```
+
+`SNAPSHOT-INSTALL.json` 是 UTF-8 JSON，V1 只允许以下字段且未知字段必须拒绝：
+
+```text
+{
+  "version": 1,
+  "snapshot_id": "<32 lowercase hex>",
+  "group_id": "<32 lowercase hex>",
+  "term": <u64>,
+  "leader_id": "<32 lowercase hex>",
+  "checkpoint_entry_id": <u64>,
+  "checkpoint_entry_crc32c": <u32>,
+  "stage_dir": "snapshot-install-<snapshot_id>"
+}
+```
+
+安装顺序固定为：完整校验并 fsync Staging；原子发布安装意图；把不可变 Artifact 发布到最终目录；
+发布从 `checkpoint + 1` 开始且以前一 CRC 为基线的新 WAL；发布 Manifest `CURRENT`；发布本地
+Replication State；最后删除安装意图和 Staging。任一步崩溃后，节点必须在打开存储引擎和提供服务前
+读取安装意图并幂等完成剩余步骤。存在安装意图时不得按中间的 `CURRENT`/`WAL-CURRENT` 组合提供服务。
+
 ## 12. Node 与 Replication State
 
 节点身份和复制水位不进入 Segment，也不能只存在内存：

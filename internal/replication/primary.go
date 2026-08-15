@@ -46,10 +46,10 @@ func (p *Primary) Replicate(ctx context.Context, encoded [][]byte) (uint64, erro
 		if err != nil {
 			return 0, protocolError(ErrInvalidState, fmt.Sprintf("replicated Entry %d is invalid: %v", i, err))
 		}
-		if entry.Term != p.term {
-			return 0, protocolError(ErrInvalidState, fmt.Sprintf("new Entry %d belongs to Term %d, want %d", entry.EntryID, entry.Term, p.term))
+		if entry.Term > p.term {
+			return 0, protocolError(ErrInvalidState, fmt.Sprintf("Entry %d belongs to future Term %d", entry.EntryID, entry.Term))
 		}
-		if i > 0 && (entry.EntryID != entries[i-1].EntryID+1 || entry.PreviousEntryCRC32C != entries[i-1].CRC32C) {
+		if i > 0 && (entry.EntryID != entries[i-1].EntryID+1 || entry.PreviousEntryCRC32C != entries[i-1].CRC32C || entry.Term < entries[i-1].Term) {
 			return 0, protocolError(ErrLogGap, "Primary replication group is not continuous")
 		}
 		entries[i] = entry

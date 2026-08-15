@@ -75,12 +75,12 @@ func TestPrimaryReplicatesDurablyAndAdvancesCommit(t *testing.T) {
 	}
 }
 
-func TestPrimaryRejectsEntryFromWrongTerm(t *testing.T) {
+func TestPrimaryRejectsEntryFromFutureTerm(t *testing.T) {
 	primary, err := NewPrimary(uuid(1), uuid(2), 7, ReceiverPeer{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = primary.Replicate(context.Background(), encodedEntriesFor(t, 6, "old", 1, 0, 0))
+	_, err = primary.Replicate(context.Background(), encodedEntriesFor(t, 8, "future", 1, 0, 0))
 	if !IsCode(err, ErrInvalidState) {
 		t.Fatalf("wrong Term error = %v", err)
 	}

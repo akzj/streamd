@@ -30,6 +30,22 @@ func Create(dataRoot, destination string) (result Result, err error) {
 	if err != nil {
 		return result, err
 	}
+	store, err := engine.Open(dataAbs)
+	if err != nil {
+		return result, err
+	}
+	defer func() { err = errors.Join(err, store.Close()) }()
+	return CreateOnline(store, destination)
+}
+
+// CreateOnline takes a short engine checkpoint and then copies only immutable
+// artifacts from that exact Manifest. Appends may continue while the files are
+// copied because no later mutable CURRENT file is used as Snapshot input.
+func CreateOnline(store *engine.Store, destination string) (result Result, err error) {
+	if store == nil {
+		return result, fmt.Errorf("Snapshot engine is required")
+	}
+	dataAbs := store.DataRoot()
 	destination, err = filepath.Abs(destination)
 	if err != nil {
 		return result, err
@@ -43,33 +59,25 @@ func Create(dataRoot, destination string) (result Result, err error) {
 		}
 		return result, err
 	}
-	store, err := engine.Open(dataAbs)
+	manifest, _, err := store.Checkpoint()
 	if err != nil {
-		return result, err
-	}
-	defer func() { err = errors.Join(err, store.Close()) }()
-	if _, _, err = store.Checkpoint(); err != nil {
 		return result, err
 	}
 	node, err := identity.Load(dataAbs)
 	if err != nil {
 		return result, fmt.Errorf("NODE: %w", err)
 	}
-	pointerBytes, err := os.ReadFile(filepath.Join(dataAbs, "CURRENT"))
+	manifestFileName := fmt.Sprintf("MANIFEST-%020d-%x.bin", manifest.Header.Generation, manifest.Header.FileID)
+	manifestBytes, err := os.ReadFile(filepath.Join(dataAbs, "manifests", manifestFileName))
 	if err != nil {
 		return result, err
 	}
-	pointer, err := format.UnmarshalCurrentPointer(pointerBytes)
+	verifiedManifest, err := format.UnmarshalManifest(manifestBytes)
 	if err != nil {
 		return result, err
 	}
-	manifestBytes, err := os.ReadFile(filepath.Join(dataAbs, "manifests", pointer.ManifestFileName))
-	if err != nil {
-		return result, err
-	}
-	manifest, err := format.UnmarshalManifest(manifestBytes)
-	if err != nil {
-		return result, err
+	if verifiedManifest.Header.FileID != manifest.Header.FileID || verifiedManifest.Footer.ContentSHA256 != manifest.Footer.ContentSHA256 {
+		return result, fmt.Errorf("checkpoint Manifest changed while creating Snapshot")
 	}
 	if manifest.Header.RecordCount == 0 {
 		return result, fmt.Errorf("empty data roots do not have an installable V1 Manifest")
@@ -90,10 +98,14 @@ func Create(dataRoot, destination string) (result Result, err error) {
 			return result, err
 		}
 	}
-	if err = copyFile(filepath.Join(staging, "CURRENT"), filepath.Join(dataAbs, "CURRENT")); err != nil {
+	pointerBytes, err := format.MarshalCurrentPointer(format.CurrentPointer{Generation: manifest.Header.Generation, ManifestFileID: manifest.Header.FileID, ManifestSHA256: manifest.Footer.ContentSHA256, ManifestFileName: manifestFileName})
+	if err != nil {
 		return result, err
 	}
-	manifestName := filepath.ToSlash(filepath.Join("manifests", pointer.ManifestFileName))
+	if err = fsutil.AtomicWrite(staging, "CURRENT", pointerBytes, 0640, nil); err != nil {
+		return result, err
+	}
+	manifestName := filepath.ToSlash(filepath.Join("manifests", manifestFileName))
 	if err = copyFile(filepath.Join(staging, filepath.FromSlash(manifestName)), filepath.Join(dataAbs, filepath.FromSlash(manifestName))); err != nil {
 		return result, err
 	}
@@ -117,7 +129,7 @@ func Create(dataRoot, destination string) (result Result, err error) {
 	if err != nil {
 		return result, err
 	}
-	snapshotBytes, err := format.MarshalSnapshotManifest(format.SnapshotManifest{Header: format.SnapshotHeader{SnapshotID: snapshotID, GroupID: node.GroupID, CheckpointEntryID: manifest.Header.LastEntryID, CheckpointEntryCRC32C: manifest.Header.LastEntryCRC32C, ManifestGeneration: manifest.Header.Generation, ManifestSHA256: manifest.Footer.ContentSHA256, CreatedAt: time.Now().UnixNano()}, Artifacts: artifacts})
+	snapshotBytes, err := format.MarshalSnapshotManifest(format.SnapshotManifest{Header: format.SnapshotHeader{SnapshotID: snapshotID, GroupID: node.GroupID, Term: store.Health().Term, CheckpointEntryID: manifest.Header.LastEntryID, CheckpointEntryCRC32C: manifest.Header.LastEntryCRC32C, ManifestGeneration: manifest.Header.Generation, ManifestSHA256: manifest.Footer.ContentSHA256, CreatedAt: time.Now().UnixNano()}, Artifacts: artifacts})
 	if err != nil {
 		return result, err
 	}

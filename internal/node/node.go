@@ -14,6 +14,7 @@ import (
 	"github.com/akzj/streamd/internal/observe"
 	"github.com/akzj/streamd/internal/service"
 	"github.com/akzj/streamd/internal/storage/engine"
+	"github.com/akzj/streamd/internal/storage/snapshot"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
@@ -32,6 +33,11 @@ func Run(ctx context.Context, config Config, logger *slog.Logger) error {
 		return fmt.Errorf("load mTLS credentials: %w", err)
 	}
 	nodeIdentity, _ := config.nodeIdentity()
+	if resumed, resumeErr := snapshot.ResumeInstall(config.DataDirectory, nil); resumeErr != nil {
+		return fmt.Errorf("resume Snapshot install: %w", resumeErr)
+	} else if resumed {
+		logger.Info("resumed Snapshot install before recovery")
+	}
 	store, err := engine.OpenWithIdentity(config.DataDirectory, nodeIdentity)
 	if err != nil {
 		return fmt.Errorf("open storage engine: %w", err)

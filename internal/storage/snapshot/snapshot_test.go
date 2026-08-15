@@ -2,6 +2,7 @@ package snapshot
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -10,6 +11,8 @@ import (
 	"github.com/akzj/streamd/internal/storage/format"
 	"github.com/akzj/streamd/internal/storage/scrub"
 )
+
+var errInstallCrash = errors.New("install crash")
 
 func TestCreateVerifyAndScrubSnapshot(t *testing.T) {
 	data := filepath.Join(t.TempDir(), "data")
@@ -58,6 +61,72 @@ func TestCreateVerifyAndScrubSnapshot(t *testing.T) {
 	file.Close()
 	if _, err = Verify(destination); err == nil {
 		t.Fatal("corrupt Snapshot passed verification")
+	}
+}
+
+func TestInstallAndCrashResumeAreAtomic(t *testing.T) {
+	base := t.TempDir()
+	source := filepath.Join(base, "source")
+	sourceNode := format.NodeIdentity{ClusterID: snapshotID(1), GroupID: snapshotID(2), NodeID: snapshotID(3), CreatedAt: 1}
+	store, err := engine.OpenWithIdentity(source, sourceNode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.Append(context.Background(), engine.AppendRequest{Namespace: "n", Stream: "s", RequestID: []byte("source"), Producer: "test", Records: []engine.InputRecord{{Payload: []byte("record")}}}); err != nil {
+		t.Fatal(err)
+	}
+	snapshotPath := filepath.Join(base, "snapshot")
+	if _, err = CreateOnline(store, snapshotPath); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, crashPoint := range []string{"", "after_install_journal", "after_install_artifacts", "after_install_wal", "after_install_current", "after_install_state"} {
+		t.Run(crashPoint, func(t *testing.T) {
+			target := filepath.Join(base, "target-"+crashPoint)
+			targetNode := format.NodeIdentity{ClusterID: sourceNode.ClusterID, GroupID: sourceNode.GroupID, NodeID: snapshotID(4), CreatedAt: 2}
+			targetStore, openErr := engine.OpenWithIdentity(target, targetNode)
+			if openErr != nil {
+				t.Fatal(openErr)
+			}
+			if closeErr := targetStore.Close(); closeErr != nil {
+				t.Fatal(closeErr)
+			}
+			hook := func(point string) error {
+				if point == crashPoint {
+					return errInstallCrash
+				}
+				return nil
+			}
+			_, installErr := Install(target, snapshotPath, InstallOptions{Term: 7, LeaderID: sourceNode.NodeID, Hook: hook})
+			if crashPoint == "" {
+				if installErr != nil {
+					t.Fatal(installErr)
+				}
+			} else {
+				if !errors.Is(installErr, errInstallCrash) {
+					t.Fatalf("Install error = %v", installErr)
+				}
+				resumed, resumeErr := ResumeInstall(target, nil)
+				if resumeErr != nil || !resumed {
+					t.Fatalf("Resume = %v, %v", resumed, resumeErr)
+				}
+			}
+			resumed, resumeErr := ResumeInstall(target, nil)
+			if resumeErr != nil || resumed {
+				t.Fatalf("completed Resume = %v, %v", resumed, resumeErr)
+			}
+			reopened, openErr := engine.OpenWithIdentity(target, targetNode)
+			if openErr != nil {
+				t.Fatal(openErr)
+			}
+			defer reopened.Close()
+			read, readErr := reopened.Read("n", "s", 0, 10, 0)
+			if readErr != nil || len(read.Records) != 1 || string(read.Records[0].Payload) != "record" {
+				t.Fatalf("Read = %+v, %v", read, readErr)
+			}
+		})
 	}
 }
 

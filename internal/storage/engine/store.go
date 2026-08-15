@@ -96,6 +96,8 @@ type Store struct {
 	commitOptions  commit.Options
 }
 
+func (s *Store) DataRoot() string { return s.root.Path() }
+
 func (s *Store) Read(namespace, name string, from uint64, maxRecords int, maxBytes uint64) (readstore.Result, error) {
 	s.viewMu.RLock()
 	defer s.viewMu.RUnlock()
