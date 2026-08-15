@@ -132,6 +132,39 @@ streamd -config /etc/streamd/streamd.json
 
 配置结构见 [`configs/streamd.example.json`](../configs/streamd.example.json)。gRPC 监听强制 TLS 1.3 和已验证客户端证书；管理监听必须绑定 loopback，仅提供 `/livez`、`/readyz` 和 `/metrics`。配置文件中的 URI SAN 到 Principal 映射使用精确匹配，授权规则按 Namespace、Stream Prefix 和 Operation 判断。若配置 `otlp_trace_endpoint`，进程通过 TLS OTLP/gRPC 导出 Trace。
 
+Strict 节点使用同一个二进制。Primary 的关键配置如下，Standby 将 `role` 改为 `standby`，且不配置
+`peer_*`：
+
+```json
+{
+  "replication": {
+    "role": "primary",
+    "peer_address": "dns:///streamd-standby.internal:7443",
+    "peer_server_name": "streamd-standby.internal",
+    "peer_node_id": "44444444-4444-4444-4444-444444444444",
+    "lease_ttl": "15s",
+    "lease_safety_margin": "3s",
+    "renew_interval": "3s",
+    "max_entries": 1024,
+    "max_bytes": 16777216,
+    "etcd": {
+      "endpoints": ["https://etcd-1.internal:2379", "https://etcd-2.internal:2379", "https://etcd-3.internal:2379"],
+      "prefix": "/streamd/v1",
+      "dial_timeout": "5s",
+      "server_name": "etcd.internal",
+      "certificate_file": "/etc/streamd/etcd/client.crt",
+      "private_key_file": "/etc/streamd/etcd/client.key",
+      "ca_file": "/etc/streamd/etcd/ca.crt"
+    }
+  }
+}
+```
+
+节点证书必须同时满足 TLS DNS 校验，并包含复制协议规定的 Node URI SAN。Primary 只有在 etcd
+线性事务取得新 Term/Lease、旧 Leader Key 已消失、Standby 前缀追平后才打开公共 Stream API。
+Standby 只注册内部 ReplicationService，不接受公共 Append。所需 WAL 已 GC 时 Primary 保持不就绪，
+运维先按 Snapshot Install Runbook 恢复 Standby，再重启 Primary 完成增量追赶。
+
 状态：
 
 ```text
@@ -312,6 +345,20 @@ Strict Standby 提供单节点故障 RPO=0；Snapshot 提供磁盘全损、误�
 5. 追赶到 Primary Commit；
 6. 完成 Scrub/Health；
 7. 才进入可用 Standby。
+
+当 Primary 报告 `NEEDS_SNAPSHOT` 时，停止 Standby，在协调器当前 Term 下执行：
+
+```bash
+streamd-tool verify-snapshot -path /srv/streamd-snapshots/latest
+streamd-tool install-snapshot \
+  -data /var/lib/streamd \
+  -path /srv/streamd-snapshots/latest \
+  -term <current-term> \
+  -leader-id <current-primary-node-id>
+```
+
+安装崩溃后可显式执行 `streamd-tool resume-install -data /var/lib/streamd`；正常 `streamd`
+启动也会在存储恢复前自动续做安装事务。
 
 发现两个已提交前缀冲突立即 P0，禁止自动选择。
 

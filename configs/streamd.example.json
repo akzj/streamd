@@ -8,6 +8,9 @@
   "shutdown_timeout": "30s",
   "subscribe_send_timeout": "30s",
   "checkpoint_interval": "1m",
+  "replication": {
+    "role": "single"
+  },
   "tls": {
     "certificate_file": "/etc/streamd/tls/server.crt",
     "private_key_file": "/etc/streamd/tls/server.key",

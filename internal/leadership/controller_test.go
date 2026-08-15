@@ -132,6 +132,23 @@ func TestControllerReleaseStopsWrites(t *testing.T) {
 	}
 }
 
+func TestControllerRestoresValidatedPrimaryState(t *testing.T) {
+	now := time.Unix(100, 0)
+	initial := State{Role: RolePrimary, Term: 7, LeaderID: testID(2), ExpiresAt: now.Add(time.Minute), Fenced: true}
+	controller, err := New(&fakeCoordinator{}, Options{GroupID: testID(1), NodeID: testID(2), KnownTerm: 7, SafetyMargin: 5 * time.Second, Now: func() time.Time { return now }, Persist: func(State) error { return nil }, Initial: &initial})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = controller.CanWrite(); err != nil {
+		t.Fatalf("restored safe Primary is not writable: %v", err)
+	}
+	invalid := initial
+	invalid.LeaderID = testID(3)
+	if _, err = New(&fakeCoordinator{}, Options{GroupID: testID(1), NodeID: testID(2), KnownTerm: 7, SafetyMargin: 5 * time.Second, Now: func() time.Time { return now }, Persist: func(State) error { return nil }, Initial: &invalid}); err == nil {
+		t.Fatal("foreign initial Primary state was accepted")
+	}
+}
+
 func TestControllerPersistsReplicationStateTransitions(t *testing.T) {
 	now := time.Unix(100, 0)
 	identity := format.NodeIdentity{ClusterID: testID(9), GroupID: testID(1), NodeID: testID(2), CreatedAt: 1}

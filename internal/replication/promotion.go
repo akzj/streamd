@@ -53,7 +53,7 @@ func Promote(dataRoot string, node format.NodeIdentity, grant PromotionGrant) (P
 		return PromotionResult{}, err
 	}
 	current, ok := stateStore.Current()
-	if !ok || grant.Term <= current.Header.Term || current.Header.Role == format.ReplicationRolePrimary {
+	if !ok || grant.Term <= current.Header.Term {
 		return PromotionResult{}, protocolError(ErrTermStale, "Promotion Term does not advance a non-Primary durable state")
 	}
 	var committedLimit *uint64

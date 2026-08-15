@@ -34,6 +34,30 @@ type Config struct {
 	Authorization        []access.Rule               `json:"authorization"`
 	Limits               service.Limits              `json:"limits"`
 	OTLPTraceEndpoint    string                      `json:"otlp_trace_endpoint,omitempty"`
+	Replication          ReplicationConfig           `json:"replication,omitempty"`
+}
+
+type ReplicationConfig struct {
+	Role              string     `json:"role,omitempty"`
+	PeerAddress       string     `json:"peer_address,omitempty"`
+	PeerServerName    string     `json:"peer_server_name,omitempty"`
+	PeerNodeID        string     `json:"peer_node_id,omitempty"`
+	LeaseTTL          string     `json:"lease_ttl,omitempty"`
+	LeaseSafetyMargin string     `json:"lease_safety_margin,omitempty"`
+	RenewInterval     string     `json:"renew_interval,omitempty"`
+	MaxEntries        int        `json:"max_entries,omitempty"`
+	MaxBytes          uint64     `json:"max_bytes,omitempty"`
+	Etcd              EtcdConfig `json:"etcd,omitempty"`
+}
+
+type EtcdConfig struct {
+	Endpoints       []string `json:"endpoints,omitempty"`
+	Prefix          string   `json:"prefix,omitempty"`
+	DialTimeout     string   `json:"dial_timeout,omitempty"`
+	ServerName      string   `json:"server_name,omitempty"`
+	CertificateFile string   `json:"certificate_file,omitempty"`
+	PrivateKeyFile  string   `json:"private_key_file,omitempty"`
+	CAFile          string   `json:"ca_file,omitempty"`
 }
 
 type TLSConfig struct {
@@ -125,7 +149,83 @@ func (c Config) Validate() error {
 	if _, err := c.checkpointDuration(); err != nil {
 		return err
 	}
+	if err := c.Replication.validate(); err != nil {
+		return err
+	}
+	if c.Replication.Role == "primary" {
+		peerID, _ := parseUUID(c.Replication.PeerNodeID)
+		identityValue, _ := c.nodeIdentity()
+		if peerID == identityValue.NodeID {
+			return fmt.Errorf("replication peer_node_id must differ from node_id")
+		}
+	}
 	return nil
+}
+
+func (c ReplicationConfig) validate() error {
+	if c.Role == "" || c.Role == "single" {
+		if c.PeerAddress != "" || len(c.Etcd.Endpoints) != 0 {
+			return fmt.Errorf("single replication role cannot configure peer or coordinator")
+		}
+		return nil
+	}
+	if c.Role != "primary" && c.Role != "standby" {
+		return fmt.Errorf("replication.role must be single, primary, or standby")
+	}
+	if c.Role == "primary" && (c.PeerAddress == "" || c.PeerServerName == "" || c.PeerNodeID == "") {
+		return fmt.Errorf("primary replication requires peer_address, peer_server_name, and peer_node_id")
+	}
+	if len(c.Etcd.Endpoints) == 0 {
+		return fmt.Errorf("replicated role requires etcd endpoints")
+	}
+	if c.MaxEntries < 0 {
+		return fmt.Errorf("replication.max_entries cannot be negative")
+	}
+	maxInt := uint64(^uint(0) >> 1)
+	if c.MaxBytes > maxInt-(1<<20) {
+		return fmt.Errorf("replication.max_bytes exceeds platform gRPC limit")
+	}
+	if c.Role == "primary" {
+		if _, err := parseUUID(c.PeerNodeID); err != nil {
+			return fmt.Errorf("replication.peer_node_id: %w", err)
+		}
+	}
+	for _, value := range []string{c.Etcd.CertificateFile, c.Etcd.PrivateKeyFile, c.Etcd.CAFile, c.Etcd.ServerName} {
+		if value == "" {
+			return fmt.Errorf("replication etcd mTLS files and server_name are required")
+		}
+	}
+	ttl, safety, renew, err := c.durations()
+	if err != nil {
+		return err
+	}
+	if safety*2 >= ttl || renew >= ttl-safety {
+		return fmt.Errorf("replication Lease timing has no safe renewal window")
+	}
+	return nil
+}
+
+func (c ReplicationConfig) durations() (time.Duration, time.Duration, time.Duration, error) {
+	parse := func(value string, fallback time.Duration, name string) (time.Duration, error) {
+		if value == "" {
+			return fallback, nil
+		}
+		duration, err := time.ParseDuration(value)
+		if err != nil || duration <= 0 {
+			return 0, fmt.Errorf("%s must be a positive duration", name)
+		}
+		return duration, nil
+	}
+	ttl, err := parse(c.LeaseTTL, 15*time.Second, "replication.lease_ttl")
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	safety, err := parse(c.LeaseSafetyMargin, 3*time.Second, "replication.lease_safety_margin")
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	renew, err := parse(c.RenewInterval, 3*time.Second, "replication.renew_interval")
+	return ttl, safety, renew, err
 }
 
 func (c Config) nodeIdentity() (format.NodeIdentity, error) {

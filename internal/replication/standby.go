@@ -63,7 +63,7 @@ func OpenStandby(path string, node format.NodeIdentity, term uint64, leaderID fo
 	}
 	current, hasState := states.Current()
 	if hasState {
-		if current.Header.Term > term || current.Header.Role == format.ReplicationRolePrimary {
+		if current.Header.Term > term || (current.Header.Role == format.ReplicationRolePrimary && current.Header.Term >= term) {
 			return fail(protocolError(ErrTermStale, "durable Standby State cannot open in requested Term"))
 		}
 		if current.Header.Term == term && (!current.Header.HasLeader || current.Header.LeaderID != leaderID) {

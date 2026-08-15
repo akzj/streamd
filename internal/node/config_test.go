@@ -50,3 +50,22 @@ func TestConfigRequiresLoopbackAdmin(t *testing.T) {
 		t.Fatal("non-loopback admin address was accepted")
 	}
 }
+
+func TestConfigValidatesStrictReplicationTopology(t *testing.T) {
+	config := Config{ListenAddress: "0.0.0.0:7443", AdminAddress: "127.0.0.1:9090", DataDirectory: "/data", ClusterID: "11111111111111111111111111111111", GroupID: "22222222222222222222222222222222", NodeID: "33333333333333333333333333333333", TLS: TLSConfig{CertificateFile: "c", PrivateKeyFile: "k", ClientCAFile: "ca"}}
+	config.PrincipalsByURI = map[string]access.Principal{"spiffe://example/a": {Tenant: "t", Service: "s"}}
+	config.Authorization = []access.Rule{{Tenant: "t", Service: "s", Namespace: "n", Operations: []access.Operation{access.Read}}}
+	config.Replication = ReplicationConfig{Role: "primary", PeerAddress: "standby:7443", PeerServerName: "standby.internal", PeerNodeID: "44444444444444444444444444444444", LeaseTTL: "15s", LeaseSafetyMargin: "3s", RenewInterval: "3s", Etcd: EtcdConfig{Endpoints: []string{"https://etcd:2379"}, ServerName: "etcd.internal", CertificateFile: "ec", PrivateKeyFile: "ek", CAFile: "eca"}}
+	if err := config.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	config.Replication.PeerNodeID = config.NodeID
+	if err := config.Validate(); err == nil {
+		t.Fatal("Primary accepted itself as Standby peer")
+	}
+	config.Replication.PeerNodeID = "44444444444444444444444444444444"
+	config.Replication.LeaseSafetyMargin = "8s"
+	if err := config.Validate(); err == nil {
+		t.Fatal("unsafe Lease timing was accepted")
+	}
+}

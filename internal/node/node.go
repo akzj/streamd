@@ -28,6 +28,9 @@ func Run(ctx context.Context, config Config, logger *slog.Logger) error {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	if config.Replication.Role != "" && config.Replication.Role != "single" {
+		return runReplicated(ctx, config, logger)
+	}
 	credentials, err := config.serverCredentials()
 	if err != nil {
 		return fmt.Errorf("load mTLS credentials: %w", err)

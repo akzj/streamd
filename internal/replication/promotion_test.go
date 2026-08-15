@@ -97,6 +97,12 @@ func TestPromoteValidatesAndCommitsDurableSuffix(t *testing.T) {
 	if _, err = reopened.Append(context.Background(), engine.AppendRequest{Namespace: "n", Stream: "s", ExpectedSequence: 1, RequestID: []byte("after-promotion"), Producer: "test", Records: []engine.InputRecord{{Payload: []byte("next")}}}); err != nil {
 		t.Fatal(err)
 	}
+	if _, _, err = reopened.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	if afterCheckpoint := reopened.Health().Watermarks; !afterCheckpoint.HasCommitted || afterCheckpoint.Committed != 2 || !afterCheckpoint.HasReplicated {
+		t.Fatalf("watermarks regressed across Checkpoint: %+v", afterCheckpoint)
+	}
 	checkpoint, err := reopened.CheckpointReplicationState(stateStore)
 	if err != nil || checkpoint.Header.Committed.EntryID != 2 || checkpoint.Header.Replicated.EntryID != 2 {
 		t.Fatalf("Replication checkpoint = %+v, %v", checkpoint.Header, err)

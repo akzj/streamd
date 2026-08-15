@@ -39,6 +39,11 @@ type RPCServer struct {
 	planner  PlanProvider
 	auth     PeerAuthenticator
 	limits   TransportLimits
+	status   func() (ReplicaHello, error)
+}
+
+func (s *RPCServer) SetStatusProvider(provider func() (ReplicaHello, error)) {
+	s.status = provider
 }
 
 func NewRPCServer(receiver *Receiver, planner PlanProvider, auth PeerAuthenticator, limits TransportLimits) (*RPCServer, error) {
@@ -124,6 +129,31 @@ func (s *RPCServer) AdvanceCommit(ctx context.Context, request *streamdv1.Replic
 	return &streamdv1.ReplicationServiceAdvanceCommitResponse{ProtocolVersion: ProtocolVersion, GroupId: groupID[:], NodeId: s.receiver.nodeID[:], Term: request.Term}, nil
 }
 
+func (s *RPCServer) Status(ctx context.Context, request *streamdv1.ReplicationServiceStatusRequest) (*streamdv1.ReplicationServiceStatusResponse, error) {
+	if request == nil || request.ProtocolVersion != ProtocolVersion || s.receiver == nil {
+		return nil, status.Error(codes.FailedPrecondition, "replication receiver is unavailable or incompatible")
+	}
+	groupID, _, err := s.sender(ctx, request.GroupId, request.LeaderId)
+	if err != nil {
+		return nil, err
+	}
+	var hello ReplicaHello
+	if s.status != nil {
+		hello, err = s.status()
+	} else {
+		state, stateErr := s.receiver.State()
+		err = stateErr
+		hello = ReplicaHello{GroupID: groupID, NodeID: s.receiver.nodeID, KnownTerm: state.Term, LastAppended: state.LastAppended, LocalDurable: state.LocalDurable, Committed: state.Committed, Applied: state.Applied}
+	}
+	if err != nil {
+		return nil, rpcError(err)
+	}
+	if hello.GroupID != groupID || hello.NodeID != s.receiver.nodeID || hello.KnownTerm > request.Term {
+		return nil, rpcError(protocolError(ErrTermStale, "Standby status is incompatible with requesting leader"))
+	}
+	return &streamdv1.ReplicationServiceStatusResponse{ProtocolVersion: ProtocolVersion, GroupId: hello.GroupID[:], NodeId: hello.NodeID[:], Term: hello.KnownTerm, InstalledSnapshotId: optionalUUIDBytes(hello.InstalledSnapshotID), Snapshot: toWirePosition(hello.Snapshot), LastAppended: toWirePosition(hello.LastAppended), LocalDurable: toWirePosition(hello.LocalDurable), Committed: toWirePosition(hello.Committed), Applied: toWirePosition(hello.Applied)}, nil
+}
+
 func (s *RPCServer) sender(ctx context.Context, group, leader []byte) (format.UUID, format.UUID, error) {
 	groupID, err := wireUUID(group)
 	if err != nil {
@@ -193,6 +223,26 @@ func (p *RPCPeer) AdvanceCommit(ctx context.Context, message CommitAdvance) erro
 		return err
 	}
 	return validateWireResponse(response.ProtocolVersion, response.GroupId, response.NodeId, response.Term, message.GroupID, message.Term)
+}
+
+func (p *RPCPeer) Status(ctx context.Context, groupID, leaderID format.UUID, term uint64) (ReplicaHello, error) {
+	response, err := p.client.Status(ctx, &streamdv1.ReplicationServiceStatusRequest{ProtocolVersion: ProtocolVersion, GroupId: groupID[:], Term: term, LeaderId: leaderID[:]})
+	if err != nil {
+		return ReplicaHello{}, err
+	}
+	responseGroup, err := wireUUID(response.GroupId)
+	if err != nil || responseGroup != groupID || response.ProtocolVersion != ProtocolVersion {
+		return ReplicaHello{}, protocolError(ErrInvalidState, "Standby status response identity is invalid")
+	}
+	nodeID, err := wireUUID(response.NodeId)
+	if err != nil {
+		return ReplicaHello{}, err
+	}
+	snapshotID, err := optionalWireUUID(response.InstalledSnapshotId)
+	if err != nil {
+		return ReplicaHello{}, err
+	}
+	return ReplicaHello{GroupID: responseGroup, NodeID: nodeID, KnownTerm: response.Term, InstalledSnapshotID: snapshotID, Snapshot: fromWirePosition(response.Snapshot), LastAppended: fromWirePosition(response.LastAppended), LocalDurable: fromWirePosition(response.LocalDurable), Committed: fromWirePosition(response.Committed), Applied: fromWirePosition(response.Applied)}, nil
 }
 
 func validateWireResponse(version uint32, group, node []byte, term uint64, wantGroup format.UUID, wantTerm uint64) error {

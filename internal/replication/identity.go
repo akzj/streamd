@@ -19,13 +19,17 @@ func NodeURI(clusterID, groupID, nodeID format.UUID) string {
 }
 
 type MTLSPeerAuthenticator struct {
-	ClusterID format.UUID
-	GroupID   format.UUID
+	ClusterID      format.UUID
+	GroupID        format.UUID
+	ExpectedNodeID format.UUID
 }
 
 func (a MTLSPeerAuthenticator) Authenticate(ctx context.Context, groupID, nodeID format.UUID) error {
 	if zeroUUID(a.ClusterID) || zeroUUID(a.GroupID) || groupID != a.GroupID || zeroUUID(nodeID) {
 		return fmt.Errorf("replication certificate identity is outside the configured group")
+	}
+	if !zeroUUID(a.ExpectedNodeID) && nodeID != a.ExpectedNodeID {
+		return fmt.Errorf("replication node is not the configured peer")
 	}
 	remote, ok := peer.FromContext(ctx)
 	if !ok {

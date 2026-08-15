@@ -11,6 +11,7 @@ service ReplicationService {
   rpc Append(ReplicationServiceAppendRequest) returns (ReplicationServiceAppendResponse);
   rpc Barrier(ReplicationServiceBarrierRequest) returns (ReplicationServiceBarrierResponse);
   rpc AdvanceCommit(ReplicationServiceAdvanceCommitRequest) returns (ReplicationServiceAdvanceCommitResponse);
+  rpc Status(ReplicationServiceStatusRequest) returns (ReplicationServiceStatusResponse);
 }
 
 enum ReplicationPlanMode {
@@ -96,4 +97,24 @@ message ReplicationServiceAdvanceCommitResponse {
   bytes group_id = 2;
   bytes node_id = 3;
   uint64 term = 4;
+}
+
+message ReplicationServiceStatusRequest {
+  uint32 protocol_version = 1;
+  bytes group_id = 2;
+  uint64 term = 3;
+  bytes leader_id = 4;
+}
+
+message ReplicationServiceStatusResponse {
+  uint32 protocol_version = 1;
+  bytes group_id = 2;
+  bytes node_id = 3;
+  uint64 term = 4;
+  bytes installed_snapshot_id = 5;
+  ReplicationPosition snapshot = 6;
+  ReplicationPosition last_appended = 7;
+  ReplicationPosition local_durable = 8;
+  ReplicationPosition committed = 9;
+  ReplicationPosition applied = 10;
 }

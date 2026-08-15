@@ -55,6 +55,7 @@ type Options struct {
 	SafetyMargin time.Duration
 	Now          func() time.Time
 	Persist      Persist
+	Initial      *State
 }
 
 type Controller struct {
@@ -79,7 +80,14 @@ func New(coordinator Coordinator, options Options) (*Controller, error) {
 	if options.Now == nil {
 		options.Now = time.Now
 	}
-	return &Controller{coordinator: coordinator, groupID: options.GroupID, nodeID: options.NodeID, safety: options.SafetyMargin, now: options.Now, persist: options.Persist, state: State{Role: RoleRecovering, Term: options.KnownTerm, LastReason: "leadership not acquired"}}, nil
+	initial := State{Role: RoleRecovering, Term: options.KnownTerm, LastReason: "leadership not acquired"}
+	if options.Initial != nil {
+		initial = *options.Initial
+		if initial.Term < options.KnownTerm || (initial.Role == RolePrimary && (initial.LeaderID != options.NodeID || !initial.Fenced)) {
+			return nil, fmt.Errorf("initial leadership state is invalid")
+		}
+	}
+	return &Controller{coordinator: coordinator, groupID: options.GroupID, nodeID: options.NodeID, safety: options.SafetyMargin, now: options.Now, persist: options.Persist, state: initial}, nil
 }
 
 func (c *Controller) Acquire(ctx context.Context) error {
@@ -186,6 +194,8 @@ func (c *Controller) CanWrite() error {
 	}
 	return nil
 }
+
+func (c *Controller) CanCommit() error { return c.CanWrite() }
 
 func (c *Controller) Snapshot() State {
 	c.mu.RLock()

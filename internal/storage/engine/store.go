@@ -408,6 +408,7 @@ func (s *Store) Checkpoint() (format.Manifest, bool, error) {
 	}
 	lastEntryID := s.state.WAL.NextEntryID() - 1
 	lastCRC := s.state.WAL.PreviousEntryCRC32C()
+	s.commitOptions.InitialWatermarks = s.committer.Watermarks()
 	if err := s.committer.Close(); err != nil {
 		s.setFatal(err)
 		return format.Manifest{}, false, err

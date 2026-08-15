@@ -59,6 +59,10 @@ func TestRPCTransportReplicatesAndCommits(t *testing.T) {
 	if err != nil || !state.Applied.Valid || state.Applied.EntryID != last {
 		t.Fatalf("receiver state = %+v, error = %v", state, err)
 	}
+	hello, err := peer.Status(context.Background(), uuid(1), uuid(2), 7)
+	if err != nil || hello.NodeID != uuid(3) || hello.Committed.EntryID != last {
+		t.Fatalf("Status = %+v, error = %v", hello, err)
+	}
 }
 
 func TestRPCTransportEnforcesBatchBounds(t *testing.T) {
@@ -121,12 +125,19 @@ func TestMTLSPeerAuthenticatorBindsNodeURI(t *testing.T) {
 	}
 	certificate := &x509.Certificate{URIs: []*url.URL{identity}}
 	ctx := peerContext(certificate)
-	auth := MTLSPeerAuthenticator{ClusterID: cluster, GroupID: group}
+	auth := MTLSPeerAuthenticator{ClusterID: cluster, GroupID: group, ExpectedNodeID: node}
 	if err = auth.Authenticate(ctx, group, node); err != nil {
 		t.Fatal(err)
 	}
 	if err = auth.Authenticate(ctx, group, uuid(4)); err == nil {
 		t.Fatal("mismatched certificate node was accepted")
+	}
+	otherIdentity, err := url.Parse(NodeURI(cluster, group, uuid(4)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = auth.Authenticate(peerContext(&x509.Certificate{URIs: []*url.URL{otherIdentity}}), group, uuid(4)); err == nil {
+		t.Fatal("authenticated but unconfigured group peer was accepted")
 	}
 }
 

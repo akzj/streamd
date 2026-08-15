@@ -810,6 +810,190 @@ func (x *ReplicationServiceAdvanceCommitResponse) GetTerm() uint64 {
 	return 0
 }
 
+type ReplicationServiceStatusRequest struct {
+	state           protoimpl.MessageState `protogen:"open.v1"`
+	ProtocolVersion uint32                 `protobuf:"varint,1,opt,name=protocol_version,json=protocolVersion,proto3" json:"protocol_version,omitempty"`
+	GroupId         []byte                 `protobuf:"bytes,2,opt,name=group_id,json=groupId,proto3" json:"group_id,omitempty"`
+	Term            uint64                 `protobuf:"varint,3,opt,name=term,proto3" json:"term,omitempty"`
+	LeaderId        []byte                 `protobuf:"bytes,4,opt,name=leader_id,json=leaderId,proto3" json:"leader_id,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
+}
+
+func (x *ReplicationServiceStatusRequest) Reset() {
+	*x = ReplicationServiceStatusRequest{}
+	mi := &file_streamd_v1_replication_proto_msgTypes[9]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ReplicationServiceStatusRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ReplicationServiceStatusRequest) ProtoMessage() {}
+
+func (x *ReplicationServiceStatusRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_streamd_v1_replication_proto_msgTypes[9]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ReplicationServiceStatusRequest.ProtoReflect.Descriptor instead.
+func (*ReplicationServiceStatusRequest) Descriptor() ([]byte, []int) {
+	return file_streamd_v1_replication_proto_rawDescGZIP(), []int{9}
+}
+
+func (x *ReplicationServiceStatusRequest) GetProtocolVersion() uint32 {
+	if x != nil {
+		return x.ProtocolVersion
+	}
+	return 0
+}
+
+func (x *ReplicationServiceStatusRequest) GetGroupId() []byte {
+	if x != nil {
+		return x.GroupId
+	}
+	return nil
+}
+
+func (x *ReplicationServiceStatusRequest) GetTerm() uint64 {
+	if x != nil {
+		return x.Term
+	}
+	return 0
+}
+
+func (x *ReplicationServiceStatusRequest) GetLeaderId() []byte {
+	if x != nil {
+		return x.LeaderId
+	}
+	return nil
+}
+
+type ReplicationServiceStatusResponse struct {
+	state               protoimpl.MessageState `protogen:"open.v1"`
+	ProtocolVersion     uint32                 `protobuf:"varint,1,opt,name=protocol_version,json=protocolVersion,proto3" json:"protocol_version,omitempty"`
+	GroupId             []byte                 `protobuf:"bytes,2,opt,name=group_id,json=groupId,proto3" json:"group_id,omitempty"`
+	NodeId              []byte                 `protobuf:"bytes,3,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
+	Term                uint64                 `protobuf:"varint,4,opt,name=term,proto3" json:"term,omitempty"`
+	InstalledSnapshotId []byte                 `protobuf:"bytes,5,opt,name=installed_snapshot_id,json=installedSnapshotId,proto3" json:"installed_snapshot_id,omitempty"`
+	Snapshot            *ReplicationPosition   `protobuf:"bytes,6,opt,name=snapshot,proto3" json:"snapshot,omitempty"`
+	LastAppended        *ReplicationPosition   `protobuf:"bytes,7,opt,name=last_appended,json=lastAppended,proto3" json:"last_appended,omitempty"`
+	LocalDurable        *ReplicationPosition   `protobuf:"bytes,8,opt,name=local_durable,json=localDurable,proto3" json:"local_durable,omitempty"`
+	Committed           *ReplicationPosition   `protobuf:"bytes,9,opt,name=committed,proto3" json:"committed,omitempty"`
+	Applied             *ReplicationPosition   `protobuf:"bytes,10,opt,name=applied,proto3" json:"applied,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
+}
+
+func (x *ReplicationServiceStatusResponse) Reset() {
+	*x = ReplicationServiceStatusResponse{}
+	mi := &file_streamd_v1_replication_proto_msgTypes[10]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ReplicationServiceStatusResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ReplicationServiceStatusResponse) ProtoMessage() {}
+
+func (x *ReplicationServiceStatusResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_streamd_v1_replication_proto_msgTypes[10]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ReplicationServiceStatusResponse.ProtoReflect.Descriptor instead.
+func (*ReplicationServiceStatusResponse) Descriptor() ([]byte, []int) {
+	return file_streamd_v1_replication_proto_rawDescGZIP(), []int{10}
+}
+
+func (x *ReplicationServiceStatusResponse) GetProtocolVersion() uint32 {
+	if x != nil {
+		return x.ProtocolVersion
+	}
+	return 0
+}
+
+func (x *ReplicationServiceStatusResponse) GetGroupId() []byte {
+	if x != nil {
+		return x.GroupId
+	}
+	return nil
+}
+
+func (x *ReplicationServiceStatusResponse) GetNodeId() []byte {
+	if x != nil {
+		return x.NodeId
+	}
+	return nil
+}
+
+func (x *ReplicationServiceStatusResponse) GetTerm() uint64 {
+	if x != nil {
+		return x.Term
+	}
+	return 0
+}
+
+func (x *ReplicationServiceStatusResponse) GetInstalledSnapshotId() []byte {
+	if x != nil {
+		return x.InstalledSnapshotId
+	}
+	return nil
+}
+
+func (x *ReplicationServiceStatusResponse) GetSnapshot() *ReplicationPosition {
+	if x != nil {
+		return x.Snapshot
+	}
+	return nil
+}
+
+func (x *ReplicationServiceStatusResponse) GetLastAppended() *ReplicationPosition {
+	if x != nil {
+		return x.LastAppended
+	}
+	return nil
+}
+
+func (x *ReplicationServiceStatusResponse) GetLocalDurable() *ReplicationPosition {
+	if x != nil {
+		return x.LocalDurable
+	}
+	return nil
+}
+
+func (x *ReplicationServiceStatusResponse) GetCommitted() *ReplicationPosition {
+	if x != nil {
+		return x.Committed
+	}
+	return nil
+}
+
+func (x *ReplicationServiceStatusResponse) GetApplied() *ReplicationPosition {
+	if x != nil {
+		return x.Applied
+	}
+	return nil
+}
+
 var File_streamd_v1_replication_proto protoreflect.FileDescriptor
 
 const file_streamd_v1_replication_proto_rawDesc = "" +
@@ -882,16 +1066,34 @@ const file_streamd_v1_replication_proto_rawDesc = "" +
 	"\x10protocol_version\x18\x01 \x01(\rR\x0fprotocolVersion\x12\x19\n" +
 	"\bgroup_id\x18\x02 \x01(\fR\agroupId\x12\x17\n" +
 	"\anode_id\x18\x03 \x01(\fR\x06nodeId\x12\x12\n" +
-	"\x04term\x18\x04 \x01(\x04R\x04term*\x87\x01\n" +
+	"\x04term\x18\x04 \x01(\x04R\x04term\"\x98\x01\n" +
+	"\x1fReplicationServiceStatusRequest\x12)\n" +
+	"\x10protocol_version\x18\x01 \x01(\rR\x0fprotocolVersion\x12\x19\n" +
+	"\bgroup_id\x18\x02 \x01(\fR\agroupId\x12\x12\n" +
+	"\x04term\x18\x03 \x01(\x04R\x04term\x12\x1b\n" +
+	"\tleader_id\x18\x04 \x01(\fR\bleaderId\"\x8c\x04\n" +
+	" ReplicationServiceStatusResponse\x12)\n" +
+	"\x10protocol_version\x18\x01 \x01(\rR\x0fprotocolVersion\x12\x19\n" +
+	"\bgroup_id\x18\x02 \x01(\fR\agroupId\x12\x17\n" +
+	"\anode_id\x18\x03 \x01(\fR\x06nodeId\x12\x12\n" +
+	"\x04term\x18\x04 \x01(\x04R\x04term\x122\n" +
+	"\x15installed_snapshot_id\x18\x05 \x01(\fR\x13installedSnapshotId\x12;\n" +
+	"\bsnapshot\x18\x06 \x01(\v2\x1f.streamd.v1.ReplicationPositionR\bsnapshot\x12D\n" +
+	"\rlast_appended\x18\a \x01(\v2\x1f.streamd.v1.ReplicationPositionR\flastAppended\x12D\n" +
+	"\rlocal_durable\x18\b \x01(\v2\x1f.streamd.v1.ReplicationPositionR\flocalDurable\x12=\n" +
+	"\tcommitted\x18\t \x01(\v2\x1f.streamd.v1.ReplicationPositionR\tcommitted\x129\n" +
+	"\aapplied\x18\n" +
+	" \x01(\v2\x1f.streamd.v1.ReplicationPositionR\aapplied*\x87\x01\n" +
 	"\x13ReplicationPlanMode\x12%\n" +
 	"!REPLICATION_PLAN_MODE_UNSPECIFIED\x10\x00\x12%\n" +
 	"!REPLICATION_PLAN_MODE_INCREMENTAL\x10\x01\x12\"\n" +
-	"\x1eREPLICATION_PLAN_MODE_SNAPSHOT\x10\x022\xc9\x03\n" +
+	"\x1eREPLICATION_PLAN_MODE_SNAPSHOT\x10\x022\xae\x04\n" +
 	"\x12ReplicationService\x12l\n" +
 	"\tNegotiate\x12..streamd.v1.ReplicationServiceNegotiateRequest\x1a/.streamd.v1.ReplicationServiceNegotiateResponse\x12c\n" +
 	"\x06Append\x12+.streamd.v1.ReplicationServiceAppendRequest\x1a,.streamd.v1.ReplicationServiceAppendResponse\x12f\n" +
 	"\aBarrier\x12,.streamd.v1.ReplicationServiceBarrierRequest\x1a-.streamd.v1.ReplicationServiceBarrierResponse\x12x\n" +
-	"\rAdvanceCommit\x122.streamd.v1.ReplicationServiceAdvanceCommitRequest\x1a3.streamd.v1.ReplicationServiceAdvanceCommitResponseB2Z0github.com/akzj/streamd/api/streamd/v1;streamdv1b\x06proto3"
+	"\rAdvanceCommit\x122.streamd.v1.ReplicationServiceAdvanceCommitRequest\x1a3.streamd.v1.ReplicationServiceAdvanceCommitResponse\x12c\n" +
+	"\x06Status\x12+.streamd.v1.ReplicationServiceStatusRequest\x1a,.streamd.v1.ReplicationServiceStatusResponseB2Z0github.com/akzj/streamd/api/streamd/v1;streamdv1b\x06proto3"
 
 var (
 	file_streamd_v1_replication_proto_rawDescOnce sync.Once
@@ -906,7 +1108,7 @@ func file_streamd_v1_replication_proto_rawDescGZIP() []byte {
 }
 
 var file_streamd_v1_replication_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_streamd_v1_replication_proto_msgTypes = make([]protoimpl.MessageInfo, 9)
+var file_streamd_v1_replication_proto_msgTypes = make([]protoimpl.MessageInfo, 11)
 var file_streamd_v1_replication_proto_goTypes = []any{
 	(ReplicationPlanMode)(0),                        // 0: streamd.v1.ReplicationPlanMode
 	(*ReplicationPosition)(nil),                     // 1: streamd.v1.ReplicationPosition
@@ -918,6 +1120,8 @@ var file_streamd_v1_replication_proto_goTypes = []any{
 	(*ReplicationServiceBarrierResponse)(nil),       // 7: streamd.v1.ReplicationServiceBarrierResponse
 	(*ReplicationServiceAdvanceCommitRequest)(nil),  // 8: streamd.v1.ReplicationServiceAdvanceCommitRequest
 	(*ReplicationServiceAdvanceCommitResponse)(nil), // 9: streamd.v1.ReplicationServiceAdvanceCommitResponse
+	(*ReplicationServiceStatusRequest)(nil),         // 10: streamd.v1.ReplicationServiceStatusRequest
+	(*ReplicationServiceStatusResponse)(nil),        // 11: streamd.v1.ReplicationServiceStatusResponse
 }
 var file_streamd_v1_replication_proto_depIdxs = []int32{
 	1,  // 0: streamd.v1.ReplicationServiceNegotiateRequest.snapshot:type_name -> streamd.v1.ReplicationPosition
@@ -930,19 +1134,26 @@ var file_streamd_v1_replication_proto_depIdxs = []int32{
 	1,  // 7: streamd.v1.ReplicationServiceNegotiateResponse.committed:type_name -> streamd.v1.ReplicationPosition
 	1,  // 8: streamd.v1.ReplicationServiceAppendRequest.previous:type_name -> streamd.v1.ReplicationPosition
 	1,  // 9: streamd.v1.ReplicationServiceBarrierResponse.durable:type_name -> streamd.v1.ReplicationPosition
-	2,  // 10: streamd.v1.ReplicationService.Negotiate:input_type -> streamd.v1.ReplicationServiceNegotiateRequest
-	4,  // 11: streamd.v1.ReplicationService.Append:input_type -> streamd.v1.ReplicationServiceAppendRequest
-	6,  // 12: streamd.v1.ReplicationService.Barrier:input_type -> streamd.v1.ReplicationServiceBarrierRequest
-	8,  // 13: streamd.v1.ReplicationService.AdvanceCommit:input_type -> streamd.v1.ReplicationServiceAdvanceCommitRequest
-	3,  // 14: streamd.v1.ReplicationService.Negotiate:output_type -> streamd.v1.ReplicationServiceNegotiateResponse
-	5,  // 15: streamd.v1.ReplicationService.Append:output_type -> streamd.v1.ReplicationServiceAppendResponse
-	7,  // 16: streamd.v1.ReplicationService.Barrier:output_type -> streamd.v1.ReplicationServiceBarrierResponse
-	9,  // 17: streamd.v1.ReplicationService.AdvanceCommit:output_type -> streamd.v1.ReplicationServiceAdvanceCommitResponse
-	14, // [14:18] is the sub-list for method output_type
-	10, // [10:14] is the sub-list for method input_type
-	10, // [10:10] is the sub-list for extension type_name
-	10, // [10:10] is the sub-list for extension extendee
-	0,  // [0:10] is the sub-list for field type_name
+	1,  // 10: streamd.v1.ReplicationServiceStatusResponse.snapshot:type_name -> streamd.v1.ReplicationPosition
+	1,  // 11: streamd.v1.ReplicationServiceStatusResponse.last_appended:type_name -> streamd.v1.ReplicationPosition
+	1,  // 12: streamd.v1.ReplicationServiceStatusResponse.local_durable:type_name -> streamd.v1.ReplicationPosition
+	1,  // 13: streamd.v1.ReplicationServiceStatusResponse.committed:type_name -> streamd.v1.ReplicationPosition
+	1,  // 14: streamd.v1.ReplicationServiceStatusResponse.applied:type_name -> streamd.v1.ReplicationPosition
+	2,  // 15: streamd.v1.ReplicationService.Negotiate:input_type -> streamd.v1.ReplicationServiceNegotiateRequest
+	4,  // 16: streamd.v1.ReplicationService.Append:input_type -> streamd.v1.ReplicationServiceAppendRequest
+	6,  // 17: streamd.v1.ReplicationService.Barrier:input_type -> streamd.v1.ReplicationServiceBarrierRequest
+	8,  // 18: streamd.v1.ReplicationService.AdvanceCommit:input_type -> streamd.v1.ReplicationServiceAdvanceCommitRequest
+	10, // 19: streamd.v1.ReplicationService.Status:input_type -> streamd.v1.ReplicationServiceStatusRequest
+	3,  // 20: streamd.v1.ReplicationService.Negotiate:output_type -> streamd.v1.ReplicationServiceNegotiateResponse
+	5,  // 21: streamd.v1.ReplicationService.Append:output_type -> streamd.v1.ReplicationServiceAppendResponse
+	7,  // 22: streamd.v1.ReplicationService.Barrier:output_type -> streamd.v1.ReplicationServiceBarrierResponse
+	9,  // 23: streamd.v1.ReplicationService.AdvanceCommit:output_type -> streamd.v1.ReplicationServiceAdvanceCommitResponse
+	11, // 24: streamd.v1.ReplicationService.Status:output_type -> streamd.v1.ReplicationServiceStatusResponse
+	20, // [20:25] is the sub-list for method output_type
+	15, // [15:20] is the sub-list for method input_type
+	15, // [15:15] is the sub-list for extension type_name
+	15, // [15:15] is the sub-list for extension extendee
+	0,  // [0:15] is the sub-list for field type_name
 }
 
 func init() { file_streamd_v1_replication_proto_init() }
@@ -956,7 +1167,7 @@ func file_streamd_v1_replication_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_streamd_v1_replication_proto_rawDesc), len(file_streamd_v1_replication_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   9,
+			NumMessages:   11,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

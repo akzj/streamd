@@ -23,6 +23,7 @@ const (
 	ReplicationService_Append_FullMethodName        = "/streamd.v1.ReplicationService/Append"
 	ReplicationService_Barrier_FullMethodName       = "/streamd.v1.ReplicationService/Barrier"
 	ReplicationService_AdvanceCommit_FullMethodName = "/streamd.v1.ReplicationService/AdvanceCommit"
+	ReplicationService_Status_FullMethodName        = "/streamd.v1.ReplicationService/Status"
 )
 
 // ReplicationServiceClient is the client API for ReplicationService service.
@@ -36,6 +37,7 @@ type ReplicationServiceClient interface {
 	Append(ctx context.Context, in *ReplicationServiceAppendRequest, opts ...grpc.CallOption) (*ReplicationServiceAppendResponse, error)
 	Barrier(ctx context.Context, in *ReplicationServiceBarrierRequest, opts ...grpc.CallOption) (*ReplicationServiceBarrierResponse, error)
 	AdvanceCommit(ctx context.Context, in *ReplicationServiceAdvanceCommitRequest, opts ...grpc.CallOption) (*ReplicationServiceAdvanceCommitResponse, error)
+	Status(ctx context.Context, in *ReplicationServiceStatusRequest, opts ...grpc.CallOption) (*ReplicationServiceStatusResponse, error)
 }
 
 type replicationServiceClient struct {
@@ -86,6 +88,16 @@ func (c *replicationServiceClient) AdvanceCommit(ctx context.Context, in *Replic
 	return out, nil
 }
 
+func (c *replicationServiceClient) Status(ctx context.Context, in *ReplicationServiceStatusRequest, opts ...grpc.CallOption) (*ReplicationServiceStatusResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ReplicationServiceStatusResponse)
+	err := c.cc.Invoke(ctx, ReplicationService_Status_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // ReplicationServiceServer is the server API for ReplicationService service.
 // All implementations must embed UnimplementedReplicationServiceServer
 // for forward compatibility.
@@ -97,6 +109,7 @@ type ReplicationServiceServer interface {
 	Append(context.Context, *ReplicationServiceAppendRequest) (*ReplicationServiceAppendResponse, error)
 	Barrier(context.Context, *ReplicationServiceBarrierRequest) (*ReplicationServiceBarrierResponse, error)
 	AdvanceCommit(context.Context, *ReplicationServiceAdvanceCommitRequest) (*ReplicationServiceAdvanceCommitResponse, error)
+	Status(context.Context, *ReplicationServiceStatusRequest) (*ReplicationServiceStatusResponse, error)
 	mustEmbedUnimplementedReplicationServiceServer()
 }
 
@@ -118,6 +131,9 @@ func (UnimplementedReplicationServiceServer) Barrier(context.Context, *Replicati
 }
 func (UnimplementedReplicationServiceServer) AdvanceCommit(context.Context, *ReplicationServiceAdvanceCommitRequest) (*ReplicationServiceAdvanceCommitResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method AdvanceCommit not implemented")
+}
+func (UnimplementedReplicationServiceServer) Status(context.Context, *ReplicationServiceStatusRequest) (*ReplicationServiceStatusResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method Status not implemented")
 }
 func (UnimplementedReplicationServiceServer) mustEmbedUnimplementedReplicationServiceServer() {}
 func (UnimplementedReplicationServiceServer) testEmbeddedByValue()                            {}
@@ -212,6 +228,24 @@ func _ReplicationService_AdvanceCommit_Handler(srv interface{}, ctx context.Cont
 	return interceptor(ctx, in, info, handler)
 }
 
+func _ReplicationService_Status_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReplicationServiceStatusRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ReplicationServiceServer).Status(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ReplicationService_Status_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ReplicationServiceServer).Status(ctx, req.(*ReplicationServiceStatusRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // ReplicationService_ServiceDesc is the grpc.ServiceDesc for ReplicationService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -234,6 +268,10 @@ var ReplicationService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "AdvanceCommit",
 			Handler:    _ReplicationService_AdvanceCommit_Handler,
+		},
+		{
+			MethodName: "Status",
+			Handler:    _ReplicationService_Status_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},
