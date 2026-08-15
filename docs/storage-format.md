@@ -131,7 +131,7 @@ ArtifactFooter {
 
 `content_sha256` 覆盖文件 Offset `[0, content_length)`，`file_length = content_length + 88`。Footer CRC 覆盖此前 Footer 字段，不覆盖自身和 Reserved。拥有该 Footer 且全部校验通过的文件才是可被 Manifest/Snapshot 引用的 Sealed Artifact；Active 投影文件不能被引用。
 
-V1 Artifact Type 编号固定为：`1=TAIL_CATALOG`、`2=LOCATOR_SNAPSHOT`、`3=REGISTRY_SNAPSHOT`、`4=LOCATOR_PACK`、`5=SNAPSHOT_MANIFEST`、`6=MANIFEST`、`7=SEGMENT`。前五种使用通用 Artifact Footer；Manifest 和 Segment 使用各自 Footer。
+V1 Artifact Type 编号固定为：`1=TAIL_CATALOG`、`2=LOCATOR_SNAPSHOT`、`3=REGISTRY_SNAPSHOT`、`4=LOCATOR_PACK`、`5=SNAPSHOT_MANIFEST`、`6=MANIFEST`、`7=SEGMENT`、`8=REPLICATION_STATE`。类型 1 到 5 以及类型 8 使用通用 Artifact Footer；Manifest 和 Segment 使用各自 Footer。
 
 ## 4. Record Frame V1
 
@@ -1195,6 +1195,136 @@ State Checkpoint 保存主备协议定义的：
 - Generation、前一 State SHA-256、自身 CRC/SHA-256。
 
 它使用与 Manifest 相同的“新文件 + CURRENT 指针”发布方式，禁止原地覆盖。V1 不为每个 Group Commit 增加独立 Metadata WAL 同步，而是周期生成 State Checkpoint，并按 Append Commit Protocol 的 durable suffix 规则恢复；State Checkpoint 是下界，不能要求修改已发布 Segment。
+
+V1 文件名为：
+
+```text
+meta/REPLICATION-STATE-<generation:020d>-<state_id_hex>.bin
+REPLICATION-CURRENT
+```
+
+State 文件由固定 320 字节 Header 和 88 字节通用 Artifact Footer 组成：
+
+```text
+ReplicationStateHeaderV1 {
+  magic                         [8]byte = "STRMRST1"
+  format_version                u16 = 1
+  header_length                 u16 = 320
+  flags                         u32
+
+  state_id                      UUID
+  generation                    u64
+  previous_generation           u64
+  previous_state_sha256         SHA256
+
+  group_id                      UUID
+  node_id                       UUID
+  term                          u64
+  role                          u16
+  durability                    u16
+  reserved_0                    u32 = 0
+
+  leader_id                     UUID
+  lease_expires_at              i64
+
+  last_appended_entry_id        u64
+  last_appended_entry_crc32c    u32
+  reserved_1                    u32 = 0
+
+  local_durable_entry_id        u64
+  local_durable_entry_crc32c    u32
+  reserved_2                    u32 = 0
+
+  replicated_entry_id           u64
+  replicated_entry_crc32c       u32
+  reserved_3                    u32 = 0
+
+  commit_entry_id               u64
+  commit_entry_crc32c           u32
+  reserved_4                    u32 = 0
+
+  applied_entry_id              u64
+  applied_entry_crc32c          u32
+  reserved_5                    u32 = 0
+
+  earliest_wal_entry_id         u64
+  installed_snapshot_id         UUID
+  snapshot_entry_id             u64
+  snapshot_entry_crc32c         u32
+  reserved_6                    u32 = 0
+
+  created_at                    i64
+  reserved_7                    [36]byte = 0
+  header_crc32c                 u32
+}
+```
+
+`header_crc32c` 使用 CRC32C Castagnoli，覆盖 Header 的前 316 字节。通用 Artifact Footer 使用 `artifact_type = REPLICATION_STATE`、`artifact_id = state_id`；Footer 的 SHA-256 覆盖完整 320 字节 Header。因此 Header 局部损坏由 CRC 检出，文件替换、截断和 Generation 链错误由 SHA-256 与 `REPLICATION-CURRENT` 检出。
+
+Flags 固定为：
+
+```text
+bit 0  HAS_LAST_APPENDED
+bit 1  HAS_LOCAL_DURABLE
+bit 2  HAS_REPLICATED
+bit 3  HAS_COMMITTED
+bit 4  HAS_APPLIED
+bit 5  HAS_LEADER
+bit 6  HAS_LEASE
+bit 7  HAS_INSTALLED_SNAPSHOT
+```
+
+Flag 未设置时对应 ID、CRC、时间或 UUID 字段必须全部为零。V1 Reader 遇到未知 Flag 必须拒绝；不能把未知状态解释成安全水位。
+
+Role 编码固定为：
+
+```text
+1  SINGLE
+2  PRIMARY
+3  STANDBY
+4  RECOVERING
+```
+
+Durability 编码固定为：
+
+```text
+1  SINGLE_SYNC
+2  REPLICATED_STRICT
+3  DEGRADED_LOCAL_ONLY
+```
+
+State 必须满足：
+
+```text
+applied <= committed <= local_durable <= last_appended
+replicated <= last_appended
+```
+
+`REPLICATED_STRICT` Primary 还必须满足 `committed <= replicated`。`STANDBY` 不设置 `HAS_REPLICATED` 和 `HAS_LEASE`；`PRIMARY` 的 `leader_id` 必须等于本地 `node_id` 并拥有 Lease；`SINGLE` 不设置 Leader、Lease、Replicated 或 Snapshot 复制状态。`RECOVERING` 不拥有 Lease。
+
+同一 Entry ID 出现在多个水位时 CRC32C 必须相同。Installed Snapshot Checkpoint 必须不晚于 Commit 水位；若 Snapshot 与 Commit 指向同一 Entry，CRC 必须相同。只要 `earliest_wal_entry_id > 0`，就必须存在覆盖到至少 `earliest_wal_entry_id - 1` 的已安装、已验证 Snapshot。空日志的所有可选水位均无值，`earliest_wal_entry_id = 0`。
+
+Generation 规则与 Manifest 相同：Generation 0 的 `previous_generation` 和 `previous_state_sha256` 全零；后续 Generation 必须恰好引用前一代的 Generation 和 Footer Content SHA-256。
+
+`REPLICATION-CURRENT` 使用以下可变长格式：
+
+```text
+ReplicationCurrentV1 {
+  magic                   [8]byte = "STRMRSC1"
+  format_version          u16 = 1
+  total_length            u16
+  flags                   u32 = 0
+  generation              u64
+  state_id                UUID
+  state_file_name_length  u16
+  reserved                u16 = 0
+  state_sha256            SHA256
+  state_file_name         bytes
+  crc32c                  u32
+}
+```
+
+最小长度为 80 字节，`crc32c` 覆盖它之前的全部内容。文件名必须是单个规范文件名，不能包含路径分隔符。启动只接受 Pointer、State Header、Artifact Footer 的 Generation、State ID 和 SHA-256 全部一致的状态；`meta/` 中更高但未被 Pointer 引用的文件只作为 Orphan 处理，不能自动提升为当前状态。
 
 ## 13. 数据目录
 
