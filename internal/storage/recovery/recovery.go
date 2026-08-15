@@ -29,7 +29,15 @@ type extent struct {
 	directory format.StreamDirectoryEntry
 }
 
+type Options struct {
+	ApplyThrough *uint64
+}
+
 func Open(root string) (*Result, error) {
+	return OpenWithOptions(root, Options{})
+}
+
+func OpenWithOptions(root string, options Options) (*Result, error) {
 	ms, err := manifeststore.Open(root)
 	if err != nil {
 		return nil, err
@@ -67,6 +75,10 @@ func Open(root string) (*Result, error) {
 				byStream[d.StreamID] = append(byStream[d.StreamID], extent{reader: reader, directory: d})
 			}
 		}
+	}
+	if options.ApplyThrough != nil && hasCheckpoint && *options.ApplyThrough < checkpointID {
+		result.Close()
+		return nil, fmt.Errorf("committed recovery watermark %d is behind Manifest checkpoint %d", *options.ApplyThrough, checkpointID)
 	}
 	for streamID, extents := range byStream {
 		slices.SortFunc(extents, func(a, b extent) int {
@@ -115,6 +127,9 @@ func Open(root string) (*Result, error) {
 			if entry.EntryID == checkpointID && entry.CRC32C != checkpointCRC {
 				return fmt.Errorf("WAL checkpoint CRC does not match Manifest")
 			}
+			return nil
+		}
+		if options.ApplyThrough != nil && entry.EntryID > *options.ApplyThrough {
 			return nil
 		}
 		if len(pending) == 0 && entry.BatchIndex != 0 {

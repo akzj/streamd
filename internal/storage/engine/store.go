@@ -23,6 +23,7 @@ import (
 	readstore "github.com/akzj/streamd/internal/storage/read"
 	"github.com/akzj/streamd/internal/storage/recovery"
 	"github.com/akzj/streamd/internal/storage/registry"
+	"github.com/akzj/streamd/internal/storage/replicationstate"
 	"github.com/akzj/streamd/internal/storage/segment"
 )
 
@@ -160,10 +161,35 @@ func open(path string, node *format.NodeIdentity, replication *ReplicationOption
 			return nil, err
 		}
 	}
-	state, err := recovery.Open(root.Path())
+	var checkpoint *format.ReplicationState
+	var applyThrough *uint64
+	if replication != nil && node != nil {
+		stateStore, stateErr := replicationstate.Open(root.Path(), *node)
+		if stateErr != nil {
+			root.Close()
+			return nil, stateErr
+		}
+		if current, ok := stateStore.Current(); ok {
+			if current.Header.Term != replication.Term || current.Header.Role != replication.Role || current.Header.Durability != replication.Durability {
+				root.Close()
+				return nil, fmt.Errorf("replicated engine options do not match durable Replication State")
+			}
+			checkpoint = &current
+			if current.Header.Committed.Present {
+				committed := current.Header.Committed.EntryID
+				applyThrough = &committed
+			}
+		}
+	}
+	state, err := recovery.OpenWithOptions(root.Path(), recovery.Options{ApplyThrough: applyThrough})
 	if err != nil {
 		root.Close()
 		return nil, err
+	}
+	if checkpoint != nil && replication.Role == format.ReplicationRolePrimary && state.WAL.NextEntryID() > 0 && (!checkpoint.Header.Committed.Present || state.WAL.NextEntryID()-1 > checkpoint.Header.Committed.EntryID) {
+		state.Close()
+		root.Close()
+		return nil, fmt.Errorf("Primary has an unresolved durable WAL suffix after its committed watermark")
 	}
 	if replication != nil && state.WAL.Scan().Header.CreatedTerm != replication.Term {
 		if err = state.WAL.Rotate(replication.Term, time.Now()); err != nil {
@@ -185,8 +211,21 @@ func open(path string, node *format.NodeIdentity, replication *ReplicationOption
 	if replication != nil {
 		term, role, durability, guard = replication.Term, replication.Role, replication.Durability, replication.Guard
 		commitOptions = commit.Options{Replica: replication.Replica, Guard: replication.Guard, ReplicaTimeout: replication.ReplicaTimeout}
+		if checkpoint != nil {
+			commitOptions.InitialWatermarks = watermarksFromState(checkpoint.Header)
+		}
 	}
 	return &Store{root: root, state: state, committer: commit.NewWithOptions(state.WAL, state.MemTable, commitOptions), reader: readstore.New(state.MemTable, state.Segments, 1024), now: time.Now, notifications: make(map[streamKey]chan struct{}), appendGates: make(map[streamKey]chan struct{}), nextEntryID: state.WAL.NextEntryID(), previousCRC32C: state.WAL.PreviousEntryCRC32C(), lastRecordedAt: lastRecordedAt, term: term, role: role, durability: durability, guard: guard, commitOptions: commitOptions}, nil
+}
+
+func watermarksFromState(header format.ReplicationStateHeader) commit.Watermarks {
+	return commit.Watermarks{
+		HasValue: header.LastAppended.Present, Appended: header.LastAppended.EntryID,
+		HasLocalDurable: header.LocalDurable.Present, LocalDurable: header.LocalDurable.EntryID,
+		HasReplicated: header.Replicated.Present, Replicated: header.Replicated.EntryID,
+		HasCommitted: header.Committed.Present, Committed: header.Committed.EntryID,
+		HasApplied: header.Applied.Present, Applied: header.Applied.EntryID,
+	}
 }
 func (s *Store) Close() error {
 	s.mu.Lock()

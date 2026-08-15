@@ -160,3 +160,54 @@ func TestRecoveryReplaysSealedAndActiveWALChain(t *testing.T) {
 		t.Fatalf("tail %+v applied %d", tail, recovered.AppliedEntryID)
 	}
 }
+
+func TestRecoveryDoesNotApplyBeyondCommittedWatermark(t *testing.T) {
+	root, err := fsutil.OpenRoot(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	state, err := Open(root.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	previous := uint32(0)
+	offset := uint64(0)
+	for entryID := uint64(0); entryID < 2; entryID++ {
+		hash := sha256.Sum256([]byte{byte(entryID)})
+		frame, frameErr := format.MarshalRecordFrame(format.RecordFrame{EntryID: entryID, StreamID: 4, Sequence: entryID, ByteOffset: offset, RecordedAt: int64(entryID + 1), BatchCount: 1, RequestHash: hash, Producer: "p"})
+		if frameErr != nil {
+			t.Fatal(frameErr)
+		}
+		encoded, encodeErr := format.MarshalWALEntry(1, previous, frame)
+		if encodeErr != nil {
+			t.Fatal(encodeErr)
+		}
+		entry, decodeErr := format.UnmarshalWALEntry(encoded)
+		if decodeErr != nil {
+			t.Fatal(decodeErr)
+		}
+		if err = state.WAL.Append(encoded); err != nil {
+			t.Fatal(err)
+		}
+		previous = entry.CRC32C
+		offset += uint64(len(frame))
+	}
+	if err = state.WAL.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	state.Close()
+	committed := uint64(0)
+	recovered, err := OpenWithOptions(root.Path(), Options{ApplyThrough: &committed})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer recovered.Close()
+	tail, ok := recovered.MemTable.Tail(4)
+	if !ok || tail.NextSequence != 1 || recovered.AppliedEntryID != 0 {
+		t.Fatalf("tail = %+v, applied = %d", tail, recovered.AppliedEntryID)
+	}
+	if recovered.WAL.NextEntryID() != 2 {
+		t.Fatalf("physical WAL tail = %d", recovered.WAL.NextEntryID())
+	}
+}

@@ -29,13 +29,14 @@ type Guard interface {
 }
 
 type Options struct {
-	MaxDelay       time.Duration
-	MaxRequests    int
-	MaxBytes       uint64
-	QueueCapacity  int
-	Replica        Replica
-	ReplicaTimeout time.Duration
-	Guard          Guard
+	MaxDelay          time.Duration
+	MaxRequests       int
+	MaxBytes          uint64
+	QueueCapacity     int
+	Replica           Replica
+	ReplicaTimeout    time.Duration
+	Guard             Guard
+	InitialWatermarks Watermarks
 }
 
 type Watermarks struct {
@@ -133,7 +134,7 @@ func NewWithOptions(log DurableLog, table *memtable.Table, options Options) *Com
 	if options.ReplicaTimeout <= 0 {
 		options.ReplicaTimeout = 30 * time.Second
 	}
-	committer := &Committer{log: log, table: table, options: options, queue: make(chan *pending, options.QueueCapacity), done: make(chan struct{}), replica: options.Replica, guard: options.Guard}
+	committer := &Committer{log: log, table: table, options: options, queue: make(chan *pending, options.QueueCapacity), done: make(chan struct{}), replica: options.Replica, guard: options.Guard, watermarks: options.InitialWatermarks}
 	go committer.run()
 	return committer
 }
