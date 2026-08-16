@@ -30,3 +30,6 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# Local integration-test artifacts, including generated private keys.
+/.tmp/

@@ -434,7 +434,8 @@ func openCoordinator(config Config) (*clientv3.Client, *etcdcoordinator.Coordina
 			return nil, nil, fmt.Errorf("replication.etcd.dial_timeout is invalid")
 		}
 	}
-	client, err := clientv3.New(clientv3.Config{Endpoints: config.Replication.Etcd.Endpoints, DialTimeout: dialTimeout, TLS: tlsConfig})
+	etcdCredentials := fixedServerNameCredentials{TransportCredentials: credentials.NewTLS(tlsConfig), serverName: config.Replication.Etcd.ServerName}
+	client, err := clientv3.New(clientv3.Config{Endpoints: config.Replication.Etcd.Endpoints, DialTimeout: dialTimeout, TLS: tlsConfig, DialOptions: []grpc.DialOption{grpc.WithTransportCredentials(etcdCredentials)}})
 	if err != nil {
 		return nil, nil, err
 	}
@@ -469,7 +470,31 @@ func replicationClientCredentials(config Config) (credentials.TransportCredentia
 		}
 		return fmt.Errorf("replication peer certificate URI SAN does not match peer_node_id")
 	}
-	return credentials.NewTLS(tlsConfig), nil
+	return fixedServerNameCredentials{TransportCredentials: credentials.NewTLS(tlsConfig), serverName: config.Replication.PeerServerName}, nil
+}
+
+// fixedServerNameCredentials keeps DNS authentication independent from the
+// dial target. gRPC otherwise replaces tls.Config.ServerName with the
+// resolver address, which is incorrect when a controlled proxy or load
+// balancer is the transport endpoint.
+type fixedServerNameCredentials struct {
+	credentials.TransportCredentials
+	serverName string
+}
+
+func (c fixedServerNameCredentials) ClientHandshake(ctx context.Context, _ string, connection net.Conn) (net.Conn, credentials.AuthInfo, error) {
+	return c.TransportCredentials.ClientHandshake(ctx, c.serverName, connection)
+}
+
+func (c fixedServerNameCredentials) Clone() credentials.TransportCredentials {
+	return fixedServerNameCredentials{TransportCredentials: c.TransportCredentials.Clone(), serverName: c.serverName}
+}
+
+func (c fixedServerNameCredentials) OverrideServerName(serverName string) error {
+	if serverName != c.serverName {
+		return fmt.Errorf("TLS server name is fixed to %q", c.serverName)
+	}
+	return nil
 }
 
 func clientTLS(certificateFile, keyFile, caFile, serverName string) (*tls.Config, error) {

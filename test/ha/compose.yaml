@@ -1,0 +1,123 @@
+services:
+  etcd:
+    image: gcr.io/etcd-development/etcd:v3.6.5@sha256:042ef9c02799eb9303abf1aa99b09f09d94b8ee3ba0c2dd3f42dc4e1d3dce534
+    command:
+      - /usr/local/bin/etcd
+      - --name=etcd
+      - --data-dir=/var/lib/etcd
+      - --listen-client-urls=https://0.0.0.0:2379
+      - --advertise-client-urls=https://etcd:2379
+      - --cert-file=/certs/etcd.crt
+      - --key-file=/certs/etcd.key
+      - --trusted-ca-file=/certs/ca.crt
+      - --client-cert-auth=true
+      - --listen-peer-urls=https://0.0.0.0:2380
+      - --initial-advertise-peer-urls=https://etcd:2380
+      - --peer-cert-file=/certs/etcd.crt
+      - --peer-key-file=/certs/etcd.key
+      - --peer-trusted-ca-file=/certs/ca.crt
+      - --peer-client-cert-auth=true
+      - --initial-cluster=etcd=https://etcd:2380
+      - --initial-cluster-state=new
+      - --initial-cluster-token=streamd-ha-test
+    volumes:
+      - etcd-data:/var/lib/etcd
+      - ${HA_RUN_DIR:?HA_RUN_DIR is required}/certs:/certs:ro
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/etcdctl", "--endpoints=https://etcd:2379", "--cacert=/certs/ca.crt", "--cert=/certs/etcd-client.crt", "--key=/certs/etcd-client.key", "endpoint", "health"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+    networks: [ha]
+
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.12.0@sha256:9378ed52a28bc50edc1350f936f518f31fa95f0d15917d6eb40b8e376d1a214e
+    networks: [ha]
+
+  proxy-init:
+    build:
+      context: ../..
+      dockerfile: test/ha/Dockerfile
+      target: proxy-init
+    environment:
+      TOXIPROXY_API: http://toxiproxy:8474
+    depends_on:
+      toxiproxy:
+        condition: service_started
+    restart: "no"
+    networks: [ha]
+
+  streamd-primary:
+    build:
+      context: ../..
+      dockerfile: test/ha/Dockerfile
+      target: streamd
+    command: ["-config", "/etc/streamd/config.json"]
+    volumes:
+      - primary-data:/var/lib/streamd
+      - ${HA_RUN_DIR:?HA_RUN_DIR is required}/configs/primary.json:/etc/streamd/config.json:ro
+      - ${HA_RUN_DIR:?HA_RUN_DIR is required}/certs:/etc/streamd/tls:ro
+      - ${HA_RUN_DIR:?HA_RUN_DIR is required}/certs:/etc/streamd/etcd:ro
+    depends_on:
+      etcd:
+        condition: service_healthy
+      proxy-init:
+        condition: service_completed_successfully
+    restart: on-failure:10
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9090/readyz"]
+      interval: 1s
+      timeout: 2s
+      retries: 60
+    networks: [ha]
+
+  streamd-standby:
+    build:
+      context: ../..
+      dockerfile: test/ha/Dockerfile
+      target: streamd
+    command: ["-config", "/etc/streamd/config.json"]
+    volumes:
+      - standby-data:/var/lib/streamd
+      - ${HA_RUN_DIR:?HA_RUN_DIR is required}/configs/standby.json:/etc/streamd/config.json:ro
+      - ${HA_RUN_DIR:?HA_RUN_DIR is required}/certs:/etc/streamd/tls:ro
+      - ${HA_RUN_DIR:?HA_RUN_DIR is required}/certs:/etc/streamd/etcd:ro
+    depends_on:
+      etcd:
+        condition: service_healthy
+      proxy-init:
+        condition: service_completed_successfully
+    restart: on-failure:10
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9090/readyz"]
+      interval: 1s
+      timeout: 2s
+      retries: 60
+    networks: [ha]
+
+  test-runner:
+    build:
+      context: ../..
+      dockerfile: test/ha/Dockerfile
+      target: test-runner
+    environment:
+      HA_CERT_DIR: /ha/certs
+      HA_PRIMARY_ADDRESS: streamd-primary:7443
+      TOXIPROXY_API: http://toxiproxy:8474
+    volumes:
+      - ${HA_RUN_DIR:?HA_RUN_DIR is required}/certs:/ha/certs:ro
+    depends_on:
+      streamd-primary:
+        condition: service_healthy
+      streamd-standby:
+        condition: service_healthy
+    profiles: [test]
+    networks: [ha]
+
+networks:
+  ha: {}
+
+volumes:
+  etcd-data: {}
+  primary-data: {}
+  standby-data: {}
