@@ -3,13 +3,13 @@ package main
 import (
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
 	"strings"
 
 	"github.com/akzj/streamd/internal/storage/format"
-	"github.com/akzj/streamd/internal/storage/identity"
 	"github.com/akzj/streamd/internal/storage/retention"
 	"github.com/akzj/streamd/internal/storage/scrub"
 	"github.com/akzj/streamd/internal/storage/snapshot"
@@ -78,14 +78,11 @@ func main() {
 		if *data == "" || *snapshotPath == "" {
 			usage()
 		}
-		var node format.NodeIdentity
-		node, err = identity.Load(*data)
+		var manager *retention.Manager
+		manager, err = retention.Open(*data)
 		if err == nil {
-			var manager *retention.Manager
-			manager, err = retention.Open(*data, node)
-			if err == nil {
-				result, err = manager.Collect(*snapshotPath, *maxRetainedBytes)
-			}
+			result, err = manager.Collect(*snapshotPath, *maxRetainedBytes)
+			err = errors.Join(err, manager.Close())
 		}
 	default:
 		usage()

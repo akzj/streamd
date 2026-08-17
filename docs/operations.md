@@ -340,6 +340,10 @@ streamd-tool collect-wal \
 前缀，并原子推进 `earliest_wal_entry_id`。禁止直接删除 `wal/` 文件。可选的
 `-max-retained-bytes` 只报告保留压力，不会越过安全水位强制删除。
 
+`collect-wal` 在读取 NODE、Manifest、Replication State 和 WAL History 以前取得数据根 `LOCK` 的
+非阻塞独占锁，并持有到 GC 及 Replication State 发布全部结束。在线节点或另一个离线工具已持锁时，
+命令必须以 `streamd data directory is locked` 失败；它不能等待后进入，也不能绕过锁只执行部分 GC。
+
 ## 10. Failover Runbook
 
 ### 10.1 自动切换前提

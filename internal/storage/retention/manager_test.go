@@ -2,11 +2,13 @@ package retention
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/akzj/streamd/internal/storage/engine"
 	"github.com/akzj/streamd/internal/storage/format"
+	"github.com/akzj/streamd/internal/storage/fsutil"
 	"github.com/akzj/streamd/internal/storage/replicationstate"
 	"github.com/akzj/streamd/internal/storage/snapshot"
 )
@@ -52,10 +54,11 @@ func TestManagerCollectsOnlyFromPinnedVerifiedSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	manager, err := Open(root, identity)
+	manager, err := Open(root)
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer manager.Close()
 	result, err := manager.Collect(snapshotPath, 0)
 	if err != nil || len(result.DeletedFiles) == 0 || result.EarliestWAL != verified.CheckpointEntryID+1 {
 		t.Fatalf("GC = %+v, %v", result, err)
@@ -76,6 +79,45 @@ func TestManagerCollectsOnlyFromPinnedVerifiedSnapshot(t *testing.T) {
 	current, ok = stateStore.Current()
 	if !ok || current.Header.EarliestWALEntryID != result.EarliestWAL || !current.Header.HasInstalledSnapshot || current.Header.InstalledSnapshotID != verified.SnapshotID {
 		t.Fatalf("Replication State = %+v, ok = %v", current.Header, ok)
+	}
+}
+
+func TestManagerRequiresExclusiveDataRootAndCloseReleasesIt(t *testing.T) {
+	root := t.TempDir()
+	node := format.NodeIdentity{ClusterID: retentionID(1), GroupID: retentionID(2), NodeID: retentionID(3), CreatedAt: 1}
+	store, err := engine.OpenWithIdentity(root, node)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = Open(root); !errors.Is(err, fsutil.ErrLocked) {
+		store.Close()
+		t.Fatalf("Retention Open with live Store error = %v", err)
+	}
+	if err = store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	manager, err := Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = engine.OpenWithIdentity(root, node); !errors.Is(err, fsutil.ErrLocked) {
+		manager.Close()
+		t.Fatalf("Store Open with live Retention Manager error = %v", err)
+	}
+	if err = manager.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = manager.Collect(root+"/snapshots/missing", 0); !errors.Is(err, ErrClosed) {
+		t.Fatalf("Collect after Close error = %v", err)
+	}
+
+	reopened, err := engine.OpenWithIdentity(root, node)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = reopened.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 

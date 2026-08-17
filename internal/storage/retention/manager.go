@@ -6,45 +6,66 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/akzj/streamd/internal/storage/format"
+	"github.com/akzj/streamd/internal/storage/fsutil"
+	"github.com/akzj/streamd/internal/storage/identity"
 	manifeststore "github.com/akzj/streamd/internal/storage/manifest"
 	"github.com/akzj/streamd/internal/storage/replicationstate"
 	"github.com/akzj/streamd/internal/storage/snapshot"
 	"github.com/akzj/streamd/internal/storage/wal"
 )
 
+var ErrClosed = errors.New("retention manager is closed")
+
 type Manager struct {
+	mu       sync.Mutex
+	rootLock *fsutil.Root
 	root     string
 	identity format.NodeIdentity
 	history  *wal.History
 	manifest *manifeststore.Store
 	state    *replicationstate.Store
 	now      func() time.Time
+	closed   bool
 }
 
-func Open(root string, identity format.NodeIdentity) (*Manager, error) {
-	abs, err := filepath.Abs(root)
+func Open(root string) (*Manager, error) {
+	rootLock, err := fsutil.LockExistingRoot(root)
 	if err != nil {
 		return nil, err
+	}
+	fail := func(err error) (*Manager, error) {
+		return nil, errors.Join(err, rootLock.Close())
+	}
+	abs := rootLock.Path()
+	node, err := identity.Load(abs)
+	if err != nil {
+		return fail(fmt.Errorf("NODE: %w", err))
 	}
 	history, err := wal.OpenHistory(abs)
 	if err != nil {
-		return nil, err
+		return fail(err)
 	}
 	manifest, err := manifeststore.Open(abs)
 	if err != nil {
-		return nil, err
+		return fail(err)
 	}
-	state, err := replicationstate.Open(abs, identity)
+	state, err := replicationstate.Open(abs, node)
 	if err != nil {
-		return nil, err
+		return fail(err)
 	}
-	return &Manager{root: abs, identity: identity, history: history, manifest: manifest, state: state, now: time.Now}, nil
+	return &Manager{rootLock: rootLock, root: abs, identity: node, history: history, manifest: manifest, state: state, now: time.Now}, nil
 }
 
 func (m *Manager) Collect(snapshotPath string, maxRetainedBytes uint64) (wal.GCResult, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return wal.GCResult{}, ErrClosed
+	}
 	absSnapshot, err := filepath.Abs(snapshotPath)
 	if err != nil {
 		return wal.GCResult{}, err
@@ -83,4 +104,14 @@ func (m *Manager) Collect(snapshotPath string, maxRetainedBytes uint64) (wal.GCR
 		return nil
 	})
 	return result, errors.Join(collectErr, stateErr)
+}
+
+func (m *Manager) Close() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return nil
+	}
+	m.closed = true
+	return m.rootLock.Close()
 }

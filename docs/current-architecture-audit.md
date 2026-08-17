@@ -5,7 +5,7 @@
 | 审计性质 | 代码现实版整体架构审计，不是目标架构复述 |
 | 审计基线 | `ddbbdd4f6202cddea07bd7e3f978415c5fa1d560` |
 | 审计日期 | 2026-08-17 |
-| 审计后实施 | Snapshot Safety Boundary：离线 HA 创建被拒绝；在线 Strict Primary 校验 Lease、fatal 与 committed watermark |
+| 审计后实施 | Snapshot Safety Boundary；WAL GC Safety Boundary：离线独占锁覆盖 NODE、校验、删除和 State 发布 |
 | 覆盖范围 | API、存储、索引、Checkpoint、Compaction、恢复、Snapshot、WAL GC、Strict HA、并发与运维入口 |
 | 不在本次范围 | 新功能实现、性能压测、生产部署验收、协议或格式变更 |
 
@@ -23,8 +23,8 @@ Lease Fencing 和诊断接口之间已经存在真实调用关系，不是只有
 2. `ResolveRejoin` 已实现并测试，但没有接入节点启动、旧主回归或 WAL 后缀处理流程。
 3. 审计时 HA 数据目录的离线 Snapshot 会通过 Single Engine 恢复全部物理 WAL；审计后的 Safety
    Boundary 已拒绝该路径，但在线 HA Snapshot 尚未接入节点管理入口。
-4. WAL GC 是离线工具语义，但 `retention.Open` 没有取得数据目录独占锁，代码没有强制阻止与
-   在线节点并发删除 WAL。
+4. 审计时 WAL GC 没有取得数据目录独占锁；审计后的 Safety Boundary 已让 Retention Manager 在
+   全部读取、删除和 State 发布期间持有数据根独占锁。
 5. 启动仍加载全部 Segment Descriptor 和 Stream Directory；Locator/Registry 查询已经有界，
    但百万 Stream 的启动内存目标尚未实现。
 
@@ -424,13 +424,15 @@ checkpoint 曾 committed。
 入口接入 Primary 的管理或自动化生命周期，因此当前状态是“拒绝不安全操作”，不是“HA Snapshot
 生产闭环已经完成”。
 
-#### P0-2 WAL GC 没有代码级独占运行保证
+#### P0-2 WAL GC 没有代码级独占运行保证（Safety Boundary 已实施）
 
-运维文档把 `collect-wal` 定义为离线命令，但 `retention.Open` 没有通过 `fsutil.OpenRoot` 或
+审计基线把 `collect-wal` 定义为离线命令，但 `retention.Open` 没有通过 `fsutil.OpenRoot` 或
 `LockExistingRoot` 获取数据目录锁。若误与在线进程并发执行，它可能删除在线 WAL History 中的 sealed
 文件；“靠 Runbook 不并发”不足以保护存储事实。
 
-门禁：WAL GC 必须持有数据目录独占锁，或成为由 Engine 所有权和 maintenance lock 驱动的在线操作。
+已实施门禁：`retention.Open` 先取得 `LockExistingRoot`，再在锁内读取 NODE、WAL、Manifest 和
+Replication State；Manager 持锁完成 Snapshot 校验、WAL 删除和 State 发布，显式 `Close` 后才释放。
+CLI 在成功和失败路径都关闭 Manager；在线 Store 与 Retention Manager 互相排斥，并由测试验证。
 
 #### P0-3 Snapshot Catch-up/Rejoin 不构成可运行 HA 恢复闭环
 
@@ -537,7 +539,7 @@ Recovery 主链，以免无法区分数据安全回归和内存模型变化。
 Review 通过后的建议顺序：
 
 1. 将已完成 committed boundary 校验的 `CreateOnline` 接入受控 Primary 管理入口，并继续完善数据目录角色/模式校验；
-2. 给 WAL GC 增加代码级独占所有权；
+2. WAL GC 代码级独占所有权已完成；后续只在端到端运维测试中验证命令退出和锁恢复；
 3. 冻结 Snapshot Catch-up/Rejoin 的自动化边界；
 4. 完成真实空盘 Standby、WAL 已回收、旧主 divergent suffix 的端到端恢复测试；
 5. 统一 Single/Primary/Standby 的进程生命周期骨架；
