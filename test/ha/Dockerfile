@@ -8,7 +8,8 @@ RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 go build -trimpath -o /out/streamd ./cmd/streamd \
  && CGO_ENABLED=0 go build -trimpath -o /out/streamd-tool ./cmd/streamd-tool \
- && CGO_ENABLED=0 go build -trimpath -o /out/proxy-init ./test/ha/cmd/proxy-init
+ && CGO_ENABLED=0 go build -trimpath -o /out/proxy-init ./test/ha/cmd/proxy-init \
+ && CGO_ENABLED=0 go build -trimpath -o /out/admin-proxy ./test/ha/cmd/admin-proxy
 
 FROM ${RUNTIME_IMAGE} AS streamd
 COPY --from=build /out/streamd /usr/local/bin/streamd
@@ -17,6 +18,10 @@ ENTRYPOINT ["/usr/local/bin/streamd"]
 FROM ${RUNTIME_IMAGE} AS proxy-init
 COPY --from=build /out/proxy-init /usr/local/bin/proxy-init
 ENTRYPOINT ["/usr/local/bin/proxy-init"]
+
+FROM ${RUNTIME_IMAGE} AS admin-proxy
+COPY --from=build /out/admin-proxy /usr/local/bin/admin-proxy
+ENTRYPOINT ["/usr/local/bin/admin-proxy"]
 
 FROM ${RUNTIME_IMAGE} AS streamd-tool
 COPY --from=build /out/streamd-tool /usr/local/bin/streamd-tool

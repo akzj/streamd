@@ -25,8 +25,8 @@ import (
 
 const (
 	primaryAddress = "streamd-primary:7443"
-	primaryMetrics = "http://streamd-primary:9090/metrics"
-	standbyMetrics = "http://streamd-standby:9090/metrics"
+	primaryMetrics = "http://streamd-primary:19090/metrics"
+	standbyMetrics = "http://streamd-standby:19090/metrics"
 	proxyAPI       = "http://toxiproxy:8474"
 )
 

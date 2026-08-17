@@ -166,6 +166,30 @@ services:
       retries: 60
     networks: [ha]
 
+  primary-admin-proxy:
+    build:
+      context: ../..
+      dockerfile: test/ha/Dockerfile
+      target: admin-proxy
+    command: ["-listen", "0.0.0.0:19090", "-target", "http://127.0.0.1:9090"]
+    network_mode: "service:streamd-primary"
+    depends_on:
+      streamd-primary:
+        condition: service_healthy
+    restart: "no"
+
+  standby-admin-proxy:
+    build:
+      context: ../..
+      dockerfile: test/ha/Dockerfile
+      target: admin-proxy
+    command: ["-listen", "0.0.0.0:19090", "-target", "http://127.0.0.1:9090"]
+    network_mode: "service:streamd-standby"
+    depends_on:
+      streamd-standby:
+        condition: service_healthy
+    restart: "no"
+
   test-runner:
     build:
       context: ../..
@@ -183,6 +207,10 @@ services:
         condition: service_healthy
       streamd-standby:
         condition: service_healthy
+      primary-admin-proxy:
+        condition: service_started
+      standby-admin-proxy:
+        condition: service_started
     profiles: [test]
     networks: [ha]
 
