@@ -3,6 +3,7 @@ package read
 import (
 	"container/list"
 	"fmt"
+	"sort"
 	"sync"
 
 	"github.com/akzj/streamd/internal/storage/errdefs"
@@ -31,7 +32,7 @@ type StreamInfo struct {
 	LastRecordedAt  int64
 }
 type extent struct {
-	reader    *segment.Reader
+	reference format.SegmentReference
 	directory format.StreamDirectoryEntry
 }
 type cacheEntry struct {
@@ -39,19 +40,21 @@ type cacheEntry struct {
 	extents  []extent
 }
 type Store struct {
-	table    *memtable.Table
-	segments []*segment.Reader
-	capacity int
-	mu       sync.Mutex
-	cache    map[uint64]*list.Element
-	lru      *list.List
+	table      *memtable.Table
+	generation uint64
+	segments   []segment.Descriptor
+	handles    *segment.HandleCache
+	capacity   int
+	mu         sync.Mutex
+	cache      map[uint64]*list.Element
+	lru        *list.List
 }
 
-func New(table *memtable.Table, segments []*segment.Reader, streamCacheCapacity int) *Store {
+func New(table *memtable.Table, root string, generation uint64, segments []segment.Descriptor, streamCacheCapacity, handleCapacity int) *Store {
 	if streamCacheCapacity <= 0 {
 		streamCacheCapacity = 1024
 	}
-	return &Store{table: table, segments: segments, capacity: streamCacheCapacity, cache: make(map[uint64]*list.Element), lru: list.New()}
+	return &Store{table: table, generation: generation, segments: append([]segment.Descriptor(nil), segments...), handles: segment.NewHandleCache(root, handleCapacity), capacity: streamCacheCapacity, cache: make(map[uint64]*list.Element), lru: list.New()}
 }
 func (s *Store) extents(streamID uint64) []extent {
 	s.mu.Lock()
@@ -61,19 +64,15 @@ func (s *Store) extents(streamID uint64) []extent {
 		return element.Value.(cacheEntry).extents
 	}
 	var found []extent
-	for _, reader := range s.segments {
-		for _, d := range reader.Directories {
+	for _, descriptor := range s.segments {
+		for _, d := range descriptor.Directories {
 			if d.StreamID == streamID {
-				found = append(found, extent{reader, d})
+				found = append(found, extent{descriptor.Reference, d})
 				break
 			}
 		}
 	}
-	for i := 1; i < len(found); i++ {
-		for j := i; j > 0 && found[j].directory.FirstSequence < found[j-1].directory.FirstSequence; j-- {
-			found[j], found[j-1] = found[j-1], found[j]
-		}
-	}
+	sort.Slice(found, func(i, j int) bool { return found[i].directory.FirstSequence < found[j].directory.FirstSequence })
 	element := s.lru.PushFront(cacheEntry{streamID, found})
 	s.cache[streamID] = element
 	if s.lru.Len() > s.capacity {
@@ -130,10 +129,20 @@ func (s *Store) Read(streamID, from uint64, maxRecords int, maxBytes uint64) (Re
 	return result, nil
 }
 func (s *Store) readSegment(streamID, sequence uint64) (format.RecordFrame, error) {
-	for _, e := range s.extents(streamID) {
+	extents := s.extents(streamID)
+	i := sort.Search(len(extents), func(i int) bool {
+		return extents[i].directory.FirstSequence+extents[i].directory.RecordCount > sequence
+	})
+	if i < len(extents) {
+		e := extents[i]
 		d := e.directory
-		if sequence >= d.FirstSequence && sequence < d.FirstSequence+d.RecordCount {
-			return e.reader.Read(streamID, sequence)
+		if sequence >= d.FirstSequence {
+			reader, release, err := s.handles.Acquire(e.reference)
+			if err != nil {
+				return format.RecordFrame{}, err
+			}
+			defer release()
+			return reader.Read(streamID, sequence)
 		}
 	}
 	return format.RecordFrame{}, fmt.Errorf("Sequence %d is not covered by a Segment", sequence)
@@ -225,3 +234,7 @@ func (s *Store) ClearCache() {
 	s.lru.Init()
 	s.mu.Unlock()
 }
+
+func (s *Store) Generation() uint64 { return s.generation }
+
+func (s *Store) Close() error { return s.handles.Close() }

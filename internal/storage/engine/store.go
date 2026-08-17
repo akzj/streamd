@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"path/filepath"
 	"slices"
 	"sync"
 	"time"
@@ -71,6 +70,12 @@ type streamKey struct {
 	namespace string
 	stream    string
 }
+
+const (
+	defaultStreamCacheCapacity   = 1024
+	defaultSegmentHandleCapacity = 64
+)
+
 type Store struct {
 	mu             sync.Mutex
 	gateMu         sync.Mutex
@@ -216,7 +221,11 @@ func open(path string, node *format.NodeIdentity, replication *ReplicationOption
 			commitOptions.InitialWatermarks = watermarksFromState(checkpoint.Header)
 		}
 	}
-	return &Store{root: root, state: state, committer: commit.NewWithOptions(state.WAL, state.MemTable, commitOptions), reader: readstore.New(state.MemTable, state.Segments, 1024), now: time.Now, notifications: make(map[streamKey]chan struct{}), appendGates: make(map[streamKey]chan struct{}), nextEntryID: state.WAL.NextEntryID(), previousCRC32C: state.WAL.PreviousEntryCRC32C(), lastRecordedAt: lastRecordedAt, term: term, role: role, durability: durability, guard: guard, commitOptions: commitOptions}, nil
+	generation := uint64(0)
+	if current, ok := state.Manifest.Current(); ok {
+		generation = current.Header.Generation
+	}
+	return &Store{root: root, state: state, committer: commit.NewWithOptions(state.WAL, state.MemTable, commitOptions), reader: readstore.New(state.MemTable, root.Path(), generation, state.Segments, defaultStreamCacheCapacity, defaultSegmentHandleCapacity), now: time.Now, notifications: make(map[streamKey]chan struct{}), appendGates: make(map[streamKey]chan struct{}), nextEntryID: state.WAL.NextEntryID(), previousCRC32C: state.WAL.PreviousEntryCRC32C(), lastRecordedAt: lastRecordedAt, term: term, role: role, durability: durability, guard: guard, commitOptions: commitOptions}, nil
 }
 
 func watermarksFromState(header format.ReplicationStateHeader) commit.Watermarks {
@@ -239,7 +248,7 @@ func (s *Store) Close() error {
 	commitErr := s.committer.Close()
 	s.viewMu.Lock()
 	defer s.viewMu.Unlock()
-	return errors.Join(commitErr, s.state.Close(), s.root.Close())
+	return errors.Join(commitErr, s.reader.Close(), s.state.Close(), s.root.Close())
 }
 func (s *Store) Append(ctx context.Context, request AppendRequest) (AppendResult, error) {
 	if request.Namespace == "" || request.Stream == "" || len(request.RequestID) == 0 || len(request.RequestID) > format.MaxRequestIDLength || request.Producer == "" || len(request.Records) == 0 || len(request.Records) > format.MaxBatchRecordCount {
@@ -436,8 +445,8 @@ func (s *Store) Checkpoint() (format.Manifest, bool, error) {
 		}
 	}
 	existing := make(map[format.UUID]bool, len(s.state.Segments))
-	for _, reader := range s.state.Segments {
-		existing[reader.Header.SegmentID] = true
+	for _, descriptor := range s.state.Segments {
+		existing[descriptor.Reference.SegmentID] = true
 	}
 	var newReference *format.SegmentReference
 	for i := range published.SegmentReferences {
@@ -451,7 +460,7 @@ func (s *Store) Checkpoint() (format.Manifest, bool, error) {
 		s.setFatal(err)
 		return format.Manifest{}, false, err
 	}
-	reader, err := segment.Open(filepath.Join(s.root.Path(), newReference.LocalPath))
+	descriptor, err := segment.DescribeReference(s.root.Path(), *newReference)
 	if err != nil {
 		s.setFatal(err)
 		return format.Manifest{}, false, err
@@ -459,18 +468,23 @@ func (s *Store) Checkpoint() (format.Manifest, bool, error) {
 	newTable := memtable.New(0)
 	for _, snapshot := range snapshots {
 		if err = newTable.SeedTail(snapshot.StreamID, snapshot.Tail); err != nil {
-			reader.Close()
 			s.setFatal(err)
 			return format.Manifest{}, false, err
 		}
 	}
 	s.viewMu.Lock()
 	oldTable := s.state.MemTable
+	oldReader := s.reader
 	s.state.MemTable = newTable
-	s.state.Segments = append(s.state.Segments, reader)
+	s.state.Segments = append(s.state.Segments, descriptor)
 	s.committer = commit.NewWithOptions(s.state.WAL, newTable, s.commitOptions)
-	s.reader = readstore.New(newTable, s.state.Segments, 1024)
+	s.reader = readstore.New(newTable, s.root.Path(), published.Header.Generation, s.state.Segments, defaultStreamCacheCapacity, defaultSegmentHandleCapacity)
+	closeErr := oldReader.Close()
 	s.viewMu.Unlock()
+	if closeErr != nil {
+		s.setFatal(closeErr)
+		return published, true, closeErr
+	}
 	oldTable.Freeze()
 	if s.checkpointHook != nil {
 		if err = s.checkpointHook("after_view_install"); err != nil {

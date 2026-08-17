@@ -20,13 +20,13 @@ type Result struct {
 	WAL            *wal.Log
 	MemTable       *memtable.Table
 	Registry       *registry.Registry
-	Segments       []*segment.Reader
+	Segments       []segment.Descriptor
 	AppliedEntryID uint64
 	HasApplied     bool
 }
 type extent struct {
-	reader    *segment.Reader
-	directory format.StreamDirectoryEntry
+	descriptor segment.Descriptor
+	directory  format.StreamDirectoryEntry
 }
 
 type Options struct {
@@ -60,19 +60,14 @@ func OpenWithOptions(root string, options Options) (*Result, error) {
 			if ref.Flags&format.SegmentRefHasLocal == 0 {
 				return nil, fmt.Errorf("Segment %x has no local copy", ref.SegmentID)
 			}
-			reader, e := segment.Open(filepath.Join(root, ref.LocalPath))
+			descriptor, e := segment.DescribeReference(root, ref)
 			if e != nil {
 				result.Close()
 				return nil, e
 			}
-			if reader.Header.SegmentID != ref.SegmentID {
-				reader.Close()
-				result.Close()
-				return nil, fmt.Errorf("Segment Reference ID mismatch")
-			}
-			result.Segments = append(result.Segments, reader)
-			for _, d := range reader.Directories {
-				byStream[d.StreamID] = append(byStream[d.StreamID], extent{reader: reader, directory: d})
+			result.Segments = append(result.Segments, descriptor)
+			for _, d := range descriptor.Directories {
+				byStream[d.StreamID] = append(byStream[d.StreamID], extent{descriptor: descriptor, directory: d})
 			}
 		}
 	}
@@ -99,16 +94,27 @@ func OpenWithOptions(root string, options Options) (*Result, error) {
 			}
 			tail = memtable.Tail{NextSequence: d.FirstSequence + d.RecordCount, NextByteOffset: d.NextByteOffset, LastRecordedAt: d.LastRecordedAt, LastEntryID: d.LastEntryID, RecordCount: tail.RecordCount + d.RecordCount}
 			if streamID == registry.RegistryStreamID {
+				reader, openErr := segment.OpenReference(root, e.descriptor.Reference)
+				if openErr != nil {
+					result.Close()
+					return nil, openErr
+				}
 				for sequence := d.FirstSequence; sequence < d.FirstSequence+d.RecordCount; sequence++ {
-					record, e := e.reader.Read(streamID, sequence)
-					if e != nil {
+					record, readErr := reader.Read(streamID, sequence)
+					if readErr != nil {
+						reader.Close()
 						result.Close()
-						return nil, e
+						return nil, readErr
 					}
-					if e = reg.ApplyRecord(record.EntryID, record.Payload); e != nil {
+					if readErr = reg.ApplyRecord(record.EntryID, record.Payload); readErr != nil {
+						reader.Close()
 						result.Close()
-						return nil, e
+						return nil, readErr
 					}
+				}
+				if closeErr := reader.Close(); closeErr != nil {
+					result.Close()
+					return nil, closeErr
 				}
 			}
 		}
@@ -292,9 +298,6 @@ func (r *Result) Close() error {
 	if r.WAL != nil {
 		errs = append(errs, r.WAL.Close())
 		r.WAL = nil
-	}
-	for _, reader := range r.Segments {
-		errs = append(errs, reader.Close())
 	}
 	r.Segments = nil
 	return errors.Join(errs...)

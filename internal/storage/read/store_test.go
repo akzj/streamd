@@ -42,17 +42,18 @@ func TestReadInspectResolveAcrossSegment(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	reader, err := segment.Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer reader.Close()
 	active := memtable.New(0)
 	d := meta.Directories[0]
 	if err = active.SeedTail(1, memtable.Tail{NextSequence: d.FirstSequence + d.RecordCount, NextByteOffset: d.NextByteOffset, LastRecordedAt: d.LastRecordedAt, LastEntryID: d.LastEntryID, RecordCount: d.RecordCount}); err != nil {
 		t.Fatal(err)
 	}
-	store := New(active, []*segment.Reader{reader}, 1)
+	reference := format.SegmentReference{Flags: format.SegmentRefHasLocal, SegmentID: meta.Header.SegmentID, FileSize: meta.Footer.FileLength, FirstEntryID: meta.Header.FirstEntryID, LastEntryID: meta.Header.LastEntryID, StreamCount: meta.Header.StreamCount, RecordCount: meta.Header.RecordCount, LocalPath: filepath.Base(path), ContentSHA256: meta.Footer.ContentSHA256}
+	descriptor, err := segment.DescribeReference(filepath.Dir(path), reference)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := New(active, filepath.Dir(path), 1, []segment.Descriptor{descriptor}, 1, 1)
+	defer store.Close()
 	result, err := store.Read(1, 1, 10, 0)
 	if err != nil || len(result.Records) != 2 || result.NextSequence != 3 {
 		t.Fatalf("result %+v %v", result, err)
