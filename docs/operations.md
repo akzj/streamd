@@ -400,7 +400,10 @@ streamd-tool collect-wal \
 6. 完成 Scrub/Health；
 7. 才进入可用 Standby。
 
-当 Primary 报告 `NEEDS_SNAPSHOT` 时，停止 Standby，在协调器当前 Term 下执行：
+当 Primary 的 `/diagnostics` 报告 `snapshot_required` 时，先记录并核对 `task_id`、`term`、
+`group_id`、source/target Node ID、Snapshot ID/Checkpoint、earliest WAL 和目标 durable position。
+`create_and_install_snapshot` 要求先从该任务指定的 Primary 创建并验证 Snapshot；
+`install_snapshot` 使用任务指定的已验证 Snapshot。停止 Standby 后，在任务的当前 Term 下执行：
 
 ```bash
 streamd-tool verify-snapshot -path /srv/streamd-snapshots/latest
@@ -412,7 +415,9 @@ streamd-tool install-snapshot \
 ```
 
 安装崩溃后可显式执行 `streamd-tool resume-install -data /var/lib/streamd`；正常 `streamd`
-启动也会在存储恢复前自动续做安装事务。
+启动也会在存储恢复前自动续做安装事务。安装完成后重启节点并确认原 `task_id` 消失、两侧 Term 一致、
+Standby `ready=true` 且增量 WAL 追赶完成。若任务事实或 Term 已变化，停止并按新任务重新核对；不要沿用
+旧参数。系统不会自动 truncate divergent suffix，也不能为缩短 RTO 手工删除 WAL。
 
 发现两个已提交前缀冲突立即 P0，禁止自动选择。
 

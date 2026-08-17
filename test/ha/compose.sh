@@ -143,9 +143,16 @@ case "$command" in
     compose --profile maintenance run --rm --no-deps maintenance-primary \
       collect-wal -data /var/lib/streamd -snapshot /var/lib/streamd/snapshots/checkpoint
     compose --profile maintenance run --rm --no-deps reset-standby
+    compose up -d --force-recreate streamd-primary streamd-standby
+    compose --profile test up -d --no-deps primary-admin-proxy
+    recovery_output=$(compose --profile test run --rm --no-deps -e HA_SCENARIO=needs-snapshot test-runner 2>&1)
+    printf '%s\n' "$recovery_output"
+    recovery_term=$(printf '%s\n' "$recovery_output" | sed -n 's/.*RECOVERY_TERM=\([0-9][0-9]*\).*/\1/p' | tail -n 1)
+    test -n "$recovery_term"
+    compose stop -t 10 primary-admin-proxy streamd-primary streamd-standby
     compose --profile maintenance run --rm --no-deps maintenance-standby \
       install-snapshot -data /var/lib/streamd -path /snapshots/checkpoint \
-      -term "$snapshot_term" -leader-id 33333333-3333-3333-3333-333333333333
+      -term "$recovery_term" -leader-id 33333333-3333-3333-3333-333333333333
     compose up -d --force-recreate --wait --wait-timeout 120 streamd-primary streamd-standby
     compose --profile test run --rm --no-deps -e HA_SCENARIO=after-snapshot test-runner
     compose --profile test run --rm --no-deps -e HA_SCENARIO=standby-partition test-runner

@@ -53,8 +53,12 @@ preserved the committed prefix.
 
 Finally, the suite creates and verifies an offline installable Snapshot, runs
 the guarded WAL collector, resets only the disposable Standby data volume,
-installs the Snapshot, and proves the restored Standby can rejoin and sustain a
-new Strict append. WAL files are never removed directly by the harness.
+and first starts the empty Standby without installing the Snapshot. It verifies
+that the Primary exposes a deterministic `snapshot_required` recovery task,
+keeps readiness false, and does not open its public gRPC service. The harness
+then stops both nodes, installs the named Snapshot using the task's current
+Term, and proves the restored Standby can rejoin and sustain a new Strict
+append. WAL files are never removed directly by the harness.
 
 On failure the harness still removes containers, networks, and volumes, but
 first preserves service logs below `.tmp/ha-artifacts/`. CI uploads that

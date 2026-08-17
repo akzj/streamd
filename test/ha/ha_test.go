@@ -9,6 +9,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -32,6 +33,10 @@ const (
 )
 
 func TestComposeStrictHA(t *testing.T) {
+	if os.Getenv("HA_SCENARIO") == "needs-snapshot" {
+		testNeedsSnapshotDiagnostics(t)
+		return
+	}
 	client, closeClient := streamClient(t)
 	defer closeClient()
 	switch os.Getenv("HA_SCENARIO") {
@@ -126,6 +131,43 @@ func TestComposeStrictHA(t *testing.T) {
 		}
 	})
 
+}
+
+func testNeedsSnapshotDiagnostics(t *testing.T) {
+	connection, err := net.DialTimeout("tcp", primaryAddress, time.Second)
+	if err == nil {
+		_ = connection.Close()
+		t.Fatal("recovery-blocked Primary public gRPC listener is open")
+	}
+	deadline := time.Now().Add(30 * time.Second)
+	var snapshot diagnostics.Snapshot
+	err = nil
+	for {
+		snapshot, err = fetchDiagnostics("http://streamd-primary:19090/diagnostics")
+		if err == nil && snapshot.Recovery != nil && snapshot.Reasons[0].Code == diagnostics.ReasonSnapshotRequired {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("recovery diagnostics did not become available: snapshot=%+v error=%v", snapshot, err)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if snapshot.Ready || snapshot.WriteReady || snapshot.Status != diagnostics.StatusDegraded || snapshot.Role != "primary" || snapshot.Recovery.Action != diagnostics.RecoveryInstallSnapshot || snapshot.Recovery.Reason != diagnostics.RecoverySnapshotOffered || snapshot.Recovery.SourceNodeID != "33333333333333333333333333333333" || snapshot.Recovery.TargetNodeID != "44444444444444444444444444444444" || snapshot.Recovery.SnapshotID == "" || snapshot.Recovery.SnapshotCheckpoint == nil || len(snapshot.Recovery.TaskID) != 64 {
+		t.Fatalf("recovery diagnostics = %+v", snapshot)
+	}
+	readyResponse, err := (&http.Client{Timeout: 3 * time.Second}).Get("http://streamd-primary:19090/readyz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = readyResponse.Body.Close()
+	if readyResponse.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("recovery readiness status = %s", readyResponse.Status)
+	}
+	t.Logf("RECOVERY_TERM=%d RECOVERY_TASK_ID=%s", snapshot.Recovery.Term, snapshot.Recovery.TaskID)
+	repeated, err := fetchDiagnostics("http://streamd-primary:19090/diagnostics")
+	if err != nil || repeated.Recovery == nil || repeated.Recovery.TaskID != snapshot.Recovery.TaskID {
+		t.Fatalf("repeated recovery diagnostics = %+v, error = %v", repeated, err)
+	}
 }
 
 func testBeforeSnapshot(t *testing.T, client streamdv1.StreamServiceClient) {

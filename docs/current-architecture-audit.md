@@ -331,7 +331,7 @@ durable 之后，Committer 进入 fatal，结果标记 uncertain。
 
 未接入的路径：
 
-- `PlanSnapshot` 只返回错误“Standby requires Snapshot ...”；
+- `PlanSnapshot` 会进入只读 Admin 诊断状态并生成结构化 Recovery Task，但不会自动执行该任务；
 - 没有 SnapshotOffer、文件传输、安装确认和自动继续 WAL catch-up；
 - `ResolveRejoin` 没有生产调用者；
 - 没有自动隔离/截断旧主的 divergent uncommitted suffix；
@@ -396,7 +396,7 @@ Catch-up 使用独立的 WAL file Pin。
 | 增量 WAL Catch-up | 已实现 | 启动前同步并 Pin WAL |
 | Promotion | 已实现 | 更高 Term 下验证并提交 durable suffix |
 | Snapshot 格式/校验/原子安装 | 已实现但未接入 HA 网络闭环 | Single 可离线创建；HA 只允许安全在线 Primary Engine 创建，尚无管理触发入口 |
-| 自动 Snapshot Catch-up | 未实现 | `PlanSnapshot` 后 Primary 启动失败 |
+| 自动 Snapshot Catch-up | 未实现 | `PlanSnapshot` 后 Primary 只提供 recovery-blocked Admin 诊断，等待运维安装 |
 | 旧主 Rejoin | 仅决策函数 | 无运行时调用者，无自动 suffix 处理 |
 | 自动 WAL GC | 未实现 | 只有离线工具 |
 | 在线 Snapshot 调度 | 未实现 | `CreateOnline` 只有测试/库调用 |
@@ -445,8 +445,13 @@ CLI 在成功和失败路径都关闭 Manager；在线 Store 与 Retention Manag
 追赶。Compose Strict HA 套件执行该完整路径。运行时尚未实现设计文档中的在线
 SnapshotOffer/SnapshotInstalled/Rejoin 消息。
 
-当前门禁：可以声称显式停机 Runbook 的空盘 Standby 恢复经过自动化验证；不能声称自动 Snapshot
-Catch-up、无停机恢复或通用 divergent suffix truncate 已实现。
+运行时现在把 `NO_RECOVERY_SOURCE`、`LOG_DIVERGED`、`NEEDS_SNAPSHOT` 和 `PlanSnapshot` 转换为
+确定性 Recovery Task。Primary 保持 Lease renewal，但关闭公共 gRPC，只在 Admin 端口暴露
+`snapshot_required`、恢复动作、Term、source/target、Snapshot/WAL/durable 边界和稳定 `task_id`。
+Compose 套件先观察并核对任务，再用任务 Term 安装 Snapshot，最后验证增量追赶。
+
+当前门禁：可以声称显式运维闭环拥有结构化、可审计的恢复任务并经过空盘 Standby 自动化验证；不能
+声称自动 Snapshot 传输/安装、无停机恢复或通用 divergent suffix truncate 已实现。
 
 ### P1：继续扩展功能前解决或冻结明确约束
 
@@ -510,8 +515,8 @@ suffix。普通 `snapshot` 永远不推断 HA commit。
 第一版已经选择强约束运维流程，同时保留未来自动协议方向：
 
 - 自动：Replication RPC 提供 Snapshot 协商、分块传输/对象地址、Pin Lease、安装确认和后续 catch-up；
-- 运维驱动：当前由失败关闭、`snapshot-primary`、verify、install/resume 和重启 catch-up 组成，并由
-  Compose HA 执行；后续应把 `NEEDS_SNAPSHOT` 诊断和恢复任务身份进一步结构化。
+- 运维驱动：当前由结构化 Recovery Task、`snapshot-primary`、verify、install/resume 和重启 catch-up
+  组成，并由 Compose HA 执行。任务身份由持久恢复事实确定性生成；节点不自动 truncate 或安装。
 
 ### D3 Rejoin 是否允许截断未提交后缀
 
@@ -547,8 +552,8 @@ Review 通过后的建议顺序：
 
 1. 将已完成 committed boundary 校验的 `CreateOnline` 接入受控 Primary 管理入口，并继续完善数据目录角色/模式校验；
 2. WAL GC 代码级独占所有权已完成；后续只在端到端运维测试中验证命令退出和锁恢复；
-3. 冻结 Snapshot Catch-up/Rejoin 的自动化边界；
-4. 完成真实空盘 Standby、WAL 已回收、旧主 divergent suffix 的端到端恢复测试；
+3. Snapshot Catch-up 已冻结为结构化运维任务；后续若增加自动传输，必须保持同一任务和安全边界；
+4. 空盘 Standby/WAL 已回收恢复测试已完成；仍需补旧主 divergent suffix 的独立端到端演练；
 5. Role/Install 恢复前置边界已统一；其余 gRPC/admin/maintenance 进程生命周期骨架仍待抽取；
 6. 再实施 Segment Descriptor/Directory 的有界启动加载；
 7. 执行规模、长稳、磁盘压力、etcd quorum 和恢复演练；

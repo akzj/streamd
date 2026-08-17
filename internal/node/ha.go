@@ -2,6 +2,7 @@ package node
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
@@ -39,6 +40,14 @@ type currentCoordinator interface {
 	leadership.Coordinator
 	Current(context.Context, format.UUID) (leadership.LeaseGrant, error)
 }
+
+type standbyRecoveryRequired struct {
+	task  diagnostics.RecoveryTask
+	cause error
+}
+
+func (e *standbyRecoveryRequired) Error() string { return e.cause.Error() }
+func (e *standbyRecoveryRequired) Unwrap() error { return e.cause }
 
 func runReplicated(ctx context.Context, config Config, logger *slog.Logger) error {
 	serverCredentials, err := config.serverCredentials()
@@ -125,6 +134,21 @@ func runPrimary(ctx context.Context, config Config, nodeIdentity format.NodeIden
 	}
 	peerNodeID, _ := parseUUID(config.Replication.PeerNodeID)
 	if err = awaitStandbyCatchUp(ctx, renewInterval, controller, config.DataDirectory, nodeIdentity, peerNodeID, grant.Term, rpcPeer, primaryProtocol, states, limits); err != nil {
+		var recovery *standbyRecoveryRequired
+		if errors.As(err, &recovery) {
+			logger.Warn("Primary blocked for Snapshot recovery", "task_id", recovery.task.TaskID, "action", recovery.task.Action, "reason", recovery.task.Reason, "target_node_id", recovery.task.TargetNodeID)
+			serveErr := serveRecoveryBlocked(ctx, config, controller, states, recovery.task, logger)
+			stopRenewal()
+			<-renewalDone
+			renewalStopped = true
+			releaseCtx, cancelRelease := context.WithTimeout(context.Background(), 5*time.Second)
+			releaseErr := controller.Release(releaseCtx)
+			cancelRelease()
+			if releaseErr == nil {
+				releaseNeeded = false
+			}
+			return errors.Join(serveErr, releaseErr)
+		}
 		return fmt.Errorf("Standby catch-up: %w", err)
 	}
 	if err = controller.CanWrite(); err != nil {
@@ -358,10 +382,16 @@ func catchUpStandby(ctx context.Context, root string, node format.NodeIdentity, 
 	}
 	plan, err := replication.Plan(view, hello)
 	if err != nil {
+		if replication.IsCode(err, replication.ErrNoRecoverySource) {
+			return newStandbyRecoveryRequired(diagnostics.RecoveryNoRecoverySource, view, hello, replication.ReplicationPlan{}, err)
+		}
+		if replication.IsCode(err, replication.ErrLogDiverged) {
+			return newStandbyRecoveryRequired(diagnostics.RecoveryLogDiverged, view, hello, replication.ReplicationPlan{}, err)
+		}
 		return err
 	}
 	if plan.Mode == replication.PlanSnapshot {
-		return fmt.Errorf("Standby requires Snapshot %x before it can join", plan.SnapshotID)
+		return newStandbyRecoveryRequired(diagnostics.RecoverySnapshotOffered, view, hello, plan, fmt.Errorf("Standby requires Snapshot %x before it can join", plan.SnapshotID))
 	}
 	if !view.LocalDurable.Valid || plan.StartEntryID > view.LocalDurable.EntryID {
 		if view.Committed.Valid {
@@ -381,8 +411,50 @@ func catchUpStandby(ctx context.Context, root string, node format.NodeIdentity, 
 	if maxBytes == 0 {
 		maxBytes = 16 << 20
 	}
-	return primary.CatchUp(ctx, history, plan.StartEntryID, view.LocalDurable.EntryID, view.Committed, maxEntries, maxBytes)
+	err = primary.CatchUp(ctx, history, plan.StartEntryID, view.LocalDurable.EntryID, view.Committed, maxEntries, maxBytes)
+	if replication.IsCode(err, replication.ErrNeedsSnapshot) {
+		return newStandbyRecoveryRequired(diagnostics.RecoveryWALNotRetained, view, hello, plan, err)
+	}
+	return err
 }
+
+func newStandbyRecoveryRequired(reason diagnostics.RecoveryReason, view replication.PrimaryView, hello replication.ReplicaHello, plan replication.ReplicationPlan, cause error) error {
+	task := diagnostics.RecoveryTask{
+		Action: diagnostics.RecoveryCreateAndInstallSnapshot, Reason: reason, Term: view.Term,
+		GroupID: fmt.Sprintf("%x", view.GroupID), SourceNodeID: fmt.Sprintf("%x", view.LeaderID), TargetNodeID: fmt.Sprintf("%x", hello.NodeID), EarliestWALEntryID: view.EarliestWAL,
+	}
+	if hello.LocalDurable.Valid {
+		task.TargetDurableEntryID = uint64Address(hello.LocalDurable.EntryID)
+		task.TargetDurableCRC32C = uint32Address(hello.LocalDurable.CRC32C)
+	}
+	checkpoint := plan.Checkpoint
+	snapshotID := plan.SnapshotID
+	if snapshotID == (format.UUID{}) && view.Snapshot != nil {
+		snapshotID, checkpoint = view.Snapshot.SnapshotID, view.Snapshot.Checkpoint
+	}
+	if snapshotID != (format.UUID{}) && checkpoint.Valid {
+		task.Action = diagnostics.RecoveryInstallSnapshot
+		task.SnapshotID = fmt.Sprintf("%x", snapshotID)
+		task.SnapshotCheckpoint = uint64Address(checkpoint.EntryID)
+	}
+	snapshotCheckpoint, targetDurable, targetCRC := "-", "-", "-"
+	if task.SnapshotCheckpoint != nil {
+		snapshotCheckpoint = fmt.Sprint(*task.SnapshotCheckpoint)
+	}
+	if task.TargetDurableEntryID != nil {
+		targetDurable = fmt.Sprint(*task.TargetDurableEntryID)
+	}
+	if task.TargetDurableCRC32C != nil {
+		targetCRC = fmt.Sprint(*task.TargetDurableCRC32C)
+	}
+	identity := fmt.Sprintf("v1|%s|%s|%s|%s|%d|%s|%s|%s|%d|%s|%s", task.Action, task.Reason, task.GroupID, task.SourceNodeID, task.Term, task.TargetNodeID, task.SnapshotID, snapshotCheckpoint, task.EarliestWALEntryID, targetDurable, targetCRC)
+	digest := sha256.Sum256([]byte(identity))
+	task.TaskID = fmt.Sprintf("%x", digest)
+	return &standbyRecoveryRequired{task: task, cause: cause}
+}
+
+func uint64Address(value uint64) *uint64 { return &value }
+func uint32Address(value uint32) *uint32 { return &value }
 
 func primaryView(root string, node format.NodeIdentity, term uint64, states *replicationstate.Store) (replication.PrimaryView, error) {
 	state, ok := states.Current()
@@ -552,6 +624,40 @@ func serveHA(config Config, grpcServer *grpc.Server, provider diagnostics.Provid
 	go func() { serveErrors <- grpcServer.Serve(grpcListener) }()
 	go func() { serveErrors <- admin.Serve(adminListener) }()
 	return grpcListener, adminListener, admin, serveErrors, nil
+}
+
+func serveRecoveryBlocked(ctx context.Context, config Config, controller *leadership.Controller, states *replicationstate.Store, task diagnostics.RecoveryTask, logger *slog.Logger) error {
+	provider := diagnostics.ProviderFunc(func() diagnostics.Snapshot {
+		current, ok := states.Current()
+		if !ok {
+			return diagnostics.Snapshot{SchemaVersion: "v1", Status: diagnostics.StatusFailed, Role: "recovering", Durability: "replicated_strict", Term: task.Term, Reasons: []diagnostics.Reason{{Code: diagnostics.ReasonStateInconsistent, Message: "runtime state is internally inconsistent"}}}
+		}
+		state := controller.Snapshot()
+		lease := diagnostics.LeaseState{Term: state.Term, ExpiresAt: state.ExpiresAt, Unsafe: state.Role != leadership.RolePrimary || !state.Fenced || state.LastReason != ""}
+		return diagnostics.RecoveryBlockedSnapshot(current.Header, task, lease)
+	})
+	registry := prometheus.NewRegistry()
+	registry.MustRegister(prometheus.NewGoCollector(), prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}))
+	metrics, err := observe.NewNodeMetrics(config.DataDirectory, provider)
+	if err != nil {
+		return err
+	}
+	registry.MustRegister(metrics)
+	listener, err := net.Listen("tcp", config.AdminAddress)
+	if err != nil {
+		return err
+	}
+	defer listener.Close()
+	admin := adminServer(provider, registry)
+	serveErrors := make(chan error, 1)
+	go func() { serveErrors <- admin.Serve(listener) }()
+	logger.Warn("streamd recovery diagnostics started", "admin_address", listener.Addr().String(), "task_id", task.TaskID)
+	serveErr := waitServe(ctx, serveErrors)
+	timeout, _ := config.shutdownDuration()
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	shutdownErr := admin.Shutdown(shutdownCtx)
+	return errors.Join(serveErr, shutdownErr)
 }
 
 func waitServe(ctx context.Context, serveErrors <-chan error) error {

@@ -78,6 +78,27 @@ func TestStandbySnapshotIsReadyRead(t *testing.T) {
 	}
 }
 
+func TestRecoveryBlockedSnapshotIsStructuredAndNotReady(t *testing.T) {
+	position := format.ReplicationPosition{Present: true, EntryID: 12, CRC32C: 101}
+	header := format.ReplicationStateHeader{Term: 8, Role: format.ReplicationRolePrimary, Durability: format.ReplicationDurabilityStrict, LastAppended: position, LocalDurable: position, Replicated: position, Committed: position, Applied: position}
+	task := RecoveryTask{
+		TaskID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Action: RecoveryCreateAndInstallSnapshot, Reason: RecoveryNoRecoverySource,
+		Term: 8, GroupID: "33333333333333333333333333333333", SourceNodeID: "11111111111111111111111111111111", TargetNodeID: "22222222222222222222222222222222", EarliestWALEntryID: 13,
+	}
+	expires := time.Unix(100, 0)
+	snapshot := RecoveryBlockedSnapshot(header, task, LeaseState{Term: 8, ExpiresAt: expires})
+	if snapshot.Status != StatusDegraded || snapshot.Ready || snapshot.WriteReady || snapshot.Role != "primary" || snapshot.Recovery == nil || snapshot.Recovery.TaskID != task.TaskID || len(snapshot.Reasons) != 1 || snapshot.Reasons[0].Code != ReasonSnapshotRequired {
+		t.Fatalf("recovery snapshot = %+v", snapshot)
+	}
+	if err := Validate(snapshot); err != nil {
+		t.Fatal(err)
+	}
+	snapshot = RecoveryBlockedSnapshot(header, task, LeaseState{Term: 8, Unsafe: true})
+	if snapshot.Status != StatusFailed || snapshot.Role != "recovering" || snapshot.LeaseExpiresAt != nil || len(snapshot.Reasons) != 2 || snapshot.Reasons[1].Code != ReasonLeaseUnsafe {
+		t.Fatalf("unsafe recovery snapshot = %+v", snapshot)
+	}
+}
+
 type noopStandbyLog struct{}
 
 func (noopStandbyLog) Append(...[]byte) error { return nil }

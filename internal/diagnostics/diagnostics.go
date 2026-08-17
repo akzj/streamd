@@ -1,6 +1,7 @@
 package diagnostics
 
 import (
+	"encoding/hex"
 	"fmt"
 	"time"
 
@@ -24,8 +25,37 @@ const (
 	ReasonWriteGuardUnavailable       ReasonCode = "write_guard_unavailable"
 	ReasonLeaseUnsafe                 ReasonCode = "lease_unsafe"
 	ReasonReplicationStateUnavailable ReasonCode = "replication_state_unavailable"
+	ReasonSnapshotRequired            ReasonCode = "snapshot_required"
 	ReasonStateInconsistent           ReasonCode = "state_inconsistent"
 )
+
+type RecoveryAction string
+type RecoveryReason string
+
+const (
+	RecoveryInstallSnapshot          RecoveryAction = "install_snapshot"
+	RecoveryCreateAndInstallSnapshot RecoveryAction = "create_and_install_snapshot"
+
+	RecoveryWALNotRetained   RecoveryReason = "wal_not_retained"
+	RecoveryLogDiverged      RecoveryReason = "log_diverged"
+	RecoverySnapshotOffered  RecoveryReason = "snapshot_offered"
+	RecoveryNoRecoverySource RecoveryReason = "no_recovery_source"
+)
+
+type RecoveryTask struct {
+	TaskID               string         `json:"task_id"`
+	Action               RecoveryAction `json:"action"`
+	Reason               RecoveryReason `json:"reason"`
+	Term                 uint64         `json:"term"`
+	GroupID              string         `json:"group_id"`
+	SourceNodeID         string         `json:"source_node_id"`
+	TargetNodeID         string         `json:"target_node_id"`
+	SnapshotID           string         `json:"snapshot_id,omitempty"`
+	SnapshotCheckpoint   *uint64        `json:"snapshot_checkpoint,omitempty"`
+	EarliestWALEntryID   uint64         `json:"earliest_wal_entry_id"`
+	TargetDurableEntryID *uint64        `json:"target_durable_entry_id,omitempty"`
+	TargetDurableCRC32C  *uint32        `json:"target_durable_crc32c,omitempty"`
+}
 
 type Reason struct {
 	Code    ReasonCode `json:"code"`
@@ -41,18 +71,19 @@ type Watermarks struct {
 }
 
 type Snapshot struct {
-	SchemaVersion         string     `json:"schema_version"`
-	Status                Status     `json:"status"`
-	Ready                 bool       `json:"ready"`
-	WriteReady            bool       `json:"write_ready"`
-	Role                  string     `json:"role"`
-	Durability            string     `json:"durability"`
-	Term                  uint64     `json:"term"`
-	LeaseExpiresAt        *time.Time `json:"lease_expires_at,omitempty"`
-	Watermarks            Watermarks `json:"watermarks"`
-	ReplicationLagEntries uint64     `json:"replication_lag_entries"`
-	ApplyLagEntries       uint64     `json:"apply_lag_entries"`
-	Reasons               []Reason   `json:"reasons"`
+	SchemaVersion         string        `json:"schema_version"`
+	Status                Status        `json:"status"`
+	Ready                 bool          `json:"ready"`
+	WriteReady            bool          `json:"write_ready"`
+	Role                  string        `json:"role"`
+	Durability            string        `json:"durability"`
+	Term                  uint64        `json:"term"`
+	LeaseExpiresAt        *time.Time    `json:"lease_expires_at,omitempty"`
+	Watermarks            Watermarks    `json:"watermarks"`
+	ReplicationLagEntries uint64        `json:"replication_lag_entries"`
+	ApplyLagEntries       uint64        `json:"apply_lag_entries"`
+	Reasons               []Reason      `json:"reasons"`
+	Recovery              *RecoveryTask `json:"recovery,omitempty"`
 }
 
 type Provider interface {
@@ -104,6 +135,34 @@ func EngineSnapshot(health engine.Health, draining bool, lease LeaseProvider) Sn
 	}
 	if !roleOK || !durabilityOK || Validate(snapshot) != nil {
 		fail(&snapshot, ReasonStateInconsistent)
+	}
+	return snapshot
+}
+
+func RecoveryBlockedSnapshot(header format.ReplicationStateHeader, task RecoveryTask, lease LeaseState) Snapshot {
+	role := "recovering"
+	var leaseExpiresAt *time.Time
+	status := StatusFailed
+	reasons := []Reason{reason(ReasonSnapshotRequired)}
+	if lease.Term == header.Term && !lease.Unsafe {
+		role = "primary"
+		status = StatusDegraded
+		leaseExpiresAt = timePtr(lease.ExpiresAt)
+	} else {
+		reasons = append(reasons, reason(ReasonLeaseUnsafe))
+	}
+	snapshot := Snapshot{
+		SchemaVersion: "v1", Status: status, Ready: false, WriteReady: false,
+		Role: role, Durability: "replicated_strict", Term: header.Term, LeaseExpiresAt: leaseExpiresAt,
+		Watermarks: formatWatermarks(header), Reasons: reasons, Recovery: &task,
+	}
+	if role == "recovering" {
+		snapshot.Watermarks.Replicated = nil
+	}
+	setLags(&snapshot)
+	if Validate(snapshot) != nil {
+		fail(&snapshot, ReasonStateInconsistent)
+		snapshot.Recovery = nil
 	}
 	return snapshot
 }
@@ -172,6 +231,34 @@ func Validate(snapshot Snapshot) error {
 	if snapshot.Role != "primary" && snapshot.LeaseExpiresAt != nil {
 		return fmt.Errorf("non-Primary state has a Lease")
 	}
+	if snapshot.Recovery != nil {
+		if snapshot.Ready || snapshot.WriteReady || snapshot.Recovery.Term == 0 || snapshot.Recovery.Term != snapshot.Term {
+			return fmt.Errorf("recovery task has inconsistent readiness or Term")
+		}
+		if snapshot.Recovery.Action != RecoveryInstallSnapshot && snapshot.Recovery.Action != RecoveryCreateAndInstallSnapshot {
+			return fmt.Errorf("unknown recovery action")
+		}
+		switch snapshot.Recovery.Reason {
+		case RecoveryWALNotRetained, RecoveryLogDiverged, RecoverySnapshotOffered, RecoveryNoRecoverySource:
+		default:
+			return fmt.Errorf("unknown recovery reason")
+		}
+		if !validHexID(snapshot.Recovery.TaskID, 32) || !validHexID(snapshot.Recovery.GroupID, 16) || !validHexID(snapshot.Recovery.SourceNodeID, 16) || !validHexID(snapshot.Recovery.TargetNodeID, 16) || snapshot.Recovery.SourceNodeID == snapshot.Recovery.TargetNodeID {
+			return fmt.Errorf("recovery task identity is invalid")
+		}
+		if snapshot.Recovery.SnapshotID != "" && !validHexID(snapshot.Recovery.SnapshotID, 16) {
+			return fmt.Errorf("recovery Snapshot identity is invalid")
+		}
+		if snapshot.Recovery.Action == RecoveryInstallSnapshot && (snapshot.Recovery.SnapshotID == "" || snapshot.Recovery.SnapshotCheckpoint == nil) {
+			return fmt.Errorf("Snapshot install task has no Snapshot")
+		}
+		if snapshot.Recovery.Action == RecoveryCreateAndInstallSnapshot && (snapshot.Recovery.SnapshotID != "" || snapshot.Recovery.SnapshotCheckpoint != nil) {
+			return fmt.Errorf("Snapshot creation task already names a Snapshot")
+		}
+		if (snapshot.Recovery.TargetDurableEntryID == nil) != (snapshot.Recovery.TargetDurableCRC32C == nil) {
+			return fmt.Errorf("target durable position is incomplete")
+		}
+	}
 	ordered := []*uint64{snapshot.Watermarks.Appended, snapshot.Watermarks.LocalDurable, snapshot.Watermarks.Committed, snapshot.Watermarks.Applied}
 	for index := 1; index < len(ordered); index++ {
 		if ordered[index] != nil && (ordered[index-1] == nil || *ordered[index] > *ordered[index-1]) {
@@ -210,6 +297,13 @@ func engineWatermarks(health engine.Health) Watermarks {
 		result.Applied = uint64Ptr(watermarks.Applied)
 	}
 	return result
+}
+
+func formatWatermarks(header format.ReplicationStateHeader) Watermarks {
+	return Watermarks{
+		Appended: formatPosition(header.LastAppended), LocalDurable: formatPosition(header.LocalDurable),
+		Replicated: formatPosition(header.Replicated), Committed: formatPosition(header.Committed), Applied: formatPosition(header.Applied),
+	}
 }
 
 func setLags(snapshot *Snapshot) {
@@ -253,6 +347,24 @@ func position(value replication.Position) *uint64 {
 	}
 	return uint64Ptr(value.EntryID)
 }
+func formatPosition(value format.ReplicationPosition) *uint64 {
+	if !value.Present {
+		return nil
+	}
+	return uint64Ptr(value.EntryID)
+}
+func validHexID(value string, bytes int) bool {
+	decoded, err := hex.DecodeString(value)
+	if err != nil || len(decoded) != bytes {
+		return false
+	}
+	for _, value := range decoded {
+		if value != 0 {
+			return true
+		}
+	}
+	return false
+}
 func uint64Ptr(value uint64) *uint64 { return &value }
 func timePtr(value time.Time) *time.Time {
 	if value.IsZero() {
@@ -273,6 +385,7 @@ func reason(code ReasonCode) Reason {
 		ReasonWriteGuardUnavailable:       "write guard is unavailable",
 		ReasonLeaseUnsafe:                 "primary lease is not safe for writes",
 		ReasonReplicationStateUnavailable: "replication state is unavailable",
+		ReasonSnapshotRequired:            "standby requires Snapshot recovery",
 		ReasonStateInconsistent:           "runtime state is internally inconsistent",
 	}
 	return Reason{Code: code, Message: messages[code]}
