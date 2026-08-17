@@ -12,6 +12,7 @@
 8. [主备复制协议](replication-protocol.md)：Strict 双副本、Snapshot Catch-up 和 Failover。
 9. [基准与可靠性验证计划](benchmark-plan.md)：性能、正确性和规模验证。
 10. [生产运维设计](operations.md)：部署、监控、备份恢复、切换与升级。
+11. [可观测性契约](observability.md)：低基数指标、写安全、复制水位与磁盘压力。
 
 ## 契约依赖
 
