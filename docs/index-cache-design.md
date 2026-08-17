@@ -6,6 +6,21 @@
 | 目标负载 | 大量 Stream、Append/Tail 为主、少量历史随机读 |
 | 原则 | 索引有界加载，Cache 可丢；不加载全部 Extent，不永久打开全部 Segment |
 
+## 实现状态
+
+当前运行时已经实现：
+
+- Segment Descriptor 与打开的 Reader 分离；恢复逐个验证 Segment 后关闭文件；
+- 默认容量 64 的 Segment Handle Cache，Cache Handle 使用引用计数，空闲 Handle 按 LRU 淘汰；
+- 读视图绑定 Manifest Generation，Checkpoint/Merge 使用新视图替换旧视图，旧 Handle Cache 在无活跃 Reader 后关闭；
+- 有界自动 Merge；先发布新 Generation，再切换 Reader，最后退休旧 Segment；
+- 在线 Snapshot Pin 精确的 Manifest Generation，复制完成前输入 Segment 不退休。
+
+当前仍是过渡实现：启动时读取全部 Segment Directory，Stream Cache Miss 仍扫描内存中的全部
+Descriptor。Tail Catalog、Cold Extent Locator、Locator Page Cache、Registry Block Cache 和
+TinyLFU 尚未接入运行时。因此当前实现解决了 FD 与小 Segment 无界增长，但尚未达到百万 Stream
+启动和 Extent 内存有界的最终验收目标。
+
 ## 1. 查询问题
 
 streamd 需要高效回答：

@@ -149,6 +149,14 @@ score = segment_count_pressure
 
 V1 优先合并相邻 Entry/时间范围的小 Segment。被频繁读取、刚发布或正在 Snapshot 传输的 Segment 降低优先级。
 
+当前运行时在每次 Checkpoint 后最多尝试一次自动 Merge。默认在 32 个 Live Segment 时触发，
+一次最多选择 8 个 Entry ID 相邻的 Segment，输入文件总量不超过 64 MiB。若不存在至少两个满足
+预算的相邻 Segment，本轮跳过，不突破内存预算强制合并。参数由 `compaction` 配置段覆盖。
+
+Merge 发布与退休分离：Replacement Segment 和新 Manifest 先持久化，Engine 再切换到新
+Generation；旧读视图退出、Handle 关闭后，输入 Segment 才移动到 `trash/`。在线 Snapshot 的
+Manifest Pin 会继续延迟退休。
+
 ### 6.3 正确性
 
 - 输入 Segment 全部不可变且校验通过；

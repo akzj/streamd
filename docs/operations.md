@@ -132,6 +132,18 @@ streamd -config /etc/streamd/streamd.json
 
 配置结构见 [`configs/streamd.example.json`](../configs/streamd.example.json)。gRPC 监听强制 TLS 1.3 和已验证客户端证书；管理监听必须绑定 loopback，仅提供 `/livez`、`/readyz`、`/diagnostics` 和 `/metrics`。`/readyz` 与 `/diagnostics` 的字段和状态码遵循[诊断契约](diagnostics.md)。配置文件中的 URI SAN 到 Principal 映射使用精确匹配，授权规则按 Namespace、Stream Prefix 和 Operation 判断。若配置 `otlp_trace_endpoint`，进程通过 TLS OTLP/gRPC 导出 Trace。
 
+本地 Segment Compaction 使用以下重启生效配置：
+
+| 字段 | 默认值 | 约束 |
+| --- | ---: | --- |
+| `compaction.min_segments` | 32 | 至少为 2；达到该数量后尝试合并 |
+| `compaction.max_input_segments` | 8 | 2 到 `min_segments`；限制单次输入数量 |
+| `compaction.max_input_bytes` | 67108864 | 至少 1 MiB；限制单次 Merge 内存与 IO 放大 |
+
+每个 Checkpoint 周期最多执行一次 Merge。超过阈值但找不到满足字节预算的相邻 Segment 时会跳过，
+不能通过增大内存占用强制满足 Segment 数目标。打开的 Segment Reader 由独立 Handle Cache 限制，
+当前默认最多保留 64 个空闲/复用 Handle。
+
 Strict 节点使用同一个二进制。Primary 的关键配置如下，Standby 将 `role` 改为 `standby`，且不配置
 `peer_*`：
 
