@@ -8,6 +8,7 @@ import (
 
 	"github.com/akzj/streamd/internal/storage/errdefs"
 	"github.com/akzj/streamd/internal/storage/format"
+	locatorstore "github.com/akzj/streamd/internal/storage/locator"
 	"github.com/akzj/streamd/internal/storage/memtable"
 	"github.com/akzj/streamd/internal/storage/segment"
 )
@@ -45,17 +46,18 @@ type Store struct {
 	generation uint64
 	segments   []segment.Descriptor
 	handles    *segment.HandleCache
+	locator    *locatorstore.Store
 	capacity   int
 	mu         sync.Mutex
 	cache      map[uint64]*list.Element
 	lru        *list.List
 }
 
-func New(table *memtable.Table, root string, generation uint64, segments []segment.Descriptor, streamCacheCapacity, handleCapacity int) *Store {
+func New(table *memtable.Table, root string, generation uint64, segments []segment.Descriptor, locator *locatorstore.Store, streamCacheCapacity, handleCapacity int) *Store {
 	if streamCacheCapacity <= 0 {
 		streamCacheCapacity = 1024
 	}
-	return &Store{table: table, generation: generation, segments: append([]segment.Descriptor(nil), segments...), handles: segment.NewHandleCache(root, handleCapacity), capacity: streamCacheCapacity, cache: make(map[uint64]*list.Element), lru: list.New()}
+	return &Store{table: table, generation: generation, segments: append([]segment.Descriptor(nil), segments...), handles: segment.NewHandleCache(root, handleCapacity), locator: locator, capacity: streamCacheCapacity, cache: make(map[uint64]*list.Element), lru: list.New()}
 }
 func (s *Store) extents(streamID uint64) []extent {
 	s.mu.Lock()
@@ -134,6 +136,19 @@ func (s *Store) Read(streamID, from uint64, maxRecords int, maxBytes uint64) (Re
 	return result, nil
 }
 func (s *Store) readSegment(streamID, sequence uint64) (format.RecordFrame, error) {
+	if s.locator != nil {
+		extent, found, err := s.locator.LookupSequence(streamID, sequence)
+		if err == nil && found {
+			reader, release, acquireErr := s.handles.Acquire(extent.Reference)
+			if acquireErr != nil {
+				return format.RecordFrame{}, acquireErr
+			}
+			defer release()
+			return reader.Read(streamID, sequence)
+		}
+		// Locator files are reconstructible projections. A missing or corrupt
+		// page must not make immutable Segment data unreadable.
+	}
 	extents := s.extents(streamID)
 	i := sort.Search(len(extents), func(i int) bool {
 		return extents[i].directory.FirstSequence+extents[i].directory.RecordCount > sequence
@@ -158,6 +173,13 @@ func (s *Store) Inspect(streamID uint64) (StreamInfo, error) {
 		return StreamInfo{}, nil
 	}
 	info := StreamInfo{Exists: true, NextSequence: tail.NextSequence, RecordCount: tail.RecordCount, LastRecordedAt: tail.LastRecordedAt}
+	if s.locator != nil && tail.NextSequence > 0 {
+		extent, found, lookupErr := s.locator.LookupSequence(streamID, 0)
+		if lookupErr == nil && found {
+			info.FirstRecordedAt = extent.Entry.FirstRecordedAt
+			return info, nil
+		}
+	}
 	extents := s.extents(streamID)
 	if len(extents) > 0 {
 		info.FirstRecordedAt = extents[0].directory.FirstRecordedAt
@@ -238,6 +260,9 @@ func (s *Store) ClearCache() {
 	s.cache = make(map[uint64]*list.Element)
 	s.lru.Init()
 	s.mu.Unlock()
+	if s.locator != nil {
+		s.locator.ClearCache()
+	}
 }
 
 func (s *Store) Generation() uint64 { return s.generation }

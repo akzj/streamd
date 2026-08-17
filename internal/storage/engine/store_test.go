@@ -281,7 +281,7 @@ func TestCheckpointPublishesSegmentRotatesWALAndRestarts(t *testing.T) {
 	if !created || manifest.Header.RecordCount != 3 || len(manifest.SegmentReferences) != 1 {
 		t.Fatalf("checkpoint Manifest = %+v, created = %v", manifest, created)
 	}
-	if len(manifest.ArtifactReferences) != 1 || manifest.ArtifactReferences[0].ArtifactType != format.ArtifactTailCatalog || store.state.TailCatalog == nil || store.state.TailCatalog.Header().ManifestGeneration != manifest.Header.Generation {
+	if len(manifest.ArtifactReferences) != 2 || manifest.ArtifactReferences[0].ArtifactType != format.ArtifactTailCatalog || manifest.ArtifactReferences[1].ArtifactType != format.ArtifactLocatorSnapshot || store.state.TailCatalog == nil || store.state.Locator == nil || store.state.TailCatalog.Header().ManifestGeneration != manifest.Header.Generation {
 		t.Fatalf("checkpoint Tail Catalog was not installed: %+v", manifest.ArtifactReferences)
 	}
 	if _, created, err = store.Checkpoint(); err != nil || created {
@@ -396,6 +396,7 @@ func TestPinnedManifestDefersCompactionRetirement(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	pinnedPacks := store.state.Locator.PackArtifacts()
 	if _, err = store.Compact(CompactionOptions{MinSegments: 2, MaxInputSegments: 4, MaxInputBytes: 64 << 20}); err != nil {
 		t.Fatal(err)
 	}
@@ -409,6 +410,11 @@ func TestPinnedManifestDefersCompactionRetirement(t *testing.T) {
 			t.Fatalf("pinned Artifact retired: %v", err)
 		}
 	}
+	for _, reference := range pinnedPacks {
+		if _, err = os.Stat(filepath.Join(dir, reference.Path)); err != nil {
+			t.Fatalf("pinned Locator Pack retired: %v", err)
+		}
+	}
 	release()
 	for _, reference := range pinned.SegmentReferences {
 		if _, err = os.Stat(filepath.Join(dir, reference.LocalPath)); !os.IsNotExist(err) {
@@ -418,6 +424,11 @@ func TestPinnedManifestDefersCompactionRetirement(t *testing.T) {
 	for _, reference := range pinned.ArtifactReferences {
 		if _, err = os.Stat(filepath.Join(dir, reference.Path)); !os.IsNotExist(err) {
 			t.Fatalf("released Artifact remains live: %v", err)
+		}
+	}
+	for _, reference := range pinnedPacks {
+		if _, err = os.Stat(filepath.Join(dir, reference.Path)); !os.IsNotExist(err) {
+			t.Fatalf("released Locator Pack remains live: %v", err)
 		}
 	}
 }
@@ -460,5 +471,90 @@ func TestRecoveryRebuildsWhenTailCatalogIsCorrupt(t *testing.T) {
 	result, err := store.Read("agent", "events", 0, 10, 0)
 	if err != nil || len(result.Records) != 1 {
 		t.Fatalf("rebuilt Read = %+v, %v", result, err)
+	}
+}
+
+func TestRecoveryReadsSegmentsWhenLocatorPackIsCorrupt(t *testing.T) {
+	dir := t.TempDir()
+	store, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.Append(context.Background(), AppendRequest{Namespace: "agent", Stream: "events", RequestID: []byte("one"), Producer: "test", Records: []InputRecord{{Payload: []byte("one")}}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, created, checkpointErr := store.Checkpoint(); checkpointErr != nil || !created {
+		t.Fatalf("Checkpoint created=%v error=%v", created, checkpointErr)
+	}
+	pack := store.state.Locator.PackArtifacts()[0]
+	if err = store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.OpenFile(filepath.Join(dir, filepath.FromSlash(pack.Path)), os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = file.WriteAt([]byte{0xff}, int64(format.SegmentSectionAlignment+32)); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if err = file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = Open(dir)
+	if err != nil {
+		t.Fatalf("recovery rejected reconstructible Locator corruption: %v", err)
+	}
+	defer store.Close()
+	result, err := store.Read("agent", "events", 0, 10, 0)
+	if err != nil || len(result.Records) != 1 || string(result.Records[0].Payload) != "one" {
+		t.Fatalf("fallback Read = %+v, %v", result, err)
+	}
+}
+
+func TestRecoveryRebuildsWhenLocatorSnapshotIsCorrupt(t *testing.T) {
+	dir := t.TempDir()
+	store, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.Append(context.Background(), AppendRequest{Namespace: "agent", Stream: "events", RequestID: []byte("one"), Producer: "test", Records: []InputRecord{{Payload: []byte("one")}}}); err != nil {
+		t.Fatal(err)
+	}
+	manifest, created, err := store.Checkpoint()
+	if err != nil || !created {
+		t.Fatalf("Checkpoint created=%v error=%v", created, err)
+	}
+	if err = store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var reference format.ArtifactReference
+	for _, artifact := range manifest.ArtifactReferences {
+		if artifact.ArtifactType == format.ArtifactLocatorSnapshot {
+			reference = artifact
+		}
+	}
+	file, err := os.OpenFile(filepath.Join(dir, filepath.FromSlash(reference.Path)), os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = file.WriteAt([]byte{0xff}, 32); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if err = file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = Open(dir)
+	if err != nil {
+		t.Fatalf("recovery rejected reconstructible Locator Snapshot corruption: %v", err)
+	}
+	defer store.Close()
+	if store.state.Locator != nil {
+		t.Fatal("corrupt Locator Snapshot was installed")
+	}
+	result, err := store.Read("agent", "events", 0, 10, 0)
+	if err != nil || len(result.Records) != 1 {
+		t.Fatalf("fallback Read = %+v, %v", result, err)
 	}
 }

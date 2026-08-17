@@ -1,0 +1,247 @@
+package locator
+
+import (
+	"container/list"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"sync"
+
+	"github.com/akzj/streamd/internal/storage/format"
+)
+
+func VerifyPack(root string, pack format.LocatorPackReference) error {
+	data, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(pack.Path)))
+	if err != nil {
+		return err
+	}
+	if uint64(len(data)) != pack.FileSize || len(data) < format.SegmentSectionAlignment+format.ArtifactFooterLength {
+		return fmt.Errorf("Locator Pack size does not match Snapshot")
+	}
+	header, err := format.UnmarshalLocatorPackHeader(data[:format.LocatorPackHeaderLength])
+	if err != nil || header.ArtifactID != pack.PackID || header.PageCount != pack.PageCount {
+		return fmt.Errorf("Locator Pack Header does not match Snapshot")
+	}
+	footer, err := format.VerifyArtifact(data[:len(data)-format.ArtifactFooterLength], data[len(data)-format.ArtifactFooterLength:], format.ArtifactLocatorPack, pack.PackID)
+	if err != nil {
+		return err
+	}
+	if footer.ContentSHA256 != pack.ContentSHA256 {
+		return fmt.Errorf("Locator Pack digest does not match Snapshot")
+	}
+	return nil
+}
+
+type pageKey struct {
+	packID  format.UUID
+	ordinal uint32
+}
+
+type cachedPage struct {
+	key  pageKey
+	page format.ExtentPage
+}
+
+type Extent struct {
+	Reference format.SegmentReference
+	Entry     format.ExtentEntry
+}
+
+type Store struct {
+	root      string
+	reference format.ArtifactReference
+	snapshot  format.LocatorSnapshot
+	packs     map[format.UUID]format.LocatorPackReference
+	segments  map[format.UUID]format.SegmentReference
+	capacity  int
+	mu        sync.Mutex
+	cache     map[pageKey]*list.Element
+	lru       *list.List
+}
+
+func Open(root string, manifest format.Manifest, pageCapacity int) (*Store, error) {
+	var reference format.ArtifactReference
+	var tailID format.UUID
+	for _, artifact := range manifest.ArtifactReferences {
+		switch artifact.ArtifactType {
+		case format.ArtifactLocatorSnapshot:
+			if reference.ArtifactID != (format.UUID{}) {
+				return nil, fmt.Errorf("Manifest contains multiple Locator Snapshots")
+			}
+			reference = artifact
+		case format.ArtifactTailCatalog:
+			tailID = artifact.ArtifactID
+		}
+	}
+	if reference.ArtifactID == (format.UUID{}) {
+		return nil, os.ErrNotExist
+	}
+	data, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(reference.Path)))
+	if err != nil {
+		return nil, err
+	}
+	if uint64(len(data)) != reference.FileSize {
+		return nil, fmt.Errorf("Locator Snapshot size does not match Manifest")
+	}
+	snapshot, err := format.UnmarshalLocatorSnapshot(data)
+	if err != nil {
+		return nil, err
+	}
+	if snapshot.Header.ArtifactID != reference.ArtifactID || snapshot.Header.ManifestGeneration != manifest.Header.Generation || snapshot.Header.CoveredEntryID != manifest.Header.LastEntryID || snapshot.Header.TailCatalogArtifactID != tailID || snapshot.Footer.ContentSHA256 != reference.ContentSHA256 {
+		return nil, fmt.Errorf("Locator Snapshot does not match Manifest")
+	}
+	if pageCapacity <= 0 {
+		pageCapacity = 256
+	}
+	store := &Store{root: root, reference: reference, snapshot: snapshot, packs: make(map[format.UUID]format.LocatorPackReference, len(snapshot.Packs)), segments: make(map[format.UUID]format.SegmentReference, len(manifest.SegmentReferences)), capacity: pageCapacity, cache: make(map[pageKey]*list.Element), lru: list.New()}
+	for _, pack := range snapshot.Packs {
+		store.packs[pack.PackID] = pack
+	}
+	for _, rootEntry := range snapshot.Roots {
+		pack := store.packs[rootEntry.PackID]
+		if uint64(rootEntry.PageOrdinal) >= pack.PageCount {
+			return nil, fmt.Errorf("Locator Root for Stream %d is outside Pack", rootEntry.StreamID)
+		}
+	}
+	for _, segment := range manifest.SegmentReferences {
+		store.segments[segment.SegmentID] = segment
+	}
+	return store, nil
+}
+
+func (s *Store) LookupSequence(streamID, sequence uint64) (Extent, bool, error) {
+	i := sort.Search(len(s.snapshot.Roots), func(i int) bool { return s.snapshot.Roots[i].StreamID >= streamID })
+	if i == len(s.snapshot.Roots) || s.snapshot.Roots[i].StreamID != streamID {
+		return Extent{}, false, nil
+	}
+	pointer := pageKey{packID: s.snapshot.Roots[i].PackID, ordinal: s.snapshot.Roots[i].PageOrdinal}
+	for {
+		page, err := s.page(pointer, streamID)
+		if err != nil {
+			return Extent{}, false, err
+		}
+		if sequence >= page.Header.FirstSequence {
+			if sequence >= page.Header.NextSequence {
+				return Extent{}, false, nil
+			}
+			index := sort.Search(len(page.Extents), func(i int) bool { return page.Extents[i].NextSequence > sequence })
+			if index == len(page.Extents) || sequence < page.Extents[index].FirstSequence {
+				return Extent{}, false, fmt.Errorf("Locator Page does not cover Sequence %d", sequence)
+			}
+			entry := page.Extents[index]
+			reference, ok := s.segments[entry.SegmentID]
+			if !ok {
+				return Extent{}, false, fmt.Errorf("Locator references unknown Segment %x", entry.SegmentID)
+			}
+			return Extent{Reference: reference, Entry: entry}, true, nil
+		}
+		if page.Header.Flags&format.ExtentPageHasPrevious == 0 {
+			return Extent{}, false, nil
+		}
+		pointer = pageKey{packID: page.Header.PreviousPackID, ordinal: page.Header.PreviousPageOrdinal}
+	}
+}
+
+func (s *Store) page(key pageKey, streamID uint64) (format.ExtentPage, error) {
+	s.mu.Lock()
+	if element := s.cache[key]; element != nil {
+		s.lru.MoveToFront(element)
+		page := element.Value.(cachedPage).page
+		s.mu.Unlock()
+		if page.Header.StreamID != streamID {
+			return format.ExtentPage{}, fmt.Errorf("Locator Page belongs to Stream %d, not %d", page.Header.StreamID, streamID)
+		}
+		return page, nil
+	}
+	s.mu.Unlock()
+	page, err := s.readPage(key, streamID)
+	if err != nil {
+		return format.ExtentPage{}, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if element := s.cache[key]; element != nil {
+		s.lru.MoveToFront(element)
+		return element.Value.(cachedPage).page, nil
+	}
+	element := s.lru.PushFront(cachedPage{key: key, page: page})
+	s.cache[key] = element
+	if s.lru.Len() > s.capacity {
+		old := s.lru.Back()
+		delete(s.cache, old.Value.(cachedPage).key)
+		s.lru.Remove(old)
+	}
+	return page, nil
+}
+
+func (s *Store) readPage(key pageKey, streamID uint64) (format.ExtentPage, error) {
+	pack, ok := s.packs[key.packID]
+	if !ok || uint64(key.ordinal) >= pack.PageCount {
+		return format.ExtentPage{}, fmt.Errorf("Locator Page pointer is outside known Packs")
+	}
+	file, err := os.Open(filepath.Join(s.root, filepath.FromSlash(pack.Path)))
+	if err != nil {
+		return format.ExtentPage{}, err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil || uint64(info.Size()) != pack.FileSize {
+		return format.ExtentPage{}, fmt.Errorf("Locator Pack size does not match Snapshot")
+	}
+	headerBytes := make([]byte, format.LocatorPackHeaderLength)
+	if _, err = file.ReadAt(headerBytes, 0); err != nil {
+		return format.ExtentPage{}, err
+	}
+	header, err := format.UnmarshalLocatorPackHeader(headerBytes)
+	if err != nil || header.ArtifactID != pack.PackID || header.PageCount != pack.PageCount || header.CoveredEntryID != s.snapshot.Header.CoveredEntryID {
+		return format.ExtentPage{}, fmt.Errorf("Locator Pack Header does not match Snapshot")
+	}
+	footerBytes := make([]byte, format.ArtifactFooterLength)
+	if _, err = file.ReadAt(footerBytes, info.Size()-format.ArtifactFooterLength); err != nil {
+		return format.ExtentPage{}, err
+	}
+	footer, err := format.UnmarshalArtifactFooter(footerBytes)
+	if err != nil || footer.ArtifactType != format.ArtifactLocatorPack || footer.ArtifactID != pack.PackID || footer.FileLength != pack.FileSize || footer.ContentSHA256 != pack.ContentSHA256 {
+		return format.ExtentPage{}, fmt.Errorf("Locator Pack Footer does not match Snapshot")
+	}
+	position, err := format.LocatorPagePosition(key.ordinal)
+	if err != nil {
+		return format.ExtentPage{}, err
+	}
+	encoded := make([]byte, format.LocatorPageLength)
+	if _, err = file.ReadAt(encoded, int64(position)); err != nil {
+		return format.ExtentPage{}, err
+	}
+	page, err := format.UnmarshalExtentPage(encoded)
+	if err != nil {
+		return format.ExtentPage{}, err
+	}
+	if page.Header.StreamID != streamID {
+		return format.ExtentPage{}, fmt.Errorf("Locator Page belongs to Stream %d, not %d", page.Header.StreamID, streamID)
+	}
+	return page, nil
+}
+
+func (s *Store) PackArtifacts() []format.ArtifactReference {
+	out := make([]format.ArtifactReference, 0, len(s.snapshot.Packs))
+	for _, pack := range s.snapshot.Packs {
+		out = append(out, format.ArtifactReference{ArtifactType: format.ArtifactLocatorPack, FormatVersion: format.VersionV1, ArtifactID: pack.PackID, FileSize: pack.FileSize, CoveredEntryID: s.snapshot.Header.CoveredEntryID, Path: pack.Path, ContentSHA256: pack.ContentSHA256})
+	}
+	return out
+}
+
+func (s *Store) Reference() format.ArtifactReference { return s.reference }
+
+func (s *Store) CacheLen() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lru.Len()
+}
+
+func (s *Store) ClearCache() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cache = make(map[pageKey]*list.Element)
+	s.lru.Init()
+}

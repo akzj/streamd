@@ -52,7 +52,7 @@ func TestReadInspectResolveAcrossSegment(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	store := New(active, filepath.Dir(path), 1, []segment.Descriptor{descriptor}, 1, 1)
+	store := New(active, filepath.Dir(path), 1, []segment.Descriptor{descriptor}, nil, 1, 1)
 	defer store.Close()
 	result, err := store.Read(1, 1, 10, 0)
 	if err != nil || len(result.Records) != 2 || result.NextSequence != 3 {

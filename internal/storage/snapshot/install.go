@@ -328,6 +328,15 @@ func verifyInstalledArtifact(path string, artifact format.SnapshotArtifact) erro
 		if scrubErr != nil || metadata.Header.SegmentID != artifact.ArtifactID || metadata.Footer.ContentSHA256 != artifact.ContentSHA256 {
 			return fmt.Errorf("existing Segment conflicts with Snapshot")
 		}
+	case format.ArtifactTailCatalog, format.ArtifactLocatorSnapshot, format.ArtifactRegistrySnapshot, format.ArtifactLocatorPack:
+		encoded, readErr := os.ReadFile(path)
+		if readErr != nil || len(encoded) < format.ArtifactFooterLength {
+			return fmt.Errorf("existing projection conflicts with Snapshot")
+		}
+		footer, verifyErr := format.VerifyArtifact(encoded[:len(encoded)-format.ArtifactFooterLength], encoded[len(encoded)-format.ArtifactFooterLength:], artifact.ArtifactType, artifact.ArtifactID)
+		if verifyErr != nil || footer.ContentSHA256 != artifact.ContentSHA256 {
+			return fmt.Errorf("existing projection conflicts with Snapshot")
+		}
 	default:
 		return fmt.Errorf("unsupported install Artifact %d", artifact.ArtifactType)
 	}
@@ -339,7 +348,20 @@ func validInstallArtifact(artifact format.SnapshotArtifact) bool {
 	if clean != artifact.LocalName || strings.Contains(clean, "..") {
 		return false
 	}
-	return (artifact.ArtifactType == format.ArtifactManifest && strings.HasPrefix(clean, "manifests/")) || (artifact.ArtifactType == format.ArtifactSegment && strings.HasPrefix(clean, "segments/"))
+	prefix := ""
+	switch artifact.ArtifactType {
+	case format.ArtifactManifest:
+		prefix = "manifests/"
+	case format.ArtifactSegment:
+		prefix = "segments/"
+	case format.ArtifactTailCatalog:
+		prefix = "catalog/"
+	case format.ArtifactLocatorSnapshot, format.ArtifactLocatorPack:
+		prefix = "locator/"
+	case format.ArtifactRegistrySnapshot:
+		prefix = "registry/"
+	}
+	return prefix != "" && strings.HasPrefix(clean, prefix) && len(clean) > len(prefix)
 }
 
 func readSnapshotManifest(path string) (format.SnapshotManifest, error) {

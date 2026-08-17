@@ -14,6 +14,7 @@ import (
 	"github.com/akzj/streamd/internal/storage/format"
 	"github.com/akzj/streamd/internal/storage/fsutil"
 	"github.com/akzj/streamd/internal/storage/identity"
+	locatorstore "github.com/akzj/streamd/internal/storage/locator"
 	"github.com/akzj/streamd/internal/storage/replicationstate"
 	"github.com/akzj/streamd/internal/storage/segment"
 )
@@ -117,7 +118,7 @@ func createOnline(store *engine.Store, destination string, term uint64) (result 
 			_ = os.RemoveAll(staging)
 		}
 	}()
-	for _, directory := range []string{"manifests", "segments"} {
+	for _, directory := range []string{"manifests", "segments", "catalog", "locator"} {
 		if err = os.Mkdir(filepath.Join(staging, directory), 0750); err != nil {
 			return result, err
 		}
@@ -134,6 +135,48 @@ func createOnline(store *engine.Store, destination string, term uint64) (result 
 		return result, err
 	}
 	artifacts := []format.SnapshotArtifact{{ArtifactType: format.ArtifactManifest, FormatVersion: format.VersionV1, Flags: format.SegmentRefHasLocal, ArtifactID: manifest.Header.FileID, FileSize: uint64(len(manifestBytes)), LocalName: manifestName, ContentSHA256: manifest.Footer.ContentSHA256}}
+	for _, reference := range manifest.ArtifactReferences {
+		source := filepath.Join(dataAbs, filepath.FromSlash(reference.Path))
+		data, readErr := os.ReadFile(source)
+		if readErr != nil {
+			return result, readErr
+		}
+		if uint64(len(data)) != reference.FileSize || len(data) < format.ArtifactFooterLength {
+			return result, fmt.Errorf("Artifact %x size mismatch", reference.ArtifactID)
+		}
+		footer, verifyErr := format.VerifyArtifact(data[:len(data)-format.ArtifactFooterLength], data[len(data)-format.ArtifactFooterLength:], reference.ArtifactType, reference.ArtifactID)
+		if verifyErr != nil {
+			return result, fmt.Errorf("Artifact %x verification failed: %w", reference.ArtifactID, verifyErr)
+		}
+		if footer.ContentSHA256 != reference.ContentSHA256 {
+			return result, fmt.Errorf("Artifact %x digest mismatch", reference.ArtifactID)
+		}
+		if err = os.MkdirAll(filepath.Dir(filepath.Join(staging, filepath.FromSlash(reference.Path))), 0750); err != nil {
+			return result, err
+		}
+		if err = copyFile(filepath.Join(staging, filepath.FromSlash(reference.Path)), source); err != nil {
+			return result, err
+		}
+		artifacts = append(artifacts, format.SnapshotArtifact{ArtifactType: reference.ArtifactType, FormatVersion: format.VersionV1, Flags: format.SegmentRefHasLocal, ArtifactID: reference.ArtifactID, FileSize: reference.FileSize, LocalName: reference.Path, ContentSHA256: reference.ContentSHA256})
+		if reference.ArtifactType == format.ArtifactLocatorSnapshot {
+			locatorSnapshot, decodeErr := format.UnmarshalLocatorSnapshot(data)
+			if decodeErr != nil {
+				return result, decodeErr
+			}
+			for _, pack := range locatorSnapshot.Packs {
+				if err = locatorstore.VerifyPack(dataAbs, pack); err != nil {
+					return result, err
+				}
+				if err = os.MkdirAll(filepath.Dir(filepath.Join(staging, filepath.FromSlash(pack.Path))), 0750); err != nil {
+					return result, err
+				}
+				if err = copyFile(filepath.Join(staging, filepath.FromSlash(pack.Path)), filepath.Join(dataAbs, filepath.FromSlash(pack.Path))); err != nil {
+					return result, err
+				}
+				artifacts = append(artifacts, format.SnapshotArtifact{ArtifactType: format.ArtifactLocatorPack, FormatVersion: format.VersionV1, Flags: format.SegmentRefHasLocal, ArtifactID: pack.PackID, FileSize: pack.FileSize, LocalName: pack.Path, ContentSHA256: pack.ContentSHA256})
+			}
+		}
+	}
 	for _, reference := range manifest.SegmentReferences {
 		if reference.Flags&format.SegmentRefHasLocal == 0 {
 			return result, fmt.Errorf("Segment %x has no local copy", reference.SegmentID)
@@ -167,6 +210,12 @@ func createOnline(store *engine.Store, destination string, term uint64) (result 
 	if err = fsutil.SyncDir(filepath.Join(staging, "segments")); err != nil {
 		return result, err
 	}
+	if err = fsutil.SyncDir(filepath.Join(staging, "catalog")); err != nil {
+		return result, err
+	}
+	if err = fsutil.SyncDir(filepath.Join(staging, "locator")); err != nil {
+		return result, err
+	}
 	if err = os.Rename(staging, destination); err != nil {
 		return result, err
 	}
@@ -191,6 +240,8 @@ func Verify(path string) (Result, error) {
 		return Result{}, err
 	}
 	segments := make(map[format.UUID]format.SnapshotArtifact)
+	artifacts := make(map[format.UUID]format.SnapshotArtifact)
+	locatorSnapshots := make([]format.LocatorSnapshot, 0, 1)
 	var manifest format.Manifest
 	foundManifest := false
 	for _, artifact := range snapshot.Artifacts {
@@ -216,9 +267,29 @@ func Verify(path string) (Result, error) {
 				return Result{}, fmt.Errorf("Snapshot Segment %x is invalid", artifact.ArtifactID)
 			}
 			segments[artifact.ArtifactID] = artifact
+		case format.ArtifactTailCatalog, format.ArtifactLocatorSnapshot, format.ArtifactRegistrySnapshot, format.ArtifactLocatorPack:
+			encoded, readErr := os.ReadFile(artifactPath)
+			if readErr != nil || len(encoded) < format.ArtifactFooterLength {
+				return Result{}, fmt.Errorf("Snapshot projection %x is invalid", artifact.ArtifactID)
+			}
+			footer, verifyErr := format.VerifyArtifact(encoded[:len(encoded)-format.ArtifactFooterLength], encoded[len(encoded)-format.ArtifactFooterLength:], artifact.ArtifactType, artifact.ArtifactID)
+			if verifyErr != nil || footer.ContentSHA256 != artifact.ContentSHA256 {
+				return Result{}, fmt.Errorf("Snapshot projection %x is invalid", artifact.ArtifactID)
+			}
+			if artifact.ArtifactType == format.ArtifactLocatorSnapshot {
+				locatorSnapshot, decodeErr := format.UnmarshalLocatorSnapshot(encoded)
+				if decodeErr != nil {
+					return Result{}, fmt.Errorf("Snapshot Locator Snapshot is invalid: %w", decodeErr)
+				}
+				locatorSnapshots = append(locatorSnapshots, locatorSnapshot)
+			}
 		default:
 			return Result{}, fmt.Errorf("unsupported Snapshot Artifact type %d", artifact.ArtifactType)
 		}
+		if _, duplicate := artifacts[artifact.ArtifactID]; duplicate {
+			return Result{}, fmt.Errorf("Snapshot contains duplicate Artifact %x", artifact.ArtifactID)
+		}
+		artifacts[artifact.ArtifactID] = artifact
 	}
 	if !foundManifest || manifest.Header.Generation != snapshot.Header.ManifestGeneration || manifest.Footer.ContentSHA256 != snapshot.Header.ManifestSHA256 || manifest.Header.LastEntryID != snapshot.Header.CheckpointEntryID || manifest.Header.LastEntryCRC32C != snapshot.Header.CheckpointEntryCRC32C || len(segments) != len(manifest.SegmentReferences) {
 		return Result{}, fmt.Errorf("Snapshot does not match its Manifest checkpoint")
@@ -235,6 +306,20 @@ func Verify(path string) (Result, error) {
 		artifact, ok := segments[reference.SegmentID]
 		if !ok || artifact.FileSize != reference.FileSize || artifact.ContentSHA256 != reference.ContentSHA256 {
 			return Result{}, fmt.Errorf("Snapshot is missing Segment %x", reference.SegmentID)
+		}
+	}
+	for _, reference := range manifest.ArtifactReferences {
+		artifact, ok := artifacts[reference.ArtifactID]
+		if !ok || artifact.ArtifactType != reference.ArtifactType || artifact.FileSize != reference.FileSize || artifact.LocalName != reference.Path || artifact.ContentSHA256 != reference.ContentSHA256 {
+			return Result{}, fmt.Errorf("Snapshot is missing Artifact %x", reference.ArtifactID)
+		}
+	}
+	for _, locatorSnapshot := range locatorSnapshots {
+		for _, pack := range locatorSnapshot.Packs {
+			artifact, ok := artifacts[pack.PackID]
+			if !ok || artifact.ArtifactType != format.ArtifactLocatorPack || artifact.FileSize != pack.FileSize || artifact.LocalName != pack.Path || artifact.ContentSHA256 != pack.ContentSHA256 {
+				return Result{}, fmt.Errorf("Snapshot is missing Locator Pack %x", pack.PackID)
+			}
 		}
 	}
 	return Result{Path: path, SnapshotID: snapshot.Header.SnapshotID, GroupID: snapshot.Header.GroupID, Term: snapshot.Header.Term, ManifestGeneration: snapshot.Header.ManifestGeneration, CheckpointEntryID: snapshot.Header.CheckpointEntryID, CheckpointCRC32C: snapshot.Header.CheckpointEntryCRC32C, Artifacts: snapshot.Header.ArtifactCount}, nil

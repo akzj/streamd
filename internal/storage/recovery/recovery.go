@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/akzj/streamd/internal/storage/format"
+	locatorstore "github.com/akzj/streamd/internal/storage/locator"
 	manifeststore "github.com/akzj/streamd/internal/storage/manifest"
 	"github.com/akzj/streamd/internal/storage/memtable"
 	"github.com/akzj/streamd/internal/storage/registry"
@@ -23,6 +24,7 @@ type Result struct {
 	Registry       *registry.Registry
 	Segments       []segment.Descriptor
 	TailCatalog    *tailstore.Catalog
+	Locator        *locatorstore.Store
 	AppliedEntryID uint64
 	HasApplied     bool
 }
@@ -77,6 +79,7 @@ func OpenWithOptions(root string, options Options) (*Result, error) {
 			// corrupt files fall back to Segment Directory and WAL recovery.
 			result.TailCatalog, _ = tailstore.OpenCheckpoint(root, reference, current.Header.Generation, checkpointID)
 		}
+		result.Locator, _ = locatorstore.Open(root, current, 256)
 	}
 	if options.ApplyThrough != nil && hasCheckpoint && *options.ApplyThrough < checkpointID {
 		result.Close()

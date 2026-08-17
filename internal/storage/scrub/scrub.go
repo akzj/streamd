@@ -9,6 +9,7 @@ import (
 	"github.com/akzj/streamd/internal/storage/format"
 	"github.com/akzj/streamd/internal/storage/fsutil"
 	"github.com/akzj/streamd/internal/storage/identity"
+	locatorstore "github.com/akzj/streamd/internal/storage/locator"
 	manifeststore "github.com/akzj/streamd/internal/storage/manifest"
 	"github.com/akzj/streamd/internal/storage/segment"
 	"github.com/akzj/streamd/internal/storage/wal"
@@ -64,10 +65,11 @@ func DataRoot(path string) (Report, error) {
 			}
 		}
 		for _, reference := range current.ArtifactReferences {
-			if err = scrubArtifact(root.Path(), reference); err != nil {
-				return report, err
+			artifacts, scrubErr := scrubArtifact(root.Path(), reference)
+			if scrubErr != nil {
+				return report, scrubErr
 			}
-			report.Artifacts++
+			report.Artifacts += artifacts
 		}
 	}
 	for streamID, extents := range byStream {
@@ -94,22 +96,41 @@ func DataRoot(path string) (Report, error) {
 	return report, nil
 }
 
-func scrubArtifact(root string, reference format.ArtifactReference) error {
+func scrubArtifact(root string, reference format.ArtifactReference) (uint64, error) {
 	data, err := os.ReadFile(filepath.Join(root, reference.Path))
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if uint64(len(data)) != reference.FileSize || len(data) < format.ArtifactFooterLength {
-		return fmt.Errorf("Artifact %x size mismatch", reference.ArtifactID)
+		return 0, fmt.Errorf("Artifact %x size mismatch", reference.ArtifactID)
 	}
 	footer, err := format.VerifyArtifact(data[:len(data)-format.ArtifactFooterLength], data[len(data)-format.ArtifactFooterLength:], reference.ArtifactType, reference.ArtifactID)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if footer.ContentSHA256 != reference.ContentSHA256 {
-		return fmt.Errorf("Artifact %x digest mismatch", reference.ArtifactID)
+		return 0, fmt.Errorf("Artifact %x digest mismatch", reference.ArtifactID)
 	}
-	return nil
+	if reference.ArtifactType != format.ArtifactLocatorSnapshot {
+		return 1, nil
+	}
+	snapshot, err := format.UnmarshalLocatorSnapshot(data)
+	if err != nil {
+		return 0, err
+	}
+	packPages := make(map[format.UUID]uint64, len(snapshot.Packs))
+	for _, pack := range snapshot.Packs {
+		if err = locatorstore.VerifyPack(root, pack); err != nil {
+			return 0, fmt.Errorf("Locator Pack %x: %w", pack.PackID, err)
+		}
+		packPages[pack.PackID] = pack.PageCount
+	}
+	for _, rootEntry := range snapshot.Roots {
+		if uint64(rootEntry.PageOrdinal) >= packPages[rootEntry.PackID] {
+			return 0, fmt.Errorf("Locator Root for Stream %d is outside Pack", rootEntry.StreamID)
+		}
+	}
+	return 1 + uint64(len(snapshot.Packs)), nil
 }
 
 type walFile struct {

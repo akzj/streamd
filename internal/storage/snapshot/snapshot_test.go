@@ -39,15 +39,44 @@ func TestCreateVerifyAndScrubSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if verified.SnapshotID != created.SnapshotID || verified.Artifacts != 2 {
+	if verified.SnapshotID != created.SnapshotID || verified.Artifacts != created.Artifacts || verified.Artifacts != 5 {
 		t.Fatalf("created = %+v, verified = %+v", created, verified)
 	}
 	report, err := scrub.DataRoot(data)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if report.Segments != 1 || report.Records != 2 {
+	if report.Segments != 1 || report.Records != 2 || report.Artifacts != 3 {
 		t.Fatalf("scrub report = %+v", report)
+	}
+	packs, err := filepath.Glob(filepath.Join(destination, "locator", "*.loc"))
+	if err != nil || len(packs) != 1 {
+		t.Fatalf("Locator Packs = %v, %v", packs, err)
+	}
+	pack, err := os.OpenFile(packs[0], os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := []byte{0}
+	if _, err = pack.ReadAt(original, int64(format.SegmentSectionAlignment+32)); err != nil {
+		pack.Close()
+		t.Fatal(err)
+	}
+	corrupt := []byte{original[0] ^ 0xff}
+	if _, err = pack.WriteAt(corrupt, int64(format.SegmentSectionAlignment+32)); err != nil {
+		pack.Close()
+		t.Fatal(err)
+	}
+	if _, err = Verify(destination); err == nil {
+		pack.Close()
+		t.Fatal("corrupt Locator Pack passed verification")
+	}
+	if _, err = pack.WriteAt(original, int64(format.SegmentSectionAlignment+32)); err != nil {
+		pack.Close()
+		t.Fatal(err)
+	}
+	if err = pack.Close(); err != nil {
+		t.Fatal(err)
 	}
 	segments, err := filepath.Glob(filepath.Join(destination, "segments", "*.seg"))
 	if err != nil || len(segments) != 1 {
