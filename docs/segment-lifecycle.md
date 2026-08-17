@@ -200,6 +200,11 @@ Locator 是投影。发布失败时可以从 Segment Directory 重建，不能�
 Catalog 和 Locator Snapshot 同代发布，切换 Reader View 后才退休旧 Snapshot/Pack；在线 Snapshot
 复制期间 Pack 受 Pin 保护。Active Pack 增量追加与跨 Pack Skip 属于后续优化。
 
+同一次发布也从 Manifest 内部 Registry Stream 重建并校验连续 StreamID，生成新的排序 Registry
+Snapshot。Compaction 构建期间可以继续 Append；视图切换前在 Engine Mutex 下把
+`created_entry_id > manifest.last_entry_id` 的 Registry Overlay 合并到新 Snapshot 基线之上，避免
+活跃 Stream 映射丢失。旧 Registry Snapshot 与 Tail/Locator 一起在新视图可见后退休。
+
 ## 8. Snapshot Pin
 
 ### 8.1 创建

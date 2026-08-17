@@ -1076,6 +1076,12 @@ RegistryEntry {
 
 Registry Entry 之后追加通用 Artifact Footer。Registry Snapshot 只包含 `created_entry_id <= covered_entry_id` 的映射，且必须包含这个 Checkpoint 以前的全部映射。
 
+实现说明：当前 Runtime 启动时只读取 Header、Footer 和 Sparse Block Index；Block Entry 按需读取并
+进入有界 LRU，不整体反序列化 Snapshot。每个 Block 最多 256 Entry。Manifest Checkpoint 内部
+Registry Stream 的 Record 数必须等于 Snapshot `entry_count`，Builder 还要求 Sequence `N` 的
+`assigned_stream_id == N + 1`；投影损坏时以 Registry Stream 为事实重建，不能从 Snapshot 单独
+恢复或重新分配 StreamID。
+
 ## 11. Snapshot Manifest V1
 
 Snapshot 不是把整个数据目录打包成不透明压缩文件，而是一个不可变 Artifact 集合及其一致性 Checkpoint。

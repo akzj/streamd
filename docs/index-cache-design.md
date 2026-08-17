@@ -23,12 +23,16 @@
 - 默认容量 256 的 Locator Page LRU Cache；Entry 只保存已校验的 Page Metadata，不保存 Payload；
 - Snapshot、Scrub、Pin 和退休引用图均显式包含 Locator Pack；Locator 损坏时回退 Segment
   Descriptor，不能影响事实数据读取。
+- Registry Snapshot 与 Manifest 同代发布；启动只加载 Sparse Block Index，名称 Entry 按 Block
+  `ReadAt`，默认使用容量 64 的 LRU Block Cache；
+- Checkpoint 内映射保留在磁盘 Snapshot，新提交映射只进入 WAL Overlay；Compaction 切换时合并
+  Checkpoint 之后的 Overlay，Registry Block 损坏时从内部 Registry Stream 惰性重建。
 
 当前仍是过渡实现：启动时仍读取全部 Segment Directory，并在内存中保留全部 Descriptor，投影损坏
-回退路径也会扫描 Descriptor。Registry Block Cache、真正有界的启动加载、TinyLFU Admission、
-Segmented LRU、Cache Shard 和 Skip Pointer 生成尚未接入运行时；当前 Builder 只生成 Previous
-Pointer。因此 Cache Miss 主路径已经有界，但尚未达到百万 Stream 启动和全部 Extent 内存有界的
-最终验收目标。
+回退路径也会扫描 Descriptor。真正有界的 Segment 启动加载、TinyLFU Admission、Segmented LRU、
+Cache Shard 和 Skip Pointer 生成尚未接入运行时；当前 Builder 只生成 Previous Pointer。因此
+名称与冷 Sequence Cache Miss 主路径已经有界，但尚未达到百万 Stream 启动和全部 Extent 内存有界
+的最终验收目标。
 
 ## 1. 查询问题
 
@@ -100,6 +104,12 @@ RegistryBlockIndex {
 ```
 
 查找先二分 Block，再在 Block 内二分。V1 不要求通用 LSM；新映射先存在 WAL/Active Registry Map，Snapshot 时合并为新排序文件。
+
+当前 Runtime 常驻 Header 和完整 Sparse Block Index，不常驻 Checkpoint 内全部 Registry Entry。Block
+按 Index Offset 读取，逐 Entry 校验长度/CRC/Key 顺序后进入容量 64 的 LRU；磁盘读取在 Cache Lock
+之外执行。`LookupID` 当前需要顺序访问 Block，热路径只使用名称查找。Snapshot 只是投影：Block
+损坏会触发一次 Registry Stream Segment 扫描并切换为内存事实映射，后续 Checkpoint 再发布新
+Snapshot。
 
 ### 4.3 Cache
 
@@ -246,8 +256,8 @@ PageCacheKey = (pack_id, page_ordinal)
 - Reader RefCount 期间不能淘汰底层 mmap/Buffer；
 - checksum 失败不进入 Cache，并隔离对应 Artifact。
 
-当前 V1 Runtime 使用单容量上限的 LRU，并在锁外执行 Pack `pread`；TinyLFU、分段与分片是后续
-优化，不属于当前已实现能力。
+当前 V1 Runtime 的 Locator Page 与 Registry Block 分别使用单容量上限 LRU，并在锁外执行文件
+读取；TinyLFU、分段与分片是后续优化，不属于当前已实现能力。
 
 ## 10. Segment Handle Cache
 
@@ -383,6 +393,7 @@ Cache Entry 必须实现 `estimated_bytes`，包括 Slice Capacity、Map Overhea
 - Cache 全清空后功能正确，只影响性能；
 - 百万 Stream 启动不遍历全部 Tail Slot 或打开全部 Segment。
 
-当前已通过任意 Sequence 定位、Page CRC、Previous Page 多页回溯、容量 1 淘汰、Cache Clear、
-Generation 切换、Snapshot Pin 和投影损坏回退测试。常驻 Extent 内存与百万 Stream 启动两项仍未
-验收，因为恢复阶段仍加载所有 Segment Descriptor/Directory。
+当前已通过任意 Sequence 定位、Page CRC、Previous Page 多页回溯、Registry 多 Block 查找、容量
+1 淘汰、Cache Clear、Generation 切换、Compaction Overlay 保留、Snapshot Pin 和投影损坏回退
+测试。常驻 Extent 内存与百万 Stream 启动两项仍未验收，因为恢复阶段仍加载所有 Segment
+Descriptor/Directory。

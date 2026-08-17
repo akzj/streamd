@@ -174,7 +174,11 @@ Primary 不单独决定尾部：
 
 ### 10.1 Stream Registry
 
-加载 Registry Snapshot，再重放更晚的 Registry Stream Record。验证名称和 StreamID 双向唯一。
+加载 Registry Snapshot Header 与 Sparse Block Index，不遍历全部 Registry Entry；使用 Registry
+Stream Tail 的 Record Count 校验 Snapshot Entry Count，并以 `entry_count + 1` 作为下一分配 ID。
+Checkpoint 之后的 Registry Stream Record 重放到内存 Overlay。名称查询先查 Overlay，再按需读取
+Snapshot Block；Block 长度、Entry CRC 或 Key 顺序损坏时，从当前 Manifest 的 Registry Stream
+Segment 惰性重建完整事实映射。Snapshot Header/Index 无效则启动时直接使用相同事实重建路径。
 
 ### 10.2 Tail Catalog
 
