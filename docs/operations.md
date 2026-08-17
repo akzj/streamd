@@ -130,7 +130,7 @@ V1 单节点进程使用 JSON 配置启动：
 streamd -config /etc/streamd/streamd.json
 ```
 
-配置结构见 [`configs/streamd.example.json`](../configs/streamd.example.json)。gRPC 监听强制 TLS 1.3 和已验证客户端证书；管理监听必须绑定 loopback，仅提供 `/livez`、`/readyz` 和 `/metrics`。配置文件中的 URI SAN 到 Principal 映射使用精确匹配，授权规则按 Namespace、Stream Prefix 和 Operation 判断。若配置 `otlp_trace_endpoint`，进程通过 TLS OTLP/gRPC 导出 Trace。
+配置结构见 [`configs/streamd.example.json`](../configs/streamd.example.json)。gRPC 监听强制 TLS 1.3 和已验证客户端证书；管理监听必须绑定 loopback，仅提供 `/livez`、`/readyz`、`/diagnostics` 和 `/metrics`。`/readyz` 与 `/diagnostics` 的字段和状态码遵循[诊断契约](diagnostics.md)。配置文件中的 URI SAN 到 Principal 映射使用精确匹配，授权规则按 Namespace、Stream Prefix 和 Operation 判断。若配置 `otlp_trace_endpoint`，进程通过 TLS OTLP/gRPC 导出 Trace。
 
 Strict 节点使用同一个二进制。Primary 的关键配置如下，Standby 将 `role` 改为 `standby`，且不配置
 `peer_*`：
