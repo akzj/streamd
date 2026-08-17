@@ -449,6 +449,8 @@ SnapshotOffer/SnapshotInstalled/Rejoin 消息。
 确定性 Recovery Task。Primary 保持 Lease renewal，但关闭公共 gRPC，只在 Admin 端口暴露
 `snapshot_required`、恢复动作、Term、source/target、Snapshot/WAL/durable 边界和稳定 `task_id`。
 Compose 套件先观察并核对任务，再用任务 Term 安装 Snapshot，最后验证增量追赶。
+套件还会在恢复阻塞期间移除 etcd quorum，验证 Lease 失效后状态转为 `failed/recovering` 且任务身份
+保持不变，再恢复 Coordinator 并执行安装。
 
 当前门禁：可以声称显式运维闭环拥有结构化、可审计的恢复任务并经过空盘 Standby 自动化验证；不能
 声称自动 Snapshot 传输/安装、无停机恢复或通用 divergent suffix truncate 已实现。

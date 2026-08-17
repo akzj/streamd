@@ -148,7 +148,16 @@ case "$command" in
     recovery_output=$(compose --profile test run --rm --no-deps -e HA_SCENARIO=needs-snapshot test-runner 2>&1)
     printf '%s\n' "$recovery_output"
     recovery_term=$(printf '%s\n' "$recovery_output" | sed -n 's/.*RECOVERY_TERM=\([0-9][0-9]*\).*/\1/p' | tail -n 1)
+    recovery_task_id=$(printf '%s\n' "$recovery_output" | sed -n 's/.*RECOVERY_TASK_ID=\([0-9a-f][0-9a-f]*\).*/\1/p' | tail -n 1)
     test -n "$recovery_term"
+    test -n "$recovery_task_id"
+    compose stop -t 1 etcd-2 etcd-3
+    compose --profile test run --rm --no-deps \
+      -e HA_SCENARIO=recovery-lease-loss \
+      -e HA_RECOVERY_TASK_ID="$recovery_task_id" \
+      test-runner
+    compose start etcd-2 etcd-3
+    compose up -d --wait --wait-timeout 60 etcd-1 etcd-2 etcd-3
     compose stop -t 10 primary-admin-proxy streamd-primary streamd-standby
     compose --profile maintenance run --rm --no-deps maintenance-standby \
       install-snapshot -data /var/lib/streamd -path /snapshots/checkpoint \

@@ -33,8 +33,12 @@ const (
 )
 
 func TestComposeStrictHA(t *testing.T) {
-	if os.Getenv("HA_SCENARIO") == "needs-snapshot" {
+	switch os.Getenv("HA_SCENARIO") {
+	case "needs-snapshot":
 		testNeedsSnapshotDiagnostics(t)
+		return
+	case "recovery-lease-loss":
+		testRecoveryLeaseLoss(t)
 		return
 	}
 	client, closeClient := streamClient(t)
@@ -131,6 +135,33 @@ func TestComposeStrictHA(t *testing.T) {
 		}
 	})
 
+}
+
+func testRecoveryLeaseLoss(t *testing.T) {
+	expectedTaskID := env("HA_RECOVERY_TASK_ID", "")
+	if expectedTaskID == "" {
+		t.Fatal("HA_RECOVERY_TASK_ID is required")
+	}
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		snapshot, err := fetchDiagnostics("http://streamd-primary:19090/diagnostics")
+		if err == nil && snapshot.Status == diagnostics.StatusFailed && snapshot.Role == "recovering" && !snapshot.Ready && !snapshot.WriteReady && snapshot.Recovery != nil && snapshot.Recovery.TaskID == expectedTaskID && hasReason(snapshot, diagnostics.ReasonLeaseUnsafe) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("recovery diagnostics did not reflect Lease loss: snapshot=%+v error=%v", snapshot, err)
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+}
+
+func hasReason(snapshot diagnostics.Snapshot, code diagnostics.ReasonCode) bool {
+	for _, reason := range snapshot.Reasons {
+		if reason.Code == code {
+			return true
+		}
+	}
+	return false
 }
 
 func testNeedsSnapshotDiagnostics(t *testing.T) {

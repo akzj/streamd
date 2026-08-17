@@ -56,9 +56,11 @@ the guarded WAL collector, resets only the disposable Standby data volume,
 and first starts the empty Standby without installing the Snapshot. It verifies
 that the Primary exposes a deterministic `snapshot_required` recovery task,
 keeps readiness false, and does not open its public gRPC service. The harness
-then stops both nodes, installs the named Snapshot using the task's current
-Term, and proves the restored Standby can rejoin and sustain a new Strict
-append. WAL files are never removed directly by the harness.
+then removes etcd quorum and verifies Lease loss changes the node to
+`failed/recovering` without losing that task identity. After restoring quorum,
+it stops both nodes, installs the named Snapshot using the task's current Term,
+and proves the restored Standby can rejoin and sustain a new Strict append. WAL
+files are never removed directly by the harness.
 
 On failure the harness still removes containers, networks, and volumes, but
 first preserves service logs below `.tmp/ha-artifacts/`. CI uploads that
