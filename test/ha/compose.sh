@@ -78,6 +78,18 @@ case "$command" in
     trap 'down >/dev/null 2>&1 || true; cleanup_files' EXIT INT TERM
     compose up -d --build --wait --wait-timeout 120 etcd-1 etcd-2 etcd-3 toxiproxy proxy-init streamd-primary streamd-standby
     compose --profile test run --rm --build test-runner
+    compose stop -t 1 etcd-3
+    compose --profile test run --rm --no-deps -e HA_SCENARIO=single-member-loss test-runner
+    compose start etcd-3
+    compose up -d --wait --wait-timeout 60 etcd-1 etcd-2 etcd-3
+    compose stop -t 1 etcd-2 etcd-3
+    compose --profile test run --rm --no-deps -e HA_SCENARIO=quorum-loss test-runner
+    compose start etcd-2 etcd-3
+    compose up -d --wait --wait-timeout 60 etcd-1 etcd-2 etcd-3
+    compose restart -t 1 streamd-primary streamd-standby
+    compose up -d --wait --wait-timeout 120 streamd-primary streamd-standby
+    compose --profile test run --rm --no-deps -e HA_SCENARIO=quorum-recovered test-runner
+    compose --profile test run --rm --no-deps -e HA_SCENARIO=standby-partition test-runner
     ;;
   *)
     echo "usage: $0 {prepare|up|test|logs|down|all}" >&2

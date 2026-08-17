@@ -30,5 +30,7 @@ acknowledged. It deliberately runs serially because the partition is a
 cluster-wide fault.
 
 Each streamd node reaches all three etcd members through independent
-Toxiproxy client links so later acceptance cases can isolate one path without
-weakening TLS identity checks.
+Toxiproxy client links. The complete run also stops one etcd member to prove
+continued writes, then removes quorum and waits for the Primary Lease safety
+window to fence writes. After quorum recovery it performs a controlled node
+restart and verifies Strict writes resume under a new safe runtime state.
