@@ -26,6 +26,7 @@ func main() {
 		{Name: "etcd-standby-2", Listen: "0.0.0.0:22380", Upstream: "etcd-2:2379", Enabled: true},
 		{Name: "etcd-standby-3", Listen: "0.0.0.0:22381", Upstream: "etcd-3:2379", Enabled: true},
 		{Name: "standby", Listen: "0.0.0.0:17443", Upstream: "streamd-standby:7443", Enabled: true},
+		{Name: "former-primary", Listen: "0.0.0.0:27443", Upstream: "streamd-primary:7443", Enabled: true},
 	}
 	client := &http.Client{Timeout: 2 * time.Second}
 	deadline := time.Now().Add(30 * time.Second)

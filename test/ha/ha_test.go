@@ -41,6 +41,15 @@ func TestComposeStrictHA(t *testing.T) {
 	case "standby-partition":
 		testStandbyPartition(t, client)
 		return
+	case "before-failover":
+		testBeforeFailover(t, client)
+		return
+	case "after-failover":
+		testAfterFailover(t, client)
+		return
+	case "after-failback":
+		testAfterFailback(t, client)
+		return
 	case "":
 	default:
 		t.Fatalf("unknown HA_SCENARIO %q", os.Getenv("HA_SCENARIO"))
@@ -70,6 +79,25 @@ func TestComposeStrictHA(t *testing.T) {
 		assertRecords(t, client, 1, "replicated")
 	})
 
+}
+
+func testBeforeFailover(t *testing.T, client streamdv1.StreamServiceClient) {
+	waitReady(t, client)
+	appendRecord(t, client, "failover-events", 0, "ha-failover-0001", "before-failover")
+}
+
+func testAfterFailover(t *testing.T, client streamdv1.StreamServiceClient) {
+	waitReady(t, client)
+	assertStreamRecords(t, client, "failover-events", "before-failover")
+	appendRecord(t, client, "failover-events", 1, "ha-failover-0002", "after-failover")
+	assertStreamRecords(t, client, "failover-events", "before-failover", "after-failover")
+}
+
+func testAfterFailback(t *testing.T, client streamdv1.StreamServiceClient) {
+	waitReady(t, client)
+	assertStreamRecords(t, client, "failover-events", "before-failover", "after-failover")
+	appendRecord(t, client, "failover-events", 2, "ha-failover-0003", "after-failback")
+	assertStreamRecords(t, client, "failover-events", "before-failover", "after-failover", "after-failback")
 }
 
 func testSingleMemberLoss(t *testing.T, client streamdv1.StreamServiceClient) {
@@ -150,7 +178,7 @@ func streamClient(t *testing.T) (streamdv1.StreamServiceClient, func()) {
 	if !roots.AppendCertsFromPEM(caPEM) {
 		t.Fatal("test CA contains no certificates")
 	}
-	connection, err := grpc.NewClient(env("HA_PRIMARY_ADDRESS", primaryAddress), grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{MinVersion: tls.VersionTLS13, Certificates: []tls.Certificate{certificate}, RootCAs: roots, ServerName: "streamd-primary"})))
+	connection, err := grpc.NewClient(env("HA_PRIMARY_ADDRESS", primaryAddress), grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{MinVersion: tls.VersionTLS13, Certificates: []tls.Certificate{certificate}, RootCAs: roots, ServerName: env("HA_PRIMARY_SERVER_NAME", "streamd-primary")})))
 	if err != nil {
 		t.Fatal(err)
 	}

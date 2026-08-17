@@ -28,7 +28,10 @@ case "$run_dir" in
 esac
 
 compose() {
-  HA_RUN_DIR="$run_dir" docker compose -p "$project" -f "$compose_file" "$@"
+  HA_RUN_DIR="$run_dir" \
+  HA_PRIMARY_CONFIG="${HA_PRIMARY_CONFIG:-$run_dir/configs/primary.json}" \
+  HA_STANDBY_CONFIG="${HA_STANDBY_CONFIG:-$run_dir/configs/standby.json}" \
+    docker compose -p "$project" -f "$compose_file" "$@"
 }
 
 prepare() {
@@ -89,6 +92,23 @@ case "$command" in
     compose restart -t 1 streamd-primary streamd-standby
     compose up -d --wait --wait-timeout 120 streamd-primary streamd-standby
     compose --profile test run --rm --no-deps -e HA_SCENARIO=quorum-recovered test-runner
+    compose --profile test run --rm --no-deps -e HA_SCENARIO=before-failover test-runner
+    compose kill -s KILL streamd-primary
+    compose stop -t 1 streamd-standby
+    sleep 16
+    HA_PRIMARY_CONFIG="$run_dir/configs/primary-as-standby.json" \
+    HA_STANDBY_CONFIG="$run_dir/configs/standby-as-primary.json" \
+      compose up -d --force-recreate --wait --wait-timeout 120 streamd-primary streamd-standby
+    compose --profile test run --rm --no-deps \
+      -e HA_SCENARIO=after-failover \
+      -e HA_PRIMARY_ADDRESS=streamd-standby:7443 \
+      -e HA_PRIMARY_SERVER_NAME=streamd-standby \
+      test-runner
+    compose kill -s KILL streamd-standby
+    compose stop -t 1 streamd-primary
+    sleep 16
+    compose up -d --force-recreate --wait --wait-timeout 120 streamd-primary streamd-standby
+    compose --profile test run --rm --no-deps -e HA_SCENARIO=after-failback test-runner
     compose --profile test run --rm --no-deps -e HA_SCENARIO=standby-partition test-runner
     ;;
   *)

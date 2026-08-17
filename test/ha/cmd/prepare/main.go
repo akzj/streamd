@@ -138,10 +138,16 @@ func prepare(out string) error {
 			return err
 		}
 	}
-	if err = writeConfig(filepath.Join(out, "configs", "primary.json"), makeConfig("primary", primaryNodeID)); err != nil {
+	if err = writeConfig(filepath.Join(out, "configs", "primary.json"), makeConfig("primary", primaryNodeID, "primary", "toxiproxy:17443", "streamd-standby", standbyNodeID)); err != nil {
 		return err
 	}
-	return writeConfig(filepath.Join(out, "configs", "standby.json"), makeConfig("standby", standbyNodeID))
+	if err = writeConfig(filepath.Join(out, "configs", "standby.json"), makeConfig("standby", standbyNodeID, "standby", "", "", "")); err != nil {
+		return err
+	}
+	if err = writeConfig(filepath.Join(out, "configs", "primary-as-standby.json"), makeConfig("standby", primaryNodeID, "primary", "", "", "")); err != nil {
+		return err
+	}
+	return writeConfig(filepath.Join(out, "configs", "standby-as-primary.json"), makeConfig("primary", standbyNodeID, "standby", "toxiproxy:27443", "streamd-primary", primaryNodeID))
 }
 
 func newAuthority() (*authority, error) {
@@ -195,12 +201,12 @@ func (a *authority) issue(directory, name string, dns, uriStrings []string, both
 	return os.WriteFile(filepath.Join(directory, name+".key"), pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER}), 0600)
 }
 
-func makeConfig(role, nodeID string) nodeConfig {
+func makeConfig(role, nodeID, certificateName, peerAddress, peerServerName, peerNodeID string) nodeConfig {
 	etcdPorts := []int{12379, 12380, 12381}
 	config := nodeConfig{
 		ListenAddress: "0.0.0.0:7443", AdminAddress: "127.0.0.1:9090", DataDirectory: "/var/lib/streamd", ClusterID: clusterID, GroupID: groupID, NodeID: nodeID,
 		ShutdownTimeout: "5s", SubscribeSendTimeout: "5s", CheckpointInterval: "1s",
-		TLS:             tlsConfig{CertificateFile: "/etc/streamd/tls/" + role + ".crt", PrivateKeyFile: "/etc/streamd/tls/" + role + ".key", ClientCAFile: "/etc/streamd/tls/ca.crt"},
+		TLS:             tlsConfig{CertificateFile: "/etc/streamd/tls/" + certificateName + ".crt", PrivateKeyFile: "/etc/streamd/tls/" + certificateName + ".key", ClientCAFile: "/etc/streamd/tls/ca.crt"},
 		PrincipalsByURI: map[string]principal{clientURI: {Tenant: "ha", Service: "test"}},
 		Authorization:   []authorizationRule{{Tenant: "ha", Service: "test", Namespace: "ha", StreamPrefix: "", Operations: []string{"append", "read", "subscribe", "inspect"}}},
 	}
@@ -213,9 +219,9 @@ func makeConfig(role, nodeID string) nodeConfig {
 	}
 	config.Replication = replicationConfig{Role: role, LeaseTTL: "15s", LeaseSafetyMargin: "3s", RenewInterval: "3s", MaxEntries: 1024, MaxBytes: 16 << 20, Etcd: etcdConfig{Endpoints: endpoints, Prefix: "/streamd/ha-test", DialTimeout: "3s", ServerName: "etcd", CertificateFile: "/etc/streamd/etcd/etcd-client.crt", PrivateKeyFile: "/etc/streamd/etcd/etcd-client.key", CAFile: "/etc/streamd/etcd/ca.crt"}}
 	if role == "primary" {
-		config.Replication.PeerAddress = "toxiproxy:17443"
-		config.Replication.PeerServerName = "streamd-standby"
-		config.Replication.PeerNodeID = standbyNodeID
+		config.Replication.PeerAddress = peerAddress
+		config.Replication.PeerServerName = peerServerName
+		config.Replication.PeerNodeID = peerNodeID
 	}
 	return config
 }

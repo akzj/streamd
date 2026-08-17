@@ -34,3 +34,9 @@ Toxiproxy client links. The complete run also stops one etcd member to prove
 continued writes, then removes quorum and waits for the Primary Lease safety
 window to fence writes. After quorum recovery it performs a controlled node
 restart and verifies Strict writes resume under a new safe runtime state.
+
+The process failover drill then kills the Primary, waits for its Lease to
+expire, promotes the former Standby with a new Term, and starts the old Primary
+as the replacement Standby. It appends on the promoted node, fails back, and
+reads that append from the former Primary to prove Rejoin persisted the new
+committed prefix.

@@ -117,7 +117,7 @@ services:
     command: ["-config", "/etc/streamd/config.json"]
     volumes:
       - primary-data:/var/lib/streamd
-      - ${HA_RUN_DIR:?HA_RUN_DIR is required}/configs/primary.json:/etc/streamd/config.json:ro
+      - ${HA_PRIMARY_CONFIG:?HA_PRIMARY_CONFIG is required}:/etc/streamd/config.json:ro
       - ${HA_RUN_DIR:?HA_RUN_DIR is required}/certs:/etc/streamd/tls:ro
       - ${HA_RUN_DIR:?HA_RUN_DIR is required}/certs:/etc/streamd/etcd:ro
     depends_on:
@@ -145,7 +145,7 @@ services:
     command: ["-config", "/etc/streamd/config.json"]
     volumes:
       - standby-data:/var/lib/streamd
-      - ${HA_RUN_DIR:?HA_RUN_DIR is required}/configs/standby.json:/etc/streamd/config.json:ro
+      - ${HA_STANDBY_CONFIG:?HA_STANDBY_CONFIG is required}:/etc/streamd/config.json:ro
       - ${HA_RUN_DIR:?HA_RUN_DIR is required}/certs:/etc/streamd/tls:ro
       - ${HA_RUN_DIR:?HA_RUN_DIR is required}/certs:/etc/streamd/etcd:ro
     depends_on:
@@ -173,6 +173,7 @@ services:
     environment:
       HA_CERT_DIR: /ha/certs
       HA_PRIMARY_ADDRESS: streamd-primary:7443
+      HA_PRIMARY_SERVER_NAME: streamd-primary
       TOXIPROXY_API: http://toxiproxy:8474
     volumes:
       - ${HA_RUN_DIR:?HA_RUN_DIR is required}/certs:/ha/certs:ro
