@@ -7,6 +7,7 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 go build -trimpath -o /out/streamd ./cmd/streamd \
+ && CGO_ENABLED=0 go build -trimpath -o /out/streamd-tool ./cmd/streamd-tool \
  && CGO_ENABLED=0 go build -trimpath -o /out/proxy-init ./test/ha/cmd/proxy-init
 
 FROM ${RUNTIME_IMAGE} AS streamd
@@ -16,6 +17,10 @@ ENTRYPOINT ["/usr/local/bin/streamd"]
 FROM ${RUNTIME_IMAGE} AS proxy-init
 COPY --from=build /out/proxy-init /usr/local/bin/proxy-init
 ENTRYPOINT ["/usr/local/bin/proxy-init"]
+
+FROM ${RUNTIME_IMAGE} AS streamd-tool
+COPY --from=build /out/streamd-tool /usr/local/bin/streamd-tool
+ENTRYPOINT ["/usr/local/bin/streamd-tool"]
 
 FROM build AS test-runner
 ENTRYPOINT ["go", "test", "-tags=integration", "./test/ha", "-count=1", "-v"]

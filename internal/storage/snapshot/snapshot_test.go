@@ -6,9 +6,11 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/akzj/streamd/internal/storage/engine"
 	"github.com/akzj/streamd/internal/storage/format"
+	"github.com/akzj/streamd/internal/storage/replicationstate"
 	"github.com/akzj/streamd/internal/storage/scrub"
 )
 
@@ -61,6 +63,55 @@ func TestCreateVerifyAndScrubSnapshot(t *testing.T) {
 	file.Close()
 	if _, err = Verify(destination); err == nil {
 		t.Fatal("corrupt Snapshot passed verification")
+	}
+}
+
+func TestOfflineCreatePreservesDurableReplicationTerm(t *testing.T) {
+	data := filepath.Join(t.TempDir(), "data")
+	node := format.NodeIdentity{ClusterID: snapshotID(1), GroupID: snapshotID(2), NodeID: snapshotID(3), CreatedAt: 1}
+	store, err := engine.OpenWithIdentity(data, node)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.Append(context.Background(), engine.AppendRequest{Namespace: "n", Stream: "s", RequestID: []byte("r"), Producer: "test", Records: []engine.InputRecord{{Payload: []byte("record")}}}); err != nil {
+		t.Fatal(err)
+	}
+	manifest, _, err := store.Checkpoint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	states, err := replicationstate.Open(data, node)
+	if err != nil {
+		t.Fatal(err)
+	}
+	position := format.ReplicationPosition{Present: true, EntryID: manifest.Header.LastEntryID, CRC32C: manifest.Header.LastEntryCRC32C}
+	_, err = states.Update(time.Now(), func(header *format.ReplicationStateHeader) error {
+		header.Term = 7
+		header.Role = format.ReplicationRolePrimary
+		header.Durability = format.ReplicationDurabilityStrict
+		header.HasLeader = true
+		header.LeaderID = node.NodeID
+		header.HasLease = true
+		header.LeaseExpiresAt = time.Now().Add(time.Minute).UnixNano()
+		header.LastAppended = position
+		header.LocalDurable = position
+		header.Replicated = position
+		header.Committed = position
+		header.Applied = position
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := Create(data, filepath.Join(t.TempDir(), "snapshot"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.Term != 7 {
+		t.Fatalf("Snapshot Term = %d, want 7", created.Term)
 	}
 }
 

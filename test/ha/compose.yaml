@@ -117,6 +117,7 @@ services:
     command: ["-config", "/etc/streamd/config.json"]
     volumes:
       - primary-data:/var/lib/streamd
+      - snapshot-data:/var/lib/streamd/snapshots
       - ${HA_PRIMARY_CONFIG:?HA_PRIMARY_CONFIG is required}:/etc/streamd/config.json:ro
       - ${HA_RUN_DIR:?HA_RUN_DIR is required}/certs:/etc/streamd/tls:ro
       - ${HA_RUN_DIR:?HA_RUN_DIR is required}/certs:/etc/streamd/etcd:ro
@@ -185,6 +186,37 @@ services:
     profiles: [test]
     networks: [ha]
 
+  maintenance-primary:
+    build:
+      context: ../..
+      dockerfile: test/ha/Dockerfile
+      target: streamd-tool
+    volumes:
+      - primary-data:/var/lib/streamd
+      - snapshot-data:/var/lib/streamd/snapshots
+    profiles: [maintenance]
+
+  maintenance-standby:
+    build:
+      context: ../..
+      dockerfile: test/ha/Dockerfile
+      target: streamd-tool
+    volumes:
+      - standby-data:/var/lib/streamd
+      - snapshot-data:/snapshots:ro
+    profiles: [maintenance]
+
+  reset-standby:
+    build:
+      context: ../..
+      dockerfile: test/ha/Dockerfile
+      target: streamd-tool
+    entrypoint: ["/bin/sh", "-ec"]
+    command: ["find /var/lib/streamd -mindepth 1 -maxdepth 1 ! -name NODE -exec rm -rf -- {} +"]
+    volumes:
+      - standby-data:/var/lib/streamd
+    profiles: [maintenance]
+
 networks:
   ha: {}
 
@@ -194,3 +226,4 @@ volumes:
   etcd-3-data: {}
   primary-data: {}
   standby-data: {}
+  snapshot-data: {}

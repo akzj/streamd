@@ -40,3 +40,8 @@ expire, promotes the former Standby with a new Term, and starts the old Primary
 as the replacement Standby. It appends on the promoted node, fails back, and
 reads that append from the former Primary to prove Rejoin persisted the new
 committed prefix.
+
+Finally, the suite creates and verifies an offline installable Snapshot, runs
+the guarded WAL collector, resets only the disposable Standby data volume,
+installs the Snapshot, and proves the restored Standby can rejoin and sustain a
+new Strict append. WAL files are never removed directly by the harness.

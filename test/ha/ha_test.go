@@ -50,6 +50,12 @@ func TestComposeStrictHA(t *testing.T) {
 	case "after-failback":
 		testAfterFailback(t, client)
 		return
+	case "before-snapshot":
+		testBeforeSnapshot(t, client)
+		return
+	case "after-snapshot":
+		testAfterSnapshot(t, client)
+		return
 	case "":
 	default:
 		t.Fatalf("unknown HA_SCENARIO %q", os.Getenv("HA_SCENARIO"))
@@ -79,6 +85,18 @@ func TestComposeStrictHA(t *testing.T) {
 		assertRecords(t, client, 1, "replicated")
 	})
 
+}
+
+func testBeforeSnapshot(t *testing.T, client streamdv1.StreamServiceClient) {
+	waitReady(t, client)
+	appendRecord(t, client, "snapshot-events", 0, "ha-snapshot-0001", "before-snapshot")
+}
+
+func testAfterSnapshot(t *testing.T, client streamdv1.StreamServiceClient) {
+	waitReady(t, client)
+	assertStreamRecords(t, client, "snapshot-events", "before-snapshot")
+	appendRecord(t, client, "snapshot-events", 1, "ha-snapshot-0002", "after-snapshot")
+	assertStreamRecords(t, client, "snapshot-events", "before-snapshot", "after-snapshot")
 }
 
 func testBeforeFailover(t *testing.T, client streamdv1.StreamServiceClient) {

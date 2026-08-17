@@ -109,6 +109,21 @@ case "$command" in
     sleep 16
     compose up -d --force-recreate --wait --wait-timeout 120 streamd-primary streamd-standby
     compose --profile test run --rm --no-deps -e HA_SCENARIO=after-failback test-runner
+    compose --profile test run --rm --no-deps -e HA_SCENARIO=before-snapshot test-runner
+    compose stop -t 10 streamd-primary streamd-standby
+    snapshot_json=$(compose --profile maintenance run --rm --no-deps --build maintenance-primary \
+      snapshot -data /var/lib/streamd -out /var/lib/streamd/snapshots/checkpoint)
+    snapshot_term=$(printf '%s\n' "$snapshot_json" | sed -n '/^{/,$p' | jq -er '.Term | select(. > 0)')
+    compose --profile maintenance run --rm --no-deps maintenance-primary \
+      verify-snapshot -path /var/lib/streamd/snapshots/checkpoint
+    compose --profile maintenance run --rm --no-deps maintenance-primary \
+      collect-wal -data /var/lib/streamd -snapshot /var/lib/streamd/snapshots/checkpoint
+    compose --profile maintenance run --rm --no-deps reset-standby
+    compose --profile maintenance run --rm --no-deps maintenance-standby \
+      install-snapshot -data /var/lib/streamd -path /snapshots/checkpoint \
+      -term "$snapshot_term" -leader-id 33333333-3333-3333-3333-333333333333
+    compose up -d --force-recreate --wait --wait-timeout 120 streamd-primary streamd-standby
+    compose --profile test run --rm --no-deps -e HA_SCENARIO=after-snapshot test-runner
     compose --profile test run --rm --no-deps -e HA_SCENARIO=standby-partition test-runner
     ;;
   *)

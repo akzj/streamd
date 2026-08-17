@@ -14,6 +14,7 @@ import (
 	"github.com/akzj/streamd/internal/storage/format"
 	"github.com/akzj/streamd/internal/storage/fsutil"
 	"github.com/akzj/streamd/internal/storage/identity"
+	"github.com/akzj/streamd/internal/storage/replicationstate"
 	"github.com/akzj/streamd/internal/storage/segment"
 )
 
@@ -33,18 +34,37 @@ func Create(dataRoot, destination string) (result Result, err error) {
 	if err != nil {
 		return result, err
 	}
+	node, err := identity.Load(dataAbs)
+	if err != nil {
+		return result, fmt.Errorf("NODE: %w", err)
+	}
+	term := uint64(0)
+	states, err := replicationstate.Open(dataAbs, node)
+	if err != nil {
+		return result, fmt.Errorf("Replication State: %w", err)
+	}
+	if current, ok := states.Current(); ok {
+		term = current.Header.Term
+	}
 	store, err := engine.Open(dataAbs)
 	if err != nil {
 		return result, err
 	}
 	defer func() { err = errors.Join(err, store.Close()) }()
-	return CreateOnline(store, destination)
+	return createOnline(store, destination, term)
 }
 
 // CreateOnline takes a short engine checkpoint and then copies only immutable
 // artifacts from that exact Manifest. Appends may continue while the files are
 // copied because no later mutable CURRENT file is used as Snapshot input.
 func CreateOnline(store *engine.Store, destination string) (result Result, err error) {
+	if store == nil {
+		return result, fmt.Errorf("Snapshot engine is required")
+	}
+	return createOnline(store, destination, store.Health().Term)
+}
+
+func createOnline(store *engine.Store, destination string, term uint64) (result Result, err error) {
 	if store == nil {
 		return result, fmt.Errorf("Snapshot engine is required")
 	}
@@ -132,7 +152,7 @@ func CreateOnline(store *engine.Store, destination string) (result Result, err e
 	if err != nil {
 		return result, err
 	}
-	snapshotBytes, err := format.MarshalSnapshotManifest(format.SnapshotManifest{Header: format.SnapshotHeader{SnapshotID: snapshotID, GroupID: node.GroupID, Term: store.Health().Term, CheckpointEntryID: manifest.Header.LastEntryID, CheckpointEntryCRC32C: manifest.Header.LastEntryCRC32C, ManifestGeneration: manifest.Header.Generation, ManifestSHA256: manifest.Footer.ContentSHA256, CreatedAt: time.Now().UnixNano()}, Artifacts: artifacts})
+	snapshotBytes, err := format.MarshalSnapshotManifest(format.SnapshotManifest{Header: format.SnapshotHeader{SnapshotID: snapshotID, GroupID: node.GroupID, Term: term, CheckpointEntryID: manifest.Header.LastEntryID, CheckpointEntryCRC32C: manifest.Header.LastEntryCRC32C, ManifestGeneration: manifest.Header.Generation, ManifestSHA256: manifest.Footer.ContentSHA256, CreatedAt: time.Now().UnixNano()}, Artifacts: artifacts})
 	if err != nil {
 		return result, err
 	}
@@ -153,7 +173,7 @@ func CreateOnline(store *engine.Store, destination string) (result Result, err e
 	if err = fsutil.SyncDir(parent); err != nil {
 		return result, err
 	}
-	return Result{Path: destination, SnapshotID: snapshotID, GroupID: node.GroupID, Term: store.Health().Term, ManifestGeneration: manifest.Header.Generation, CheckpointEntryID: manifest.Header.LastEntryID, CheckpointCRC32C: manifest.Header.LastEntryCRC32C, Artifacts: uint64(len(artifacts))}, nil
+	return Result{Path: destination, SnapshotID: snapshotID, GroupID: node.GroupID, Term: term, ManifestGeneration: manifest.Header.Generation, CheckpointEntryID: manifest.Header.LastEntryID, CheckpointCRC32C: manifest.Header.LastEntryCRC32C, Artifacts: uint64(len(artifacts))}, nil
 }
 
 func Verify(path string) (Result, error) {
