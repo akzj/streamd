@@ -108,6 +108,50 @@ func TestMergeRejectsDuplicateInputs(t *testing.T) {
 	}
 }
 
+func TestPublishMergeRetainsInputsUntilExplicitRetirement(t *testing.T) {
+	root, err := fsutil.OpenRoot(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	manifests, err := manifeststore.Open(root.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := New(root.Path(), manifests)
+	firstFrame := recordFrame(t, 0, 7, 0, 0, 10, "first")
+	first, err := manager.PublishFlush([]memtable.StreamSnapshot{snapshot(t, firstFrame)}, 0, 11)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondFrame := recordFrame(t, 1, 7, 1, uint64(len(firstFrame)), 11, "second")
+	second, err := manager.PublishFlush([]memtable.StreamSnapshot{snapshot(t, secondFrame)}, 1, 22)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := []format.UUID{first.SegmentReferences[0].SegmentID, otherReference(t, second, first.SegmentReferences[0].SegmentID).SegmentID}
+	merged, retained, err := manager.PublishMerge(ids)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if merged.Header.Generation != 2 || len(retained) != 2 {
+		t.Fatalf("merged = %+v, retained = %d", merged.Header, len(retained))
+	}
+	for _, ref := range retained {
+		if _, err = os.Stat(filepath.Join(root.Path(), ref.LocalPath)); err != nil {
+			t.Fatalf("input Segment retired before view switch: %v", err)
+		}
+	}
+	if err = manager.Retire(retained); err != nil {
+		t.Fatal(err)
+	}
+	for _, ref := range retained {
+		if _, err = os.Stat(filepath.Join(root.Path(), ref.LocalPath)); !os.IsNotExist(err) {
+			t.Fatalf("retired Segment remains live: %v", err)
+		}
+	}
+}
+
 func TestCollectTrashHonorsCutoff(t *testing.T) {
 	root, err := fsutil.OpenRoot(t.TempDir())
 	if err != nil {

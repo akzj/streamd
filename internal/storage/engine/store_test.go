@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -301,5 +303,69 @@ func TestCheckpointPublishesSegmentRotatesWALAndRestarts(t *testing.T) {
 	read, err = store.Read("agent", "events", 0, 10, 0)
 	if err != nil || len(read.Records) != 3 || string(read.Records[2].Payload) != "three" {
 		t.Fatalf("restart Read = %+v, %v", read, err)
+	}
+}
+
+func TestCompactSwitchesGenerationBeforeRetiringInputs(t *testing.T) {
+	dir := t.TempDir()
+	store, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	appendAndCheckpoint := func(expected uint64, requestID, payload string) format.Manifest {
+		t.Helper()
+		_, appendErr := store.Append(context.Background(), AppendRequest{Namespace: "agent", Stream: "events", ExpectedSequence: expected, RequestID: []byte(requestID), Producer: "test", Records: []InputRecord{{Payload: []byte(payload)}}})
+		if appendErr != nil {
+			t.Fatal(appendErr)
+		}
+		manifest, created, checkpointErr := store.Checkpoint()
+		if checkpointErr != nil || !created {
+			t.Fatalf("Checkpoint created=%v error=%v", created, checkpointErr)
+		}
+		return manifest
+	}
+	appendAndCheckpoint(0, "first", "one")
+	before := appendAndCheckpoint(1, "second", "two")
+	if len(before.SegmentReferences) != 2 {
+		t.Fatalf("Segment count before Compact = %d", len(before.SegmentReferences))
+	}
+
+	stopReads := make(chan struct{})
+	readErrors := make(chan error, 1)
+	go func() {
+		for {
+			select {
+			case <-stopReads:
+				readErrors <- nil
+				return
+			default:
+				result, readErr := store.Read("agent", "events", 0, 10, 0)
+				if readErr != nil || len(result.Records) != 2 {
+					readErrors <- fmt.Errorf("concurrent Read records=%d: %w", len(result.Records), readErr)
+					return
+				}
+			}
+		}
+	}()
+	compacted, err := store.Compact(CompactionOptions{MinSegments: 2, MaxInputSegments: 4, MaxInputBytes: 64 << 20})
+	close(stopReads)
+	if readErr := <-readErrors; readErr != nil {
+		t.Fatal(readErr)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !compacted.Created || compacted.InputSegments != 2 || compacted.Manifest.Header.Generation != before.Header.Generation+1 || len(compacted.Manifest.SegmentReferences) != 1 {
+		t.Fatalf("Compaction = %+v", compacted)
+	}
+	result, err := store.Read("agent", "events", 0, 10, 0)
+	if err != nil || len(result.Records) != 2 || string(result.Records[1].Payload) != "two" {
+		t.Fatalf("post-Compact Read = %+v, %v", result, err)
+	}
+	for _, reference := range before.SegmentReferences {
+		if _, statErr := os.Stat(filepath.Join(dir, reference.LocalPath)); !os.IsNotExist(statErr) {
+			t.Fatalf("retired input Segment remains live: %v", statErr)
+		}
 	}
 }

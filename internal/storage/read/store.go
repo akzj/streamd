@@ -36,8 +36,9 @@ type extent struct {
 	directory format.StreamDirectoryEntry
 }
 type cacheEntry struct {
-	streamID uint64
-	extents  []extent
+	streamID   uint64
+	generation uint64
+	extents    []extent
 }
 type Store struct {
 	table      *memtable.Table
@@ -60,8 +61,12 @@ func (s *Store) extents(streamID uint64) []extent {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if element := s.cache[streamID]; element != nil {
-		s.lru.MoveToFront(element)
-		return element.Value.(cacheEntry).extents
+		if element.Value.(cacheEntry).generation == s.generation {
+			s.lru.MoveToFront(element)
+			return element.Value.(cacheEntry).extents
+		}
+		delete(s.cache, streamID)
+		s.lru.Remove(element)
 	}
 	var found []extent
 	for _, descriptor := range s.segments {
@@ -73,7 +78,7 @@ func (s *Store) extents(streamID uint64) []extent {
 		}
 	}
 	sort.Slice(found, func(i, j int) bool { return found[i].directory.FirstSequence < found[j].directory.FirstSequence })
-	element := s.lru.PushFront(cacheEntry{streamID, found})
+	element := s.lru.PushFront(cacheEntry{streamID: streamID, generation: s.generation, extents: found})
 	s.cache[streamID] = element
 	if s.lru.Len() > s.capacity {
 		old := s.lru.Back()

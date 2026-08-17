@@ -58,6 +58,19 @@ type Health struct {
 	Term             uint64
 }
 
+type CompactionOptions struct {
+	MinSegments      int
+	MaxInputSegments int
+	MaxInputBytes    uint64
+}
+
+type CompactionResult struct {
+	Manifest      format.Manifest
+	Created       bool
+	InputSegments int
+	InputBytes    uint64
+}
+
 type ReplicationOptions struct {
 	Term           uint64
 	Role           format.ReplicationRole
@@ -77,6 +90,7 @@ const (
 )
 
 type Store struct {
+	maintenanceMu  sync.Mutex
 	mu             sync.Mutex
 	gateMu         sync.Mutex
 	viewMu         sync.RWMutex
@@ -84,6 +98,7 @@ type Store struct {
 	notifyMu       sync.Mutex
 	root           *fsutil.Root
 	state          *recovery.Result
+	lifecycle      *lifecycle.Manager
 	committer      *commit.Committer
 	reader         *readstore.Store
 	now            func() time.Time
@@ -225,7 +240,7 @@ func open(path string, node *format.NodeIdentity, replication *ReplicationOption
 	if current, ok := state.Manifest.Current(); ok {
 		generation = current.Header.Generation
 	}
-	return &Store{root: root, state: state, committer: commit.NewWithOptions(state.WAL, state.MemTable, commitOptions), reader: readstore.New(state.MemTable, root.Path(), generation, state.Segments, defaultStreamCacheCapacity, defaultSegmentHandleCapacity), now: time.Now, notifications: make(map[streamKey]chan struct{}), appendGates: make(map[streamKey]chan struct{}), nextEntryID: state.WAL.NextEntryID(), previousCRC32C: state.WAL.PreviousEntryCRC32C(), lastRecordedAt: lastRecordedAt, term: term, role: role, durability: durability, guard: guard, commitOptions: commitOptions}, nil
+	return &Store{root: root, state: state, lifecycle: lifecycle.New(root.Path(), state.Manifest), committer: commit.NewWithOptions(state.WAL, state.MemTable, commitOptions), reader: readstore.New(state.MemTable, root.Path(), generation, state.Segments, defaultStreamCacheCapacity, defaultSegmentHandleCapacity), now: time.Now, notifications: make(map[streamKey]chan struct{}), appendGates: make(map[streamKey]chan struct{}), nextEntryID: state.WAL.NextEntryID(), previousCRC32C: state.WAL.PreviousEntryCRC32C(), lastRecordedAt: lastRecordedAt, term: term, role: role, durability: durability, guard: guard, commitOptions: commitOptions}, nil
 }
 
 func watermarksFromState(header format.ReplicationStateHeader) commit.Watermarks {
@@ -238,6 +253,8 @@ func watermarksFromState(header format.ReplicationStateHeader) commit.Watermarks
 	}
 }
 func (s *Store) Close() error {
+	s.maintenanceMu.Lock()
+	defer s.maintenanceMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.shutdown {
@@ -391,6 +408,8 @@ func (s *Store) Append(ctx context.Context, request AppendRequest) (AppendResult
 }
 
 func (s *Store) Checkpoint() (format.Manifest, bool, error) {
+	s.maintenanceMu.Lock()
+	defer s.maintenanceMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.shutdown {
@@ -432,8 +451,7 @@ func (s *Store) Checkpoint() (format.Manifest, bool, error) {
 			return format.Manifest{}, false, err
 		}
 	}
-	manager := lifecycle.New(s.root.Path(), s.state.Manifest)
-	published, err := manager.PublishFlush(flush, lastEntryID, lastCRC)
+	published, err := s.lifecycle.PublishFlush(flush, lastEntryID, lastCRC)
 	if err != nil {
 		s.setFatal(err)
 		return format.Manifest{}, false, err
@@ -492,6 +510,120 @@ func (s *Store) Checkpoint() (format.Manifest, bool, error) {
 		}
 	}
 	return published, true, nil
+}
+
+// Compact replaces a bounded set of adjacent immutable Segments and installs
+// the resulting Manifest Generation before retiring the input files. Appends
+// continue while the replacement Segment is built; Checkpoint and other
+// maintenance operations are serialized.
+func (s *Store) Compact(options CompactionOptions) (CompactionResult, error) {
+	if options.MinSegments < 2 || options.MaxInputSegments < 2 || options.MaxInputBytes == 0 {
+		return CompactionResult{}, fmt.Errorf("invalid Compaction options")
+	}
+	s.maintenanceMu.Lock()
+	defer s.maintenanceMu.Unlock()
+	s.mu.Lock()
+	if s.shutdown {
+		s.mu.Unlock()
+		return CompactionResult{}, errdefs.ErrClosed
+	}
+	if err := s.fatalError(); err != nil {
+		s.mu.Unlock()
+		return CompactionResult{}, fmt.Errorf("engine failed: %w", err)
+	}
+	s.mu.Unlock()
+
+	current, ok := s.state.Manifest.Current()
+	if !ok || len(current.SegmentReferences) < options.MinSegments {
+		return CompactionResult{Manifest: current}, nil
+	}
+	selected, inputBytes := selectCompactionInputs(current.SegmentReferences, options)
+	if len(selected) < 2 {
+		return CompactionResult{Manifest: current}, nil
+	}
+	ids := make([]format.UUID, len(selected))
+	for i := range selected {
+		ids[i] = selected[i].SegmentID
+	}
+	published, retained, err := s.lifecycle.PublishMerge(ids)
+	if err != nil {
+		return CompactionResult{}, err
+	}
+
+	s.viewMu.RLock()
+	table := s.state.MemTable
+	existing := make(map[format.UUID]segment.Descriptor, len(s.state.Segments))
+	for _, descriptor := range s.state.Segments {
+		existing[descriptor.Reference.SegmentID] = descriptor
+	}
+	s.viewMu.RUnlock()
+	descriptors := make([]segment.Descriptor, 0, len(published.SegmentReferences))
+	for _, reference := range published.SegmentReferences {
+		if descriptor, found := existing[reference.SegmentID]; found {
+			descriptors = append(descriptors, descriptor)
+			continue
+		}
+		descriptor, describeErr := segment.DescribeReference(s.root.Path(), reference)
+		if describeErr != nil {
+			s.setFatal(describeErr)
+			return CompactionResult{}, describeErr
+		}
+		descriptors = append(descriptors, descriptor)
+	}
+	nextReader := readstore.New(table, s.root.Path(), published.Header.Generation, descriptors, defaultStreamCacheCapacity, defaultSegmentHandleCapacity)
+	s.viewMu.Lock()
+	oldReader := s.reader
+	s.state.Segments = descriptors
+	s.reader = nextReader
+	s.viewMu.Unlock()
+	if err = oldReader.Close(); err != nil {
+		s.setFatal(err)
+		return CompactionResult{}, err
+	}
+	if err = s.lifecycle.Retire(retained); err != nil {
+		return CompactionResult{}, err
+	}
+	return CompactionResult{Manifest: published, Created: true, InputSegments: len(selected), InputBytes: inputBytes}, nil
+}
+
+func selectCompactionInputs(references []format.SegmentReference, options CompactionOptions) ([]format.SegmentReference, uint64) {
+	ordered := append([]format.SegmentReference(nil), references...)
+	slices.SortFunc(ordered, func(a, b format.SegmentReference) int {
+		if a.FirstEntryID < b.FirstEntryID {
+			return -1
+		}
+		if a.FirstEntryID > b.FirstEntryID {
+			return 1
+		}
+		if a.LastEntryID < b.LastEntryID {
+			return -1
+		}
+		if a.LastEntryID > b.LastEntryID {
+			return 1
+		}
+		return 0
+	})
+	for start := 0; start+1 < len(ordered); start++ {
+		var bytes uint64
+		var selected []format.SegmentReference
+		for i := start; i < len(ordered) && len(selected) < options.MaxInputSegments; i++ {
+			if len(selected) > 0 {
+				previous := selected[len(selected)-1]
+				if previous.LastEntryID == math.MaxUint64 || ordered[i].FirstEntryID != previous.LastEntryID+1 {
+					break
+				}
+			}
+			if ordered[i].FileSize > options.MaxInputBytes-bytes {
+				break
+			}
+			selected = append(selected, ordered[i])
+			bytes += ordered[i].FileSize
+		}
+		if len(selected) >= 2 {
+			return selected, bytes
+		}
+	}
+	return nil, 0
 }
 
 // CheckpointReplicationState publishes a crash-recovery lower bound without

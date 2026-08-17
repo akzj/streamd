@@ -92,17 +92,38 @@ func (m *Manager) PublishFlush(streams []memtable.StreamSnapshot, lastEntryID ui
 func (m *Manager) Merge(ids []format.UUID) (format.Manifest, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	published, selected, err := m.publishMergeLocked(ids)
+	if err != nil {
+		return format.Manifest{}, err
+	}
+	for _, ref := range selected {
+		path := filepath.Join(m.root, ref.LocalPath)
+		_ = m.retireLocked(ref.SegmentID, path)
+	}
+	return published, nil
+}
+
+// PublishMerge publishes a replacement Segment while retaining all input
+// files. The caller must install the new reader Generation before calling
+// Retire, so a reader on the previous Generation can still open its files.
+func (m *Manager) PublishMerge(ids []format.UUID) (format.Manifest, []format.SegmentReference, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.publishMergeLocked(ids)
+}
+
+func (m *Manager) publishMergeLocked(ids []format.UUID) (format.Manifest, []format.SegmentReference, error) {
 	if len(ids) < 2 {
-		return format.Manifest{}, fmt.Errorf("Merge requires at least two Segments")
+		return format.Manifest{}, nil, fmt.Errorf("Merge requires at least two Segments")
 	}
 	current, ok := m.manifests.Current()
 	if !ok {
-		return format.Manifest{}, fmt.Errorf("no current Manifest")
+		return format.Manifest{}, nil, fmt.Errorf("no current Manifest")
 	}
 	wanted := make(map[format.UUID]bool, len(ids))
 	for _, id := range ids {
 		if wanted[id] {
-			return format.Manifest{}, fmt.Errorf("Merge input contains duplicate Segment %x", id)
+			return format.Manifest{}, nil, fmt.Errorf("Merge input contains duplicate Segment %x", id)
 		}
 		wanted[id] = true
 	}
@@ -116,23 +137,23 @@ func (m *Manager) Merge(ids []format.UUID) (format.Manifest, error) {
 		}
 	}
 	if len(selected) != len(wanted) {
-		return format.Manifest{}, fmt.Errorf("Merge input is not fully referenced")
+		return format.Manifest{}, nil, fmt.Errorf("Merge input is not fully referenced")
 	}
 	byStream := make(map[uint64][][]byte)
 	for _, ref := range selected {
 		if ref.Flags&format.SegmentRefHasLocal == 0 {
-			return format.Manifest{}, fmt.Errorf("Merge input Segment %x has no local copy", ref.SegmentID)
+			return format.Manifest{}, nil, fmt.Errorf("Merge input Segment %x has no local copy", ref.SegmentID)
 		}
 		reader, err := segment.Open(filepath.Join(m.root, ref.LocalPath))
 		if err != nil {
-			return format.Manifest{}, err
+			return format.Manifest{}, nil, err
 		}
 		for _, d := range reader.Directories {
 			for seq := d.FirstSequence; seq < d.FirstSequence+d.RecordCount; seq++ {
 				frame, e := reader.ReadFrame(d.StreamID, seq)
 				if e != nil {
 					reader.Close()
-					return format.Manifest{}, e
+					return format.Manifest{}, nil, e
 				}
 				byStream[d.StreamID] = append(byStream[d.StreamID], frame)
 			}
@@ -156,11 +177,11 @@ func (m *Manager) Merge(ids []format.UUID) (format.Manifest, error) {
 		for i, frame := range frames {
 			r, e := format.UnmarshalRecordFrame(frame)
 			if e != nil {
-				return format.Manifest{}, e
+				return format.Manifest{}, nil, e
 			}
 			records[i] = r
 			if i > 0 && (r.Sequence != records[i-1].Sequence+1 || r.ByteOffset != records[i-1].ByteOffset+uint64(len(frames[i-1]))) {
-				return format.Manifest{}, fmt.Errorf("Merge input has a Stream gap")
+				return format.Manifest{}, nil, fmt.Errorf("Merge input has a Stream gap")
 			}
 		}
 		last := records[len(records)-1]
@@ -177,35 +198,41 @@ func (m *Manager) Merge(ids []format.UUID) (format.Manifest, error) {
 	})
 	id, err := newID()
 	if err != nil {
-		return format.Manifest{}, err
+		return format.Manifest{}, nil, err
 	}
 	staging := filepath.Join(m.root, "staging", fmt.Sprintf("SEG-%x.tmp", id))
 	meta, err := segment.WriteFile(staging, id, time.Now().UnixNano(), streams)
 	if err != nil {
-		return format.Manifest{}, err
+		return format.Manifest{}, nil, err
 	}
 	name := fmt.Sprintf("SEG-%x.seg", id)
 	final := filepath.Join(m.root, "segments", name)
 	if err = os.Rename(staging, final); err != nil {
-		return format.Manifest{}, err
+		return format.Manifest{}, nil, err
 	}
 	if err = fsutil.SyncDir(filepath.Join(m.root, "segments")); err != nil {
-		return format.Manifest{}, err
+		return format.Manifest{}, nil, err
 	}
 	kept = append(kept, format.SegmentReference{Flags: format.SegmentRefHasLocal, SegmentID: id, FileSize: meta.Footer.FileLength, FirstEntryID: meta.Header.FirstEntryID, LastEntryID: meta.Header.LastEntryID, StreamCount: meta.Header.StreamCount, RecordCount: meta.Header.RecordCount, LocalPath: "segments/" + name, ContentSHA256: meta.Footer.ContentSHA256})
 	next, err := m.nextManifest(kept, current.Header.LastEntryID, current.Header.LastEntryCRC32C)
 	if err != nil {
-		return format.Manifest{}, err
+		return format.Manifest{}, nil, err
 	}
 	published, err := m.manifests.Publish(next)
 	if err != nil {
-		return format.Manifest{}, err
+		return format.Manifest{}, nil, err
 	}
-	for _, ref := range selected {
-		path := filepath.Join(m.root, ref.LocalPath)
-		_ = m.retireLocked(ref.SegmentID, path)
+	return published, selected, nil
+}
+
+func (m *Manager) Retire(references []format.SegmentReference) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var retireErr error
+	for _, ref := range references {
+		retireErr = errors.Join(retireErr, m.retireLocked(ref.SegmentID, filepath.Join(m.root, ref.LocalPath)))
 	}
-	return published, nil
+	return retireErr
 }
 func (m *Manager) nextManifest(refs []format.SegmentReference, lastID uint64, lastCRC uint32) (format.Manifest, error) {
 	var header format.ManifestHeader
