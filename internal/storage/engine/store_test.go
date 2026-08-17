@@ -281,6 +281,9 @@ func TestCheckpointPublishesSegmentRotatesWALAndRestarts(t *testing.T) {
 	if !created || manifest.Header.RecordCount != 3 || len(manifest.SegmentReferences) != 1 {
 		t.Fatalf("checkpoint Manifest = %+v, created = %v", manifest, created)
 	}
+	if len(manifest.ArtifactReferences) != 1 || manifest.ArtifactReferences[0].ArtifactType != format.ArtifactTailCatalog || store.state.TailCatalog == nil || store.state.TailCatalog.Header().ManifestGeneration != manifest.Header.Generation {
+		t.Fatalf("checkpoint Tail Catalog was not installed: %+v", manifest.ArtifactReferences)
+	}
 	if _, created, err = store.Checkpoint(); err != nil || created {
 		t.Fatalf("empty checkpoint created=%v error=%v", created, err)
 	}
@@ -300,6 +303,9 @@ func TestCheckpointPublishesSegmentRotatesWALAndRestarts(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
+	if store.state.TailCatalog == nil {
+		t.Fatal("Tail Catalog was not recovered")
+	}
 	read, err = store.Read("agent", "events", 0, 10, 0)
 	if err != nil || len(read.Records) != 3 || string(read.Records[2].Payload) != "three" {
 		t.Fatalf("restart Read = %+v, %v", read, err)
@@ -398,10 +404,61 @@ func TestPinnedManifestDefersCompactionRetirement(t *testing.T) {
 			t.Fatalf("pinned Segment retired: %v", err)
 		}
 	}
+	for _, reference := range pinned.ArtifactReferences {
+		if _, err = os.Stat(filepath.Join(dir, reference.Path)); err != nil {
+			t.Fatalf("pinned Artifact retired: %v", err)
+		}
+	}
 	release()
 	for _, reference := range pinned.SegmentReferences {
 		if _, err = os.Stat(filepath.Join(dir, reference.LocalPath)); !os.IsNotExist(err) {
 			t.Fatalf("released Segment remains live: %v", err)
 		}
+	}
+	for _, reference := range pinned.ArtifactReferences {
+		if _, err = os.Stat(filepath.Join(dir, reference.Path)); !os.IsNotExist(err) {
+			t.Fatalf("released Artifact remains live: %v", err)
+		}
+	}
+}
+
+func TestRecoveryRebuildsWhenTailCatalogIsCorrupt(t *testing.T) {
+	dir := t.TempDir()
+	store, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = store.Append(context.Background(), AppendRequest{Namespace: "agent", Stream: "events", RequestID: []byte("one"), Producer: "test", Records: []InputRecord{{Payload: []byte("one")}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, created, err := store.Checkpoint()
+	if err != nil || !created {
+		t.Fatalf("Checkpoint created=%v error=%v", created, err)
+	}
+	if err = store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reference := manifest.ArtifactReferences[0]
+	path := filepath.Join(dir, filepath.FromSlash(reference.Path))
+	file, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = file.WriteAt([]byte{0xff}, 4096+16); err != nil {
+		t.Fatal(err)
+	}
+	file.Close()
+	store, err = Open(dir)
+	if err != nil {
+		t.Fatalf("recovery rejected reconstructible Tail corruption: %v", err)
+	}
+	defer store.Close()
+	if store.state.TailCatalog != nil {
+		t.Fatal("corrupt Tail Catalog was installed")
+	}
+	result, err := store.Read("agent", "events", 0, 10, 0)
+	if err != nil || len(result.Records) != 1 {
+		t.Fatalf("rebuilt Read = %+v, %v", result, err)
 	}
 }

@@ -24,6 +24,7 @@ import (
 	"github.com/akzj/streamd/internal/storage/registry"
 	"github.com/akzj/streamd/internal/storage/replicationstate"
 	"github.com/akzj/streamd/internal/storage/segment"
+	tailstore "github.com/akzj/streamd/internal/storage/tail"
 	"github.com/akzj/streamd/internal/storage/wal"
 )
 
@@ -427,6 +428,9 @@ func (s *Store) CheckpointAndPin() (format.Manifest, bool, func(), error) {
 	for _, reference := range manifest.SegmentReferences {
 		releases = append(releases, s.lifecycle.Pin(reference.SegmentID))
 	}
+	for _, reference := range manifest.ArtifactReferences {
+		releases = append(releases, s.lifecycle.Pin(reference.ArtifactID))
+	}
 	var once sync.Once
 	release := func() {
 		once.Do(func() {
@@ -480,7 +484,35 @@ func (s *Store) checkpointLocked() (format.Manifest, bool, error) {
 			return format.Manifest{}, false, err
 		}
 	}
-	published, err := s.lifecycle.PublishFlush(flush, lastEntryID, lastCRC)
+	previous, _ := s.state.Manifest.Current()
+	existing := make(map[format.UUID]bool, len(s.state.Segments))
+	for _, descriptor := range s.state.Segments {
+		existing[descriptor.Reference.SegmentID] = true
+	}
+	var descriptors []segment.Descriptor
+	var tailReference format.ArtifactReference
+	published, err := s.lifecycle.PublishFlushWithArtifacts(flush, lastEntryID, lastCRC, func(generation uint64, references []format.SegmentReference, coveredEntryID uint64) ([]format.ArtifactReference, error) {
+		descriptors = append([]segment.Descriptor(nil), s.state.Segments...)
+		for _, reference := range references {
+			if existing[reference.SegmentID] {
+				continue
+			}
+			descriptor, describeErr := segment.DescribeReference(s.root.Path(), reference)
+			if describeErr != nil {
+				return nil, describeErr
+			}
+			descriptors = append(descriptors, descriptor)
+		}
+		if len(descriptors) != len(references) {
+			return nil, fmt.Errorf("published Manifest Segment set is inconsistent")
+		}
+		var buildErr error
+		tailReference, buildErr = s.buildTailReference(generation, coveredEntryID, descriptors, snapshots)
+		if buildErr != nil {
+			return nil, buildErr
+		}
+		return []format.ArtifactReference{tailReference}, nil
+	})
 	if err != nil {
 		s.setFatal(err)
 		return format.Manifest{}, false, err
@@ -491,27 +523,12 @@ func (s *Store) checkpointLocked() (format.Manifest, bool, error) {
 			return format.Manifest{}, false, err
 		}
 	}
-	existing := make(map[format.UUID]bool, len(s.state.Segments))
-	for _, descriptor := range s.state.Segments {
-		existing[descriptor.Reference.SegmentID] = true
-	}
-	var newReference *format.SegmentReference
-	for i := range published.SegmentReferences {
-		if !existing[published.SegmentReferences[i].SegmentID] {
-			newReference = &published.SegmentReferences[i]
-			break
-		}
-	}
-	if newReference == nil {
-		err = fmt.Errorf("published Manifest has no new Segment")
-		s.setFatal(err)
-		return format.Manifest{}, false, err
-	}
-	descriptor, err := segment.DescribeReference(s.root.Path(), *newReference)
+	nextTailCatalog, err := tailstore.OpenCheckpoint(s.root.Path(), tailReference, published.Header.Generation, published.Header.LastEntryID)
 	if err != nil {
 		s.setFatal(err)
 		return format.Manifest{}, false, err
 	}
+	retiredArtifacts := replacedTailArtifacts(previous.ArtifactReferences, tailReference)
 	newTable := memtable.New(0)
 	for _, snapshot := range snapshots {
 		if err = newTable.SeedTail(snapshot.StreamID, snapshot.Tail); err != nil {
@@ -522,17 +539,25 @@ func (s *Store) checkpointLocked() (format.Manifest, bool, error) {
 	s.viewMu.Lock()
 	oldTable := s.state.MemTable
 	oldReader := s.reader
+	oldTailCatalog := s.state.TailCatalog
 	s.state.MemTable = newTable
-	s.state.Segments = append(s.state.Segments, descriptor)
+	s.state.Segments = descriptors
+	s.state.TailCatalog = nextTailCatalog
 	s.committer = commit.NewWithOptions(s.state.WAL, newTable, s.commitOptions)
 	s.reader = readstore.New(newTable, s.root.Path(), published.Header.Generation, s.state.Segments, defaultStreamCacheCapacity, defaultSegmentHandleCapacity)
 	closeErr := oldReader.Close()
+	if oldTailCatalog != nil {
+		closeErr = errors.Join(closeErr, oldTailCatalog.Close())
+	}
 	s.viewMu.Unlock()
 	if closeErr != nil {
 		s.setFatal(closeErr)
 		return published, true, closeErr
 	}
 	oldTable.Freeze()
+	if err = s.lifecycle.RetireArtifacts(retiredArtifacts); err != nil {
+		return published, true, err
+	}
 	if s.checkpointHook != nil {
 		if err = s.checkpointHook("after_view_install"); err != nil {
 			return published, true, err
@@ -574,11 +599,6 @@ func (s *Store) Compact(options CompactionOptions) (CompactionResult, error) {
 	for i := range selected {
 		ids[i] = selected[i].SegmentID
 	}
-	published, retained, err := s.lifecycle.PublishMerge(ids)
-	if err != nil {
-		return CompactionResult{}, err
-	}
-
 	s.viewMu.RLock()
 	table := s.state.MemTable
 	existing := make(map[format.UUID]segment.Descriptor, len(s.state.Segments))
@@ -586,33 +606,101 @@ func (s *Store) Compact(options CompactionOptions) (CompactionResult, error) {
 		existing[descriptor.Reference.SegmentID] = descriptor
 	}
 	s.viewMu.RUnlock()
-	descriptors := make([]segment.Descriptor, 0, len(published.SegmentReferences))
-	for _, reference := range published.SegmentReferences {
-		if descriptor, found := existing[reference.SegmentID]; found {
+	previous := current
+	snapshots := table.Snapshot()
+	var descriptors []segment.Descriptor
+	var tailReference format.ArtifactReference
+	published, retained, err := s.lifecycle.PublishMergeWithArtifacts(ids, func(generation uint64, references []format.SegmentReference, coveredEntryID uint64) ([]format.ArtifactReference, error) {
+		descriptors = make([]segment.Descriptor, 0, len(references))
+		for _, reference := range references {
+			if descriptor, found := existing[reference.SegmentID]; found {
+				descriptors = append(descriptors, descriptor)
+				continue
+			}
+			descriptor, describeErr := segment.DescribeReference(s.root.Path(), reference)
+			if describeErr != nil {
+				return nil, describeErr
+			}
 			descriptors = append(descriptors, descriptor)
-			continue
 		}
-		descriptor, describeErr := segment.DescribeReference(s.root.Path(), reference)
-		if describeErr != nil {
-			s.setFatal(describeErr)
-			return CompactionResult{}, describeErr
+		var buildErr error
+		tailReference, buildErr = s.buildTailReference(generation, coveredEntryID, descriptors, snapshots)
+		if buildErr != nil {
+			return nil, buildErr
 		}
-		descriptors = append(descriptors, descriptor)
+		return []format.ArtifactReference{tailReference}, nil
+	})
+	if err != nil {
+		s.setFatal(err)
+		return CompactionResult{}, err
 	}
+	nextTailCatalog, err := tailstore.OpenCheckpoint(s.root.Path(), tailReference, published.Header.Generation, published.Header.LastEntryID)
+	if err != nil {
+		s.setFatal(err)
+		return CompactionResult{}, err
+	}
+	retiredArtifacts := replacedTailArtifacts(previous.ArtifactReferences, tailReference)
 	nextReader := readstore.New(table, s.root.Path(), published.Header.Generation, descriptors, defaultStreamCacheCapacity, defaultSegmentHandleCapacity)
 	s.viewMu.Lock()
 	oldReader := s.reader
+	oldTailCatalog := s.state.TailCatalog
 	s.state.Segments = descriptors
+	s.state.TailCatalog = nextTailCatalog
 	s.reader = nextReader
 	s.viewMu.Unlock()
-	if err = oldReader.Close(); err != nil {
+	err = oldReader.Close()
+	if oldTailCatalog != nil {
+		err = errors.Join(err, oldTailCatalog.Close())
+	}
+	if err != nil {
 		s.setFatal(err)
 		return CompactionResult{}, err
 	}
 	if err = s.lifecycle.Retire(retained); err != nil {
 		return CompactionResult{}, err
 	}
+	if err = s.lifecycle.RetireArtifacts(retiredArtifacts); err != nil {
+		return CompactionResult{}, err
+	}
 	return CompactionResult{Manifest: published, Created: true, InputSegments: len(selected), InputBytes: inputBytes}, nil
+}
+
+func (s *Store) buildTailReference(generation, coveredEntryID uint64, descriptors []segment.Descriptor, snapshots []memtable.StreamSnapshot) (format.ArtifactReference, error) {
+	type latestExtent struct {
+		segmentID    format.UUID
+		nextSequence uint64
+	}
+	latest := make(map[uint64]latestExtent)
+	for _, descriptor := range descriptors {
+		for _, directory := range descriptor.Directories {
+			if directory.RecordCount > math.MaxUint64-directory.FirstSequence {
+				return format.ArtifactReference{}, fmt.Errorf("Stream %d extent Sequence overflows", directory.StreamID)
+			}
+			next := directory.FirstSequence + directory.RecordCount
+			if current, ok := latest[directory.StreamID]; !ok || next > current.nextSequence {
+				latest[directory.StreamID] = latestExtent{segmentID: descriptor.Reference.SegmentID, nextSequence: next}
+			}
+		}
+	}
+	slots := make([]format.TailSlot, 0, len(snapshots))
+	for _, snapshot := range snapshots {
+		extent, ok := latest[snapshot.StreamID]
+		if snapshot.Tail.RecordCount > 0 && (!ok || extent.nextSequence != snapshot.Tail.NextSequence) {
+			return format.ArtifactReference{}, fmt.Errorf("Stream %d Tail has no matching latest Segment", snapshot.StreamID)
+		}
+		slots = append(slots, format.TailSlot{Generation: 2, Present: true, StreamID: snapshot.StreamID, NextSequence: snapshot.Tail.NextSequence, NextByteOffset: snapshot.Tail.NextByteOffset, LastRecordedAt: snapshot.Tail.LastRecordedAt, LastEntryID: snapshot.Tail.LastEntryID, AppliedEntryID: coveredEntryID, LatestSegmentID: extent.segmentID})
+	}
+	return tailstore.WriteNewCheckpoint(s.root.Path(), generation, coveredEntryID, slots)
+}
+
+func replacedTailArtifacts(previous []format.ArtifactReference, replacement format.ArtifactReference) []format.ArtifactReference {
+	var retired []format.ArtifactReference
+	for _, old := range previous {
+		if old.ArtifactType == format.ArtifactTailCatalog && old.ArtifactID != replacement.ArtifactID {
+			retired = append(retired, old)
+		}
+	}
+	return retired
 }
 
 func selectCompactionInputs(references []format.SegmentReference, options CompactionOptions) ([]format.SegmentReference, uint64) {

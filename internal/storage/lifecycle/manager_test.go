@@ -108,6 +108,34 @@ func TestMergeRejectsDuplicateInputs(t *testing.T) {
 	}
 }
 
+func TestArtifactBuilderPublishesInSameManifestGeneration(t *testing.T) {
+	root, err := fsutil.OpenRoot(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	manifests, err := manifeststore.Open(root.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := New(root.Path(), manifests)
+	frame := recordFrame(t, 0, 1, 0, 0, 1, "record")
+	digest := sha256.Sum256([]byte("tail"))
+	artifactID := format.UUID{15: 9}
+	published, err := manager.PublishFlushWithArtifacts([]memtable.StreamSnapshot{snapshot(t, frame)}, 0, 1, func(generation uint64, segments []format.SegmentReference, coveredEntryID uint64) ([]format.ArtifactReference, error) {
+		if generation != 0 || len(segments) != 1 || coveredEntryID != 0 {
+			t.Fatalf("builder Generation=%d Segments=%d Covered=%d", generation, len(segments), coveredEntryID)
+		}
+		return []format.ArtifactReference{{ArtifactType: format.ArtifactTailCatalog, FormatVersion: format.VersionV1, ArtifactID: artifactID, FileSize: 1, CoveredEntryID: coveredEntryID, Path: "catalog/tail.cat", ContentSHA256: digest}}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if published.Header.Generation != 0 || len(published.ArtifactReferences) != 1 || published.ArtifactReferences[0].ArtifactID != artifactID {
+		t.Fatalf("published Manifest = %+v", published)
+	}
+}
+
 func TestPublishMergeRetainsInputsUntilExplicitRetirement(t *testing.T) {
 	root, err := fsutil.OpenRoot(t.TempDir())
 	if err != nil {

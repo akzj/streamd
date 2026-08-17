@@ -31,6 +31,8 @@ type Manager struct {
 	pending   map[format.UUID]*retirement
 }
 
+type ArtifactBuilder func(generation uint64, segments []format.SegmentReference, coveredEntryID uint64) ([]format.ArtifactReference, error)
+
 func New(root string, manifests *manifeststore.Store) *Manager {
 	return &Manager{
 		root:      root,
@@ -60,6 +62,10 @@ func (m *Manager) Pin(id format.UUID) func() {
 	}
 }
 func (m *Manager) PublishFlush(streams []memtable.StreamSnapshot, lastEntryID uint64, lastCRC uint32) (format.Manifest, error) {
+	return m.PublishFlushWithArtifacts(streams, lastEntryID, lastCRC, nil)
+}
+
+func (m *Manager) PublishFlushWithArtifacts(streams []memtable.StreamSnapshot, lastEntryID uint64, lastCRC uint32, builder ArtifactBuilder) (format.Manifest, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if len(streams) == 0 {
@@ -87,12 +93,15 @@ func (m *Manager) PublishFlush(streams []memtable.StreamSnapshot, lastEntryID ui
 	if err != nil {
 		return format.Manifest{}, err
 	}
+	if err = applyArtifactBuilder(&next, builder); err != nil {
+		return format.Manifest{}, err
+	}
 	return m.manifests.Publish(next)
 }
 func (m *Manager) Merge(ids []format.UUID) (format.Manifest, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	published, selected, err := m.publishMergeLocked(ids)
+	published, selected, err := m.publishMergeLocked(ids, nil)
 	if err != nil {
 		return format.Manifest{}, err
 	}
@@ -107,12 +116,16 @@ func (m *Manager) Merge(ids []format.UUID) (format.Manifest, error) {
 // files. The caller must install the new reader Generation before calling
 // Retire, so a reader on the previous Generation can still open its files.
 func (m *Manager) PublishMerge(ids []format.UUID) (format.Manifest, []format.SegmentReference, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.publishMergeLocked(ids)
+	return m.PublishMergeWithArtifacts(ids, nil)
 }
 
-func (m *Manager) publishMergeLocked(ids []format.UUID) (format.Manifest, []format.SegmentReference, error) {
+func (m *Manager) PublishMergeWithArtifacts(ids []format.UUID, builder ArtifactBuilder) (format.Manifest, []format.SegmentReference, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.publishMergeLocked(ids, builder)
+}
+
+func (m *Manager) publishMergeLocked(ids []format.UUID, builder ArtifactBuilder) (format.Manifest, []format.SegmentReference, error) {
 	if len(ids) < 2 {
 		return format.Manifest{}, nil, fmt.Errorf("Merge requires at least two Segments")
 	}
@@ -218,11 +231,39 @@ func (m *Manager) publishMergeLocked(ids []format.UUID) (format.Manifest, []form
 	if err != nil {
 		return format.Manifest{}, nil, err
 	}
+	if err = applyArtifactBuilder(&next, builder); err != nil {
+		return format.Manifest{}, nil, err
+	}
 	published, err := m.manifests.Publish(next)
 	if err != nil {
 		return format.Manifest{}, nil, err
 	}
 	return published, selected, nil
+}
+
+func applyArtifactBuilder(next *format.Manifest, builder ArtifactBuilder) error {
+	if builder == nil {
+		return nil
+	}
+	replacements, err := builder(next.Header.Generation, append([]format.SegmentReference(nil), next.SegmentReferences...), next.Header.LastEntryID)
+	if err != nil {
+		return err
+	}
+	types := make(map[format.ArtifactType]bool, len(replacements))
+	for _, replacement := range replacements {
+		if types[replacement.ArtifactType] {
+			return fmt.Errorf("duplicate Artifact replacement type %d", replacement.ArtifactType)
+		}
+		types[replacement.ArtifactType] = true
+	}
+	artifacts := make([]format.ArtifactReference, 0, len(next.ArtifactReferences)+len(replacements))
+	for _, reference := range next.ArtifactReferences {
+		if !types[reference.ArtifactType] {
+			artifacts = append(artifacts, reference)
+		}
+	}
+	next.ArtifactReferences = append(artifacts, replacements...)
+	return nil
 }
 
 func (m *Manager) Retire(references []format.SegmentReference) error {
@@ -234,6 +275,23 @@ func (m *Manager) Retire(references []format.SegmentReference) error {
 	}
 	return retireErr
 }
+
+func (m *Manager) RetireArtifacts(references []format.ArtifactReference) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var retireErr error
+	for _, ref := range references {
+		if m.pending[ref.ArtifactID] == nil {
+			m.pending[ref.ArtifactID] = &retirement{
+				source:      filepath.Join(m.root, ref.Path),
+				destination: filepath.Join(m.root, "trash", fmt.Sprintf("ART-%x-%d.trash", ref.ArtifactID, time.Now().UnixNano())),
+			}
+		}
+		retireErr = errors.Join(retireErr, m.retireLocked(ref.ArtifactID, filepath.Join(m.root, ref.Path)))
+	}
+	return retireErr
+}
+
 func (m *Manager) nextManifest(refs []format.SegmentReference, lastID uint64, lastCRC uint32) (format.Manifest, error) {
 	var header format.ManifestHeader
 	current, ok := m.manifests.Current()

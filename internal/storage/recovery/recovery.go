@@ -8,6 +8,7 @@ import (
 	"github.com/akzj/streamd/internal/storage/memtable"
 	"github.com/akzj/streamd/internal/storage/registry"
 	"github.com/akzj/streamd/internal/storage/segment"
+	tailstore "github.com/akzj/streamd/internal/storage/tail"
 	"github.com/akzj/streamd/internal/storage/wal"
 	"os"
 	"path/filepath"
@@ -21,6 +22,7 @@ type Result struct {
 	MemTable       *memtable.Table
 	Registry       *registry.Registry
 	Segments       []segment.Descriptor
+	TailCatalog    *tailstore.Catalog
 	AppliedEntryID uint64
 	HasApplied     bool
 }
@@ -70,6 +72,11 @@ func OpenWithOptions(root string, options Options) (*Result, error) {
 				byStream[d.StreamID] = append(byStream[d.StreamID], extent{descriptor: descriptor, directory: d})
 			}
 		}
+		if reference, found, findErr := tailstore.FindReference(current); findErr == nil && found {
+			// Tail Catalog is a reconstructible projection. Missing, stale, or
+			// corrupt files fall back to Segment Directory and WAL recovery.
+			result.TailCatalog, _ = tailstore.OpenCheckpoint(root, reference, current.Header.Generation, checkpointID)
+		}
 	}
 	if options.ApplyThrough != nil && hasCheckpoint && *options.ApplyThrough < checkpointID {
 		result.Close()
@@ -86,6 +93,7 @@ func OpenWithOptions(root string, options Options) (*Result, error) {
 			return 0
 		})
 		var tail memtable.Tail
+		var latestSegmentID format.UUID
 		for i, e := range extents {
 			d := e.directory
 			if i > 0 && (d.FirstSequence != tail.NextSequence || d.FirstByteOffset != tail.NextByteOffset || d.FirstRecordedAt < tail.LastRecordedAt) {
@@ -93,6 +101,7 @@ func OpenWithOptions(root string, options Options) (*Result, error) {
 				return nil, fmt.Errorf("Stream %d Segment extents are not continuous", streamID)
 			}
 			tail = memtable.Tail{NextSequence: d.FirstSequence + d.RecordCount, NextByteOffset: d.NextByteOffset, LastRecordedAt: d.LastRecordedAt, LastEntryID: d.LastEntryID, RecordCount: tail.RecordCount + d.RecordCount}
+			latestSegmentID = e.descriptor.Reference.SegmentID
 			if streamID == registry.RegistryStreamID {
 				reader, openErr := segment.OpenReference(root, e.descriptor.Reference)
 				if openErr != nil {
@@ -116,6 +125,13 @@ func OpenWithOptions(root string, options Options) (*Result, error) {
 					result.Close()
 					return nil, closeErr
 				}
+			}
+		}
+		if result.TailCatalog != nil {
+			slot, found, lookupErr := result.TailCatalog.Lookup(streamID)
+			if lookupErr != nil || !found || slot.NextSequence != tail.NextSequence || slot.NextByteOffset != tail.NextByteOffset || slot.LastRecordedAt != tail.LastRecordedAt || slot.LastEntryID != tail.LastEntryID || slot.AppliedEntryID != checkpointID || slot.LatestSegmentID != latestSegmentID {
+				_ = result.TailCatalog.Close()
+				result.TailCatalog = nil
 			}
 		}
 		if err = table.SeedTail(streamID, tail); err != nil {
@@ -298,6 +314,10 @@ func (r *Result) Close() error {
 	if r.WAL != nil {
 		errs = append(errs, r.WAL.Close())
 		r.WAL = nil
+	}
+	if r.TailCatalog != nil {
+		errs = append(errs, r.TailCatalog.Close())
+		r.TailCatalog = nil
 	}
 	r.Segments = nil
 	return errors.Join(errs...)
