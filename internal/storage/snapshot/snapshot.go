@@ -118,7 +118,7 @@ func createOnline(store *engine.Store, destination string, term uint64) (result 
 			_ = os.RemoveAll(staging)
 		}
 	}()
-	for _, directory := range []string{"manifests", "segments", "catalog", "locator"} {
+	for _, directory := range []string{"manifests", "segments", "catalog", "locator", "registry"} {
 		if err = os.Mkdir(filepath.Join(staging, directory), 0750); err != nil {
 			return result, err
 		}
@@ -216,6 +216,9 @@ func createOnline(store *engine.Store, destination string, term uint64) (result 
 	if err = fsutil.SyncDir(filepath.Join(staging, "locator")); err != nil {
 		return result, err
 	}
+	if err = fsutil.SyncDir(filepath.Join(staging, "registry")); err != nil {
+		return result, err
+	}
 	if err = os.Rename(staging, destination); err != nil {
 		return result, err
 	}
@@ -282,6 +285,10 @@ func Verify(path string) (Result, error) {
 					return Result{}, fmt.Errorf("Snapshot Locator Snapshot is invalid: %w", decodeErr)
 				}
 				locatorSnapshots = append(locatorSnapshots, locatorSnapshot)
+			} else if artifact.ArtifactType == format.ArtifactRegistrySnapshot {
+				if _, decodeErr := format.UnmarshalRegistrySnapshot(encoded); decodeErr != nil {
+					return Result{}, fmt.Errorf("Snapshot Registry Snapshot is invalid: %w", decodeErr)
+				}
 			}
 		default:
 			return Result{}, fmt.Errorf("unsupported Snapshot Artifact type %d", artifact.ArtifactType)

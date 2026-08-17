@@ -198,6 +198,9 @@ func UnmarshalRegistrySnapshot(b []byte) (RegistrySnapshot, error) {
 		if e != nil {
 			return s, e
 		}
+		if idx.EntryCount > RegistryBlockEntriesV1 {
+			return s, invalidf("Registry Block exceeds entry limit")
+		}
 		blocks = append(blocks, idx)
 		pos = next
 	}

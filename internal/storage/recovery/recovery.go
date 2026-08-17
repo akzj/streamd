@@ -55,6 +55,12 @@ func OpenWithOptions(root string, options Options) (*Result, error) {
 	hasCheckpoint := false
 	byStream := make(map[uint64][]extent)
 	if hasManifest {
+		if reference, found, findErr := registry.FindReference(current); findErr == nil && found {
+			if snapshot, openErr := registry.OpenCheckpoint(root, reference, current.Header.LastEntryID, 64); openErr == nil {
+				result.Registry = registry.NewWithSnapshot(snapshot)
+				reg = result.Registry
+			}
+		}
 		if current.Header.RecordCount > 0 {
 			checkpointID = current.Header.LastEntryID
 			checkpointCRC = current.Header.LastEntryCRC32C
@@ -85,6 +91,10 @@ func OpenWithOptions(root string, options Options) (*Result, error) {
 		result.Close()
 		return nil, fmt.Errorf("committed recovery watermark %d is behind Manifest checkpoint %d", *options.ApplyThrough, checkpointID)
 	}
+	if reg.HasSnapshot() {
+		descriptors := append([]segment.Descriptor(nil), result.Segments...)
+		reg.SetFallback(func() ([]registry.Mapping, error) { return registry.RebuildMappings(root, descriptors) })
+	}
 	for streamID, extents := range byStream {
 		slices.SortFunc(extents, func(a, b extent) int {
 			if a.directory.FirstSequence < b.directory.FirstSequence {
@@ -105,7 +115,7 @@ func OpenWithOptions(root string, options Options) (*Result, error) {
 			}
 			tail = memtable.Tail{NextSequence: d.FirstSequence + d.RecordCount, NextByteOffset: d.NextByteOffset, LastRecordedAt: d.LastRecordedAt, LastEntryID: d.LastEntryID, RecordCount: tail.RecordCount + d.RecordCount}
 			latestSegmentID = e.descriptor.Reference.SegmentID
-			if streamID == registry.RegistryStreamID {
+			if streamID == registry.RegistryStreamID && !reg.HasSnapshot() {
 				reader, openErr := segment.OpenReference(root, e.descriptor.Reference)
 				if openErr != nil {
 					result.Close()
@@ -135,6 +145,16 @@ func OpenWithOptions(root string, options Options) (*Result, error) {
 			if lookupErr != nil || !found || slot.NextSequence != tail.NextSequence || slot.NextByteOffset != tail.NextByteOffset || slot.LastRecordedAt != tail.LastRecordedAt || slot.LastEntryID != tail.LastEntryID || slot.AppliedEntryID != checkpointID || slot.LatestSegmentID != latestSegmentID {
 				_ = result.TailCatalog.Close()
 				result.TailCatalog = nil
+			}
+		}
+		if streamID == registry.RegistryStreamID && reg.HasSnapshot() && uint64(reg.Count()) != tail.RecordCount {
+			if err = reg.RebuildFromFacts(); err != nil {
+				result.Close()
+				return nil, fmt.Errorf("Registry Snapshot fact rebuild failed: %w", err)
+			}
+			if uint64(reg.Count()) != tail.RecordCount {
+				result.Close()
+				return nil, fmt.Errorf("Registry facts do not match Registry Stream count")
 			}
 		}
 		if err = table.SeedTail(streamID, tail); err != nil {

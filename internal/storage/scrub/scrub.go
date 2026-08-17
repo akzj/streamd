@@ -112,6 +112,11 @@ func scrubArtifact(root string, reference format.ArtifactReference) (uint64, err
 		return 0, fmt.Errorf("Artifact %x digest mismatch", reference.ArtifactID)
 	}
 	if reference.ArtifactType != format.ArtifactLocatorSnapshot {
+		if reference.ArtifactType == format.ArtifactRegistrySnapshot {
+			if _, decodeErr := format.UnmarshalRegistrySnapshot(data); decodeErr != nil {
+				return 0, decodeErr
+			}
+		}
 		return 1, nil
 	}
 	snapshot, err := format.UnmarshalLocatorSnapshot(data)

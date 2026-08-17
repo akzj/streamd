@@ -281,7 +281,7 @@ func TestCheckpointPublishesSegmentRotatesWALAndRestarts(t *testing.T) {
 	if !created || manifest.Header.RecordCount != 3 || len(manifest.SegmentReferences) != 1 {
 		t.Fatalf("checkpoint Manifest = %+v, created = %v", manifest, created)
 	}
-	if len(manifest.ArtifactReferences) != 2 || manifest.ArtifactReferences[0].ArtifactType != format.ArtifactTailCatalog || manifest.ArtifactReferences[1].ArtifactType != format.ArtifactLocatorSnapshot || store.state.TailCatalog == nil || store.state.Locator == nil || store.state.TailCatalog.Header().ManifestGeneration != manifest.Header.Generation {
+	if len(manifest.ArtifactReferences) != 3 || manifest.ArtifactReferences[0].ArtifactType != format.ArtifactTailCatalog || manifest.ArtifactReferences[1].ArtifactType != format.ArtifactLocatorSnapshot || manifest.ArtifactReferences[2].ArtifactType != format.ArtifactRegistrySnapshot || store.state.TailCatalog == nil || store.state.Locator == nil || !store.state.Registry.HasSnapshot() || store.state.TailCatalog.Header().ManifestGeneration != manifest.Header.Generation {
 		t.Fatalf("checkpoint Tail Catalog was not installed: %+v", manifest.ArtifactReferences)
 	}
 	if _, created, err = store.Checkpoint(); err != nil || created {
@@ -305,6 +305,12 @@ func TestCheckpointPublishesSegmentRotatesWALAndRestarts(t *testing.T) {
 	defer store.Close()
 	if store.state.TailCatalog == nil {
 		t.Fatal("Tail Catalog was not recovered")
+	}
+	if !store.state.Registry.HasSnapshot() {
+		t.Fatal("Registry Snapshot was not recovered")
+	}
+	if overlay := store.state.Registry.MappingsAfter(0); len(overlay) != 0 {
+		t.Fatalf("Registry recovery retained %d checkpoint mappings in memory Overlay", len(overlay))
 	}
 	read, err = store.Read("agent", "events", 0, 10, 0)
 	if err != nil || len(read.Records) != 3 || string(read.Records[2].Payload) != "three" {
@@ -556,5 +562,88 @@ func TestRecoveryRebuildsWhenLocatorSnapshotIsCorrupt(t *testing.T) {
 	result, err := store.Read("agent", "events", 0, 10, 0)
 	if err != nil || len(result.Records) != 1 {
 		t.Fatalf("fallback Read = %+v, %v", result, err)
+	}
+}
+
+func TestRegistryBlockCorruptionFallsBackToRegistryStream(t *testing.T) {
+	dir := t.TempDir()
+	store, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.Append(context.Background(), AppendRequest{Namespace: "agent", Stream: "events", RequestID: []byte("one"), Producer: "test", Records: []InputRecord{{Payload: []byte("one")}}}); err != nil {
+		t.Fatal(err)
+	}
+	manifest, created, err := store.Checkpoint()
+	if err != nil || !created {
+		t.Fatalf("Checkpoint created=%v error=%v", created, err)
+	}
+	if err = store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var reference format.ArtifactReference
+	for _, artifact := range manifest.ArtifactReferences {
+		if artifact.ArtifactType == format.ArtifactRegistrySnapshot {
+			reference = artifact
+		}
+	}
+	path := filepath.Join(dir, filepath.FromSlash(reference.Path))
+	encoded, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	header, err := format.UnmarshalRegistrySnapshotHeader(encoded[:format.RegistrySnapshotHeaderLength])
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = file.WriteAt([]byte{0xff}, int64(header.EntriesOffset+8)); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if err = file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	result, err := store.Read("agent", "events", 0, 10, 0)
+	if err != nil || len(result.Records) != 1 {
+		t.Fatalf("Registry fallback Read = %+v, %v", result, err)
+	}
+	if store.state.Registry.HasSnapshot() {
+		t.Fatal("corrupt Registry Snapshot remained installed after fallback")
+	}
+}
+
+func TestCompactionPreservesRegistryOverlayAfterCheckpoint(t *testing.T) {
+	dir := t.TempDir()
+	store, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	for i, payload := range []string{"one", "two"} {
+		if _, err = store.Append(context.Background(), AppendRequest{Namespace: "agent", Stream: "events", ExpectedSequence: uint64(i), RequestID: []byte(payload), Producer: "test", Records: []InputRecord{{Payload: []byte(payload)}}}); err != nil {
+			t.Fatal(err)
+		}
+		if _, created, checkpointErr := store.Checkpoint(); checkpointErr != nil || !created {
+			t.Fatalf("Checkpoint created=%v error=%v", created, checkpointErr)
+		}
+	}
+	if _, err = store.Append(context.Background(), AppendRequest{Namespace: "agent", Stream: "active", RequestID: []byte("active"), Producer: "test", Records: []InputRecord{{Payload: []byte("active")}}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.Compact(CompactionOptions{MinSegments: 2, MaxInputSegments: 4, MaxInputBytes: 64 << 20}); err != nil {
+		t.Fatal(err)
+	}
+	result, err := store.Read("agent", "active", 0, 10, 0)
+	if err != nil || len(result.Records) != 1 || string(result.Records[0].Payload) != "active" {
+		t.Fatalf("active Registry overlay Read = %+v, %v", result, err)
 	}
 }

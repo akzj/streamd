@@ -39,14 +39,14 @@ func TestCreateVerifyAndScrubSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if verified.SnapshotID != created.SnapshotID || verified.Artifacts != created.Artifacts || verified.Artifacts != 5 {
+	if verified.SnapshotID != created.SnapshotID || verified.Artifacts != created.Artifacts || verified.Artifacts != 6 {
 		t.Fatalf("created = %+v, verified = %+v", created, verified)
 	}
 	report, err := scrub.DataRoot(data)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if report.Segments != 1 || report.Records != 2 || report.Artifacts != 3 {
+	if report.Segments != 1 || report.Records != 2 || report.Artifacts != 4 {
 		t.Fatalf("scrub report = %+v", report)
 	}
 	packs, err := filepath.Glob(filepath.Join(destination, "locator", "*.loc"))
