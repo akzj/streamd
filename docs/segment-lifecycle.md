@@ -194,6 +194,12 @@ Flush/Merge 为每个受影响 Stream 生成新 Extent：
 
 Locator 是投影。发布失败时可以从 Segment Directory 重建，不能反向决定 Segment 是否删除。
 
+当前 V1 Runtime 每次 Checkpoint/Merge 从该 Generation 的完整 Segment Descriptor 集构建一个
+新的 Sealed Pack 和 Locator Snapshot，不复用 Active Pack。Page 内 Extent 连续，超过单页容量时
+通过 Previous Pointer 串联；格式支持 Skip Pointer，但当前 Builder 尚不生成。新 Manifest、Tail
+Catalog 和 Locator Snapshot 同代发布，切换 Reader View 后才退休旧 Snapshot/Pack；在线 Snapshot
+复制期间 Pack 受 Pin 保护。Active Pack 增量追加与跨 Pack Skip 属于后续优化。
+
 ## 8. Snapshot Pin
 
 ### 8.1 创建

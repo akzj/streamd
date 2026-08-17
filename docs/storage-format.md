@@ -971,6 +971,11 @@ LocatorRootEntry {             // fixed 40 bytes
 
 Locator Snapshot 只引用 Sealed Pack。它是投影，格式损坏时可以扫描当前 Manifest 的 Segment Directory 重建，不能据此删除 Segment。
 
+实现说明：当前 V1 Builder 为每个 Manifest Generation 生成一个完整 Sealed Pack；多页 Stream 生成
+Previous Pointer 链，暂不生成 Skip Pointer。Runtime 按 Root 延迟读取 Page，并使用有界 LRU 缓存
+已校验 Metadata；Snapshot/Pin/Scrub/Retirement 必须沿 Locator Snapshot 显式遍历 Pack，因为 Pack
+不是 Manifest 的直接 Artifact Reference。
+
 ## 10. Stream Registry Snapshot V1
 
 Stream Registry 的事实变更必须进入 WAL；Registry Snapshot 只是加速恢复的 Checkpoint。

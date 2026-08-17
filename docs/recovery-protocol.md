@@ -182,7 +182,11 @@ Primary 不单独决定尾部：
 
 ### 10.3 Locator
 
-加载 Locator Snapshot 和 Sealed Pack。缺失或损坏时扫描当前 Manifest 的 Segment Directory，重建 Extent 链和 Root。
+加载并校验 Locator Snapshot；Sealed Pack 不在启动时整体读取，而是在 Page Cache Miss 时按需校验
+Pack Header/Footer 和目标 Page CRC。Snapshot 缺失或损坏时不安装 Locator；Pack/Page 在运行时
+缺失或损坏时回退当前 Manifest 的 Segment Descriptor。当前 V1 Runtime 不在启动阶段立即重写
+Locator，下一次 Checkpoint/Merge 会从 Segment Directory 发布新的 Pack、Snapshot、Root 和 Tail
+Pointer。
 
 ### 10.4 Unified Index
 
