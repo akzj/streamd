@@ -16,12 +16,17 @@ import (
 	"time"
 
 	streamdv1 "github.com/akzj/streamd/api/streamd/v1"
+	dto "github.com/prometheus/client_model/go"
+	"github.com/prometheus/common/expfmt"
+	"github.com/prometheus/common/model"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 )
 
 const (
 	primaryAddress = "streamd-primary:7443"
+	primaryMetrics = "http://streamd-primary:9090/metrics"
+	standbyMetrics = "http://streamd-standby:9090/metrics"
 	proxyAPI       = "http://toxiproxy:8474"
 )
 
@@ -83,6 +88,21 @@ func TestComposeStrictHA(t *testing.T) {
 			t.Fatalf("idempotent Append response = %+v", repeated)
 		}
 		assertRecords(t, client, 1, "replicated")
+	})
+
+	t.Run("metrics expose strict replication state", func(t *testing.T) {
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			primary, primaryErr := fetchMetrics(primaryMetrics)
+			standby, standbyErr := fetchMetrics(standbyMetrics)
+			if primaryErr == nil && standbyErr == nil && strictMetricsReady(primary, standby) {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("Strict HA metrics did not converge: primary_error=%v standby_error=%v", primaryErr, standbyErr)
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
 	})
 
 }
@@ -280,6 +300,76 @@ func updateStandbyProxy(enabled bool) error {
 		return fmt.Errorf("update Standby proxy: %s", response.Status)
 	}
 	return nil
+}
+
+func fetchMetrics(address string) (map[string]*dto.MetricFamily, error) {
+	client := &http.Client{Timeout: 3 * time.Second}
+	response, err := client.Get(address)
+	if err != nil {
+		return nil, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("GET %s: %s", address, response.Status)
+	}
+	parser := expfmt.NewTextParser(model.UTF8Validation)
+	return parser.TextToMetricFamilies(response.Body)
+}
+
+func strictMetricsReady(primary, standby map[string]*dto.MetricFamily) bool {
+	primaryTerm, ok := gaugeValue(primary, "streamd_leadership_term", nil)
+	if !ok || primaryTerm <= 0 || !gaugeEquals(primary, "streamd_node_info", map[string]string{"role": "primary", "durability": "replicated_strict"}, 1) ||
+		!gaugeEquals(primary, "streamd_write_ready", nil, 1) || !gaugeEquals(primary, "streamd_observer_collection_success", nil, 1) {
+		return false
+	}
+	standbyTerm, ok := gaugeValue(standby, "streamd_leadership_term", nil)
+	if !ok || standbyTerm != primaryTerm || !gaugeEquals(standby, "streamd_node_info", map[string]string{"role": "standby", "durability": "replicated_strict"}, 1) ||
+		!gaugeEquals(standby, "streamd_write_ready", nil, 0) || !gaugeEquals(standby, "streamd_observer_collection_success", nil, 1) {
+		return false
+	}
+	primaryCommitted, ok := gaugeValue(primary, "streamd_watermark_entry_id", map[string]string{"stage": "committed"})
+	if !ok || !gaugeEquals(primary, "streamd_watermark_present", map[string]string{"stage": "committed"}, 1) ||
+		!gaugeEquals(primary, "streamd_watermark_entry_id", map[string]string{"stage": "appended"}, primaryCommitted) ||
+		!gaugeEquals(primary, "streamd_watermark_entry_id", map[string]string{"stage": "local_durable"}, primaryCommitted) ||
+		!gaugeEquals(primary, "streamd_watermark_entry_id", map[string]string{"stage": "replicated"}, primaryCommitted) ||
+		!gaugeEquals(primary, "streamd_watermark_entry_id", map[string]string{"stage": "applied"}, primaryCommitted) {
+		return false
+	}
+	return gaugeEquals(standby, "streamd_watermark_present", map[string]string{"stage": "replicated"}, 0) &&
+		gaugeEquals(standby, "streamd_watermark_entry_id", map[string]string{"stage": "appended"}, primaryCommitted) &&
+		gaugeEquals(standby, "streamd_watermark_entry_id", map[string]string{"stage": "local_durable"}, primaryCommitted) &&
+		gaugeEquals(standby, "streamd_watermark_entry_id", map[string]string{"stage": "committed"}, primaryCommitted) &&
+		gaugeEquals(standby, "streamd_watermark_entry_id", map[string]string{"stage": "applied"}, primaryCommitted)
+}
+
+func gaugeEquals(families map[string]*dto.MetricFamily, name string, labels map[string]string, want float64) bool {
+	value, ok := gaugeValue(families, name, labels)
+	return ok && value == want
+}
+
+func gaugeValue(families map[string]*dto.MetricFamily, name string, labels map[string]string) (float64, bool) {
+	family := families[name]
+	if family == nil {
+		return 0, false
+	}
+	for _, metric := range family.Metric {
+		if metricLabelsMatch(metric.Label, labels) && metric.Gauge != nil {
+			return metric.Gauge.GetValue(), true
+		}
+	}
+	return 0, false
+}
+
+func metricLabelsMatch(pairs []*dto.LabelPair, want map[string]string) bool {
+	if len(pairs) != len(want) {
+		return false
+	}
+	for _, pair := range pairs {
+		if want[pair.GetName()] != pair.GetValue() {
+			return false
+		}
+	}
+	return true
 }
 
 func env(name, fallback string) string {
