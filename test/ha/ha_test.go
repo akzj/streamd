@@ -16,6 +16,7 @@ import (
 	"time"
 
 	streamdv1 "github.com/akzj/streamd/api/streamd/v1"
+	"github.com/akzj/streamd/internal/diagnostics"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/expfmt"
 	"github.com/prometheus/common/model"
@@ -102,6 +103,26 @@ func TestComposeStrictHA(t *testing.T) {
 				t.Fatalf("Strict HA metrics did not converge: primary_error=%v standby_error=%v", primaryErr, standbyErr)
 			}
 			time.Sleep(100 * time.Millisecond)
+		}
+	})
+
+	t.Run("diagnostics share strict replication state", func(t *testing.T) {
+		primary, err := fetchDiagnostics("http://streamd-primary:19090/diagnostics")
+		if err != nil {
+			t.Fatal(err)
+		}
+		standby, err := fetchDiagnostics("http://streamd-standby:19090/diagnostics")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !primary.Ready || !primary.WriteReady || primary.Status != diagnostics.StatusReadyWrite || primary.Role != "primary" || primary.Term == 0 || primary.LeaseExpiresAt == nil || len(primary.Reasons) != 0 {
+			t.Fatalf("Primary diagnostics = %+v", primary)
+		}
+		if !standby.Ready || standby.WriteReady || standby.Status != diagnostics.StatusReadyRead || standby.Role != "standby" || standby.Term != primary.Term || len(standby.Reasons) != 0 {
+			t.Fatalf("Standby diagnostics = %+v", standby)
+		}
+		if primary.Watermarks.Committed == nil || standby.Watermarks.Committed == nil || *standby.Watermarks.Committed != *primary.Watermarks.Committed || standby.Watermarks.Replicated != nil {
+			t.Fatalf("diagnostic watermarks differ: primary=%+v standby=%+v", primary.Watermarks, standby.Watermarks)
 		}
 	})
 
@@ -314,6 +335,23 @@ func fetchMetrics(address string) (map[string]*dto.MetricFamily, error) {
 	}
 	parser := expfmt.NewTextParser(model.UTF8Validation)
 	return parser.TextToMetricFamilies(response.Body)
+}
+
+func fetchDiagnostics(address string) (diagnostics.Snapshot, error) {
+	client := &http.Client{Timeout: 3 * time.Second}
+	response, err := client.Get(address)
+	if err != nil {
+		return diagnostics.Snapshot{}, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return diagnostics.Snapshot{}, fmt.Errorf("GET %s: %s", address, response.Status)
+	}
+	var snapshot diagnostics.Snapshot
+	if err = json.NewDecoder(response.Body).Decode(&snapshot); err != nil {
+		return diagnostics.Snapshot{}, err
+	}
+	return snapshot, nil
 }
 
 func strictMetricsReady(primary, standby map[string]*dto.MetricFamily) bool {
