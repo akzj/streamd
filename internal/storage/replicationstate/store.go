@@ -68,6 +68,44 @@ func (s *Store) Current() (format.ReplicationState, bool) {
 	return *s.current, true
 }
 
+// Previous returns the immutable state directly referenced by the current
+// generation. Orphan files from interrupted publications are ignored: only a
+// state whose content hash matches the current generation chain is accepted.
+func (s *Store) Previous() (format.ReplicationState, bool, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.current == nil || s.current.Header.Generation == 0 {
+		return format.ReplicationState{}, false, nil
+	}
+	pattern := filepath.Join(s.root, "meta", fmt.Sprintf("REPLICATION-STATE-%020d-*.bin", s.current.Header.PreviousGeneration))
+	paths, err := filepath.Glob(pattern)
+	if err != nil {
+		return format.ReplicationState{}, false, err
+	}
+	var matched *format.ReplicationState
+	for _, path := range paths {
+		encoded, readErr := os.ReadFile(path)
+		if readErr != nil {
+			return format.ReplicationState{}, false, readErr
+		}
+		state, decodeErr := format.UnmarshalReplicationState(encoded)
+		if decodeErr != nil || state.Footer.ContentSHA256 != s.current.Header.PreviousStateSHA256 {
+			continue
+		}
+		if state.Header.Generation != s.current.Header.PreviousGeneration || state.Header.GroupID != s.groupID || state.Header.NodeID != s.nodeID {
+			return format.ReplicationState{}, false, fmt.Errorf("previous Replication State does not continue current identity")
+		}
+		if matched != nil {
+			return format.ReplicationState{}, false, fmt.Errorf("multiple previous Replication States match current generation")
+		}
+		matched = &state
+	}
+	if matched == nil {
+		return format.ReplicationState{}, false, fmt.Errorf("previous Replication State referenced by current generation is missing")
+	}
+	return *matched, true, nil
+}
+
 func (s *Store) Publish(next format.ReplicationState) (format.ReplicationState, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

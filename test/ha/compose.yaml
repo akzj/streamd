@@ -222,6 +222,7 @@ services:
     volumes:
       - primary-data:/var/lib/streamd
       - snapshot-data:/var/lib/streamd/snapshots
+    network_mode: none
     profiles: [maintenance]
 
   maintenance-standby:
@@ -232,6 +233,29 @@ services:
     volumes:
       - standby-data:/var/lib/streamd
       - snapshot-data:/snapshots:ro
+    network_mode: none
+    profiles: [maintenance]
+
+  maintenance-failover-primary:
+    build:
+      context: ../..
+      dockerfile: test/ha/Dockerfile
+      target: streamd-tool
+    volumes:
+      - standby-data:/var/lib/streamd
+      - snapshot-data:/var/lib/streamd/snapshots
+    network_mode: none
+    profiles: [maintenance]
+
+  maintenance-former-primary:
+    build:
+      context: ../..
+      dockerfile: test/ha/Dockerfile
+      target: streamd-tool
+    volumes:
+      - primary-data:/var/lib/streamd
+      - snapshot-data:/snapshots:ro
+    network_mode: none
     profiles: [maintenance]
 
   reset-standby:
@@ -243,6 +267,19 @@ services:
     command: ["find /var/lib/streamd -mindepth 1 -maxdepth 1 ! -name NODE -exec rm -rf -- {} +"]
     volumes:
       - standby-data:/var/lib/streamd
+    network_mode: none
+    profiles: [maintenance]
+
+  reset-primary:
+    build:
+      context: ../..
+      dockerfile: test/ha/Dockerfile
+      target: streamd-tool
+    entrypoint: ["/bin/sh", "-ec"]
+    command: ["find /var/lib/streamd -mindepth 1 -maxdepth 1 ! -name NODE -exec rm -rf -- {} +"]
+    volumes:
+      - primary-data:/var/lib/streamd
+    network_mode: none
     profiles: [maintenance]
 
 networks:

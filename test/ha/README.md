@@ -44,9 +44,12 @@ restart and verifies Strict writes resume under a new safe runtime state.
 
 The process failover drill then kills the Primary, waits for its Lease to
 expire, promotes the former Standby with a new Term, and starts the old Primary
-as the replacement Standby. It appends on the promoted node, fails back, and
-reads that append from the former Primary to prove Rejoin persisted the new
-committed prefix.
+as the replacement Standby. It appends on the promoted node, then snapshots the
+surviving Primary and reinstalls the former Primary before failback. This
+deliberately covers the crash window where a newer local Manifest exists but
+the durable committed checkpoint is older; the harness never truncates or
+trusts that suffix. It reads the append after failback to prove Snapshot Rejoin
+preserved the committed prefix.
 
 Finally, the suite creates and verifies an offline installable Snapshot, runs
 the guarded WAL collector, resets only the disposable Standby data volume,
@@ -57,3 +60,6 @@ On failure the harness still removes containers, networks, and volumes, but
 first preserves service logs below `.tmp/ha-artifacts/`. CI uploads that
 directory as a short-lived diagnostic artifact. The nightly workflow runs ten
 fresh projects; the 100-run command is the release-candidate stability gate.
+All offline maintenance containers use `network_mode: none`, and cleanup loads
+both test and maintenance profiles so one-shot commands cannot leak Compose
+default networks.

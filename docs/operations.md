@@ -177,6 +177,12 @@ Strict 节点使用同一个二进制。Primary 的关键配置如下，Standby 
 Standby 只注册内部 ReplicationService，不接受公共 Append。所需 WAL 已 GC 时 Primary 保持不就绪，
 运维先按 Snapshot Install Runbook 恢复 Standby，再重启 Primary 完成增量追赶。
 
+所有 Single、Primary 和 Standby 启动路径都在打开 Engine、连接 Coordinator 或监听网络以前检查
+`SNAPSHOT-INSTALL.json`，并完成可恢复的安装事务。存在无效或无法完成的 Journal 时节点失败关闭，
+不能跳过安装使用旧 CURRENT 启动。持久 Replication State 为 PRIMARY、STANDBY 或 RECOVERING 的
+数据目录不能按 Single Engine 打开；角色变更必须走 Coordinator/Promotion/Rejoin，而不是修改配置
+绕过复制语义。
+
 状态：
 
 ```text
@@ -296,10 +302,22 @@ streamd-tool verify-snapshot -path /backup/streamd-snapshot-001
 三个命令都会失败关闭。`scrub` 需要取得数据目录独占锁并逐 Frame、Segment SHA-256、Manifest 引用、Stream Extent 和 WAL 链校验；`snapshot` 同样要求节点离线，先完成 Checkpoint，再原子发布包含 CURRENT、Manifest、全部 Segment 和 Snapshot Manifest 的新目录。目标目录不得位于数据根内部且必须尚不存在。
 
 离线 `snapshot` 只接受 Single 数据目录。它遇到 PRIMARY、STANDBY 或 RECOVERING Replication
-State 时必须拒绝，不能按 Single 恢复规则把物理 WAL 尾部推断为 committed。Strict HA Snapshot
-只能由运行中的 Strict Primary Engine 创建：创建前后都要求节点无 fatal、Lease Guard 可写，并验证
-Snapshot Checkpoint 不晚于 committed watermark。当前 `CreateOnline` 是内部集成入口，尚未提供管理
-RPC 或周期调度；在该入口接入以前，Strict HA 不得使用离线命令替代。
+State 时必须拒绝，不能按 Single 恢复规则把物理 WAL 尾部推断为 committed。
+
+Strict HA 有两个独立安全入口：运行中的 Strict Primary Engine 可以调用 `CreateOnline`，创建前后验证
+fatal、Lease Guard 和 committed watermark；显式停机维护使用：
+
+```bash
+streamd-tool snapshot-primary \
+  -data /var/lib/streamd \
+  -out /var/lib/streamd/snapshots/checkpoint
+```
+
+`snapshot-primary` 接受 durable Strict PRIMARY，或正常释放 Lease 后的 RECOVERING，但后者必须通过
+Replication State 的 hash-linked generation chain 证明其紧邻前态是同 Term Strict PRIMARY。普通
+Standby/Recovering 因此不能冒充 Primary。命令通过 replicated Engine 按 committed watermark 恢复；
+存在任何超过 committed 的 durable WAL suffix 时失败关闭，也不会把离线状态伪装成仍持有 Lease。
+当前 `CreateOnline` 尚未提供管理 RPC 或周期调度，HA Runbook 使用明确的停机 `snapshot-primary` 路径。
 
 ### 9.1 策略
 

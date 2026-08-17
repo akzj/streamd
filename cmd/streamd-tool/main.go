@@ -39,6 +39,15 @@ func main() {
 			usage()
 		}
 		result, err = snapshot.Create(*data, *out)
+	case "snapshot-primary":
+		flags := flag.NewFlagSet("snapshot-primary", flag.ExitOnError)
+		data := flags.String("data", "", "offline Strict Primary or cleanly released Primary data directory")
+		out := flags.String("out", "", "new Snapshot directory")
+		_ = flags.Parse(os.Args[2:])
+		if *data == "" || *out == "" {
+			usage()
+		}
+		result, err = snapshot.CreatePrimaryOffline(*data, *out)
 	case "verify-snapshot":
 		flags := flag.NewFlagSet("verify-snapshot", flag.ExitOnError)
 		path := flags.String("path", "", "Snapshot directory")
@@ -100,7 +109,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: streamd-tool scrub -data DIR | snapshot -data DIR -out DIR | verify-snapshot -path DIR | install-snapshot -data DIR -path DIR -term N -leader-id UUID | resume-install -data DIR | collect-wal -data DIR -snapshot DIR [-max-retained-bytes N]")
+	fmt.Fprintln(os.Stderr, "usage: streamd-tool scrub -data DIR | snapshot -data DIR -out DIR | snapshot-primary -data DIR -out DIR | verify-snapshot -path DIR | install-snapshot -data DIR -path DIR -term N -leader-id UUID | resume-install -data DIR | collect-wal -data DIR -snapshot DIR [-max-retained-bytes N]")
 	os.Exit(2)
 }
 

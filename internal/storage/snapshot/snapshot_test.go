@@ -13,6 +13,7 @@ import (
 	"github.com/akzj/streamd/internal/storage/format"
 	"github.com/akzj/streamd/internal/storage/replicationstate"
 	"github.com/akzj/streamd/internal/storage/scrub"
+	"github.com/akzj/streamd/internal/storage/wal"
 )
 
 var errInstallCrash = errors.New("install crash")
@@ -163,6 +164,93 @@ func TestOfflineCreateRejectsReplicatedDataRoot(t *testing.T) {
 	if _, statErr := os.Stat(destination); !errors.Is(statErr, os.ErrNotExist) {
 		t.Fatalf("rejected Snapshot destination exists: %v", statErr)
 	}
+	primarySnapshot := filepath.Join(t.TempDir(), "primary-snapshot")
+	created, err := CreatePrimaryOffline(data, primarySnapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.Term != 7 || created.CheckpointEntryID != manifest.Header.LastEntryID {
+		t.Fatalf("offline Primary Snapshot = %+v", created)
+	}
+	if _, err = states.Update(time.Now(), func(header *format.ReplicationStateHeader) error {
+		header.Role = format.ReplicationRoleRecovering
+		header.HasLeader = false
+		header.LeaderID = format.UUID{}
+		header.HasLease = false
+		header.LeaseExpiresAt = 0
+		header.Replicated = format.ReplicationPosition{}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = CreatePrimaryOffline(data, filepath.Join(t.TempDir(), "released-primary-snapshot")); err != nil {
+		t.Fatalf("cleanly released Primary Snapshot: %v", err)
+	}
+
+	log, err := wal.OpenWithPrevious(data, manifest.Header.LastEntryCRC32C)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entryID := log.NextEntryID()
+	frame, err := format.MarshalRecordFrame(format.RecordFrame{EntryID: entryID, StreamID: 99, BatchCount: 1, RequestID: []byte("suffix"), Producer: "test", Payload: []byte("uncommitted")})
+	if err != nil {
+		log.Close()
+		t.Fatal(err)
+	}
+	encoded, err := format.MarshalWALEntry(7, log.PreviousEntryCRC32C(), frame)
+	if err != nil {
+		log.Close()
+		t.Fatal(err)
+	}
+	if err = log.Append(encoded); err == nil {
+		err = log.Sync()
+	}
+	if closeErr := log.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = CreatePrimaryOffline(data, filepath.Join(t.TempDir(), "unsafe-primary-snapshot")); err == nil || !strings.Contains(err.Error(), "unresolved durable WAL suffix") {
+		t.Fatalf("unresolved Primary suffix Snapshot error = %v", err)
+	}
+}
+
+func TestOfflinePrimaryRejectsRecoveringFormerStandby(t *testing.T) {
+	data := t.TempDir()
+	node := format.NodeIdentity{ClusterID: snapshotID(1), GroupID: snapshotID(2), NodeID: snapshotID(3), CreatedAt: 1}
+	store, err := engine.OpenWithIdentity(data, node)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	states, err := replicationstate.Open(data, node)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = states.Update(time.Now(), func(header *format.ReplicationStateHeader) error {
+		header.Term = 7
+		header.Role = format.ReplicationRoleStandby
+		header.Durability = format.ReplicationDurabilityStrict
+		header.HasLeader = true
+		header.LeaderID = snapshotID(4)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = states.Update(time.Now(), func(header *format.ReplicationStateHeader) error {
+		header.Role = format.ReplicationRoleRecovering
+		header.HasLeader = false
+		header.LeaderID = format.UUID{}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = CreatePrimaryOffline(data, filepath.Join(t.TempDir(), "snapshot")); err == nil || !strings.Contains(err.Error(), "directly continue a Strict PRIMARY") {
+		t.Fatalf("former Standby Snapshot error = %v", err)
+	}
 }
 
 func TestCreateOnlineStrictPrimaryRequiresCommittedWritableSource(t *testing.T) {
@@ -279,7 +367,7 @@ func TestInstallAndCrashResumeAreAtomic(t *testing.T) {
 			if resumeErr != nil || resumed {
 				t.Fatalf("completed Resume = %v, %v", resumed, resumeErr)
 			}
-			reopened, openErr := engine.OpenWithIdentity(target, targetNode)
+			reopened, openErr := engine.OpenReplicated(target, targetNode, engine.ReplicationOptions{Term: 7, Role: format.ReplicationRoleStandby, Durability: format.ReplicationDurabilityStrict, Guard: &snapshotGuard{}})
 			if openErr != nil {
 				t.Fatal(openErr)
 			}

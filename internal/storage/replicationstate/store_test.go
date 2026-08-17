@@ -44,6 +44,10 @@ func TestPublishReopenAndContinueGeneration(t *testing.T) {
 	if !ok || current.Header.StateID != second.Header.StateID || current.Header.Generation != 1 {
 		t.Fatalf("current = %+v, ok = %v", current, ok)
 	}
+	previous, ok, err := reopened.Previous()
+	if err != nil || !ok || previous.Header.StateID != first.Header.StateID || previous.Footer.ContentSHA256 != second.Header.PreviousStateSHA256 {
+		t.Fatalf("previous = %+v, ok = %v, error = %v", previous, ok, err)
+	}
 	files, err := filepath.Glob(filepath.Join(root.Path(), "meta", "REPLICATION-STATE-*.bin"))
 	if err != nil || len(files) != 2 {
 		t.Fatalf("State files = %v, error = %v", files, err)

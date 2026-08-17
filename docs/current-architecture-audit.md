@@ -5,7 +5,7 @@
 | 审计性质 | 代码现实版整体架构审计，不是目标架构复述 |
 | 审计基线 | `ddbbdd4f6202cddea07bd7e3f978415c5fa1d560` |
 | 审计日期 | 2026-08-17 |
-| 审计后实施 | Snapshot Safety Boundary；WAL GC Safety Boundary：离线独占锁覆盖 NODE、校验、删除和 State 发布 |
+| 审计后实施 | Snapshot/WAL GC Safety；Role/Install Recovery；显式 `snapshot-primary` 运维恢复路径 |
 | 覆盖范围 | API、存储、索引、Checkpoint、Compaction、恢复、Snapshot、WAL GC、Strict HA、并发与运维入口 |
 | 不在本次范围 | 新功能实现、性能压测、生产部署验收、协议或格式变更 |
 
@@ -279,7 +279,10 @@ Snapshot Manifest、安装 Journal、崩溃续装以及三组 CURRENT 指针切�
 - `CreateOnline(store, ...)` 使用运行中的 Engine，在 Checkpoint 前后验证 Source Role、Strict
   Durability、fatal、Lease Guard 和 committed watermark，但当前节点没有调度或 RPC 接入；
 - `streamd-tool snapshot` 只允许 Single 数据目录；检测到 PRIMARY、STANDBY 或 RECOVERING
-  Replication State 时失败关闭。
+  Replication State 时失败关闭；
+- `streamd-tool snapshot-primary` 只允许停止的 durable Strict Primary，或由 hash-linked 紧邻前态证明
+  是同 Term Primary 的 cleanly released RECOVERING；按 committed state 打开 replicated Engine，并拒绝
+  任何超过 committed 的物理 WAL suffix。
 
 WAL GC 要求当前 Manifest、已验证且位于 `data/snapshots/` 的 Snapshot，以及 replication state 的
 committed 证据。它只删除被 Segment 和 Snapshot 同时覆盖的连续 sealed WAL 前缀；Catch-up Pin 会
@@ -419,10 +422,11 @@ Catch-up 使用独立的 WAL file Pin。
 固化进 Manifest。`snapshot.Install` 校验 Artifact 完整性和目标水位，但无法证明来源 Snapshot 的
 checkpoint 曾 committed。
 
-已实施门禁：离线创建检测到 replicated role 后直接拒绝；`CreateOnline` 只接受无 fatal、Lease Guard
-安全的 Strict Primary，并验证 Checkpoint 被 committed watermark 覆盖。仍未完成的是把该安全在线
-入口接入 Primary 的管理或自动化生命周期，因此当前状态是“拒绝不安全操作”，不是“HA Snapshot
-生产闭环已经完成”。
+已实施门禁：普通离线创建检测到 replicated role 后直接拒绝；`CreateOnline` 只接受无 fatal、Lease
+Guard 安全的 Strict Primary，并验证 Checkpoint 被 committed watermark 覆盖；显式离线
+`snapshot-primary` 要求 durable Primary provenance，并由 Engine 拒绝 unresolved suffix。正常关闭产生的
+RECOVERING 只有在紧邻前态为同 Term Primary 时才成立。在线自动调度仍未实现，但 HA 运维恢复不再依赖
+不安全的 Single 推断。
 
 #### P0-2 WAL GC 没有代码级独占运行保证（Safety Boundary 已实施）
 
@@ -434,24 +438,28 @@ checkpoint 曾 committed。
 Replication State；Manager 持锁完成 Snapshot 校验、WAL 删除和 State 发布，显式 `Close` 后才释放。
 CLI 在成功和失败路径都关闭 Manager；在线 Store 与 Retention Manager 互相排斥，并由测试验证。
 
-#### P0-3 Snapshot Catch-up/Rejoin 不构成可运行 HA 恢复闭环
+#### P0-3 Snapshot Catch-up/Rejoin 不构成自动 HA 恢复闭环（显式运维闭环已验证）
 
-一旦 Standby 落后超过 earliest WAL、空盘或拥有 divergent suffix，自动路径无法恢复服务。当前必须
-依赖人工停机、传输 Snapshot、执行工具、必要时 `resume-install`、再按正确角色启动。运行时尚不能
-兑现设计文档中的 SnapshotOffer/SnapshotInstalled/Rejoin 行为。
+一旦 Standby 落后超过 earliest WAL、空盘或拥有 divergent suffix，自动路径仍无法恢复服务。当前
+采用明确的运维状态机：停止节点、`snapshot-primary`、校验、WAL GC、重置/安装 Standby、启动后增量
+追赶。Compose Strict HA 套件执行该完整路径。运行时尚未实现设计文档中的在线
+SnapshotOffer/SnapshotInstalled/Rejoin 消息。
 
-门禁：在声称单节点永久故障可恢复前，至少完成自动或严格 Runbook 驱动的端到端流程，并用真实双
-节点故障注入验证。
+当前门禁：可以声称显式停机 Runbook 的空盘 Standby 恢复经过自动化验证；不能声称自动 Snapshot
+Catch-up、无停机恢复或通用 divergent suffix truncate 已实现。
 
 ### P1：继续扩展功能前解决或冻结明确约束
 
-#### P1-1 角色启动与 Snapshot install resume 不统一
+#### P1-1 角色启动与 Snapshot install resume 不统一（已实施）
 
-Single 启动自动调用 `ResumeInstall`，HA 启动路径不会；HA 依赖显式 `streamd-tool resume-install`。
-同一个数据目录若使用错误的 Single 配置启动，`OpenWithIdentity` 不校验已有 replication role。
+审计基线中 Single 启动自动调用 `ResumeInstall`，HA 启动路径不会；HA 依赖显式
+`streamd-tool resume-install`。同一个数据目录若使用错误的 Single 配置启动，`OpenWithIdentity`
+也不校验已有 replication role。
 
-需要决定：节点启动是否统一先恢复 install journal；数据目录是否永久绑定 deployment mode/group role
-约束；角色迁移只能经过哪些显式状态机。
+已实施边界：Single、Primary、Standby 都在 Engine/Coordinator/Listener 以前调用同一 Resume helper；
+Engine 的 Single open 会加载 NODE 与 Replication State，并拒绝 PRIMARY、STANDBY、RECOVERING。
+Snapshot 安装后的 Standby 数据也必须用 replicated Engine 恢复。后续仍需冻结完整角色迁移状态机，
+但已不能通过错误的 Single 配置绕过现有角色。
 
 #### P1-2 全量 Descriptor/Directory 常驻
 
@@ -493,18 +501,17 @@ Promotion、Snapshot、WAL GC 和运维诊断必须始终区分“持久 state �
 
 ### D1 Snapshot 的生产所有者
 
-推荐：Snapshot 由运行中的正确角色 Engine 生成，Checkpoint 必须不晚于 committed watermark；离线
-工具只做 verify/install/resume，不自行推断 HA commit。
-
-需要决定是否接受该方向，还是保留离线创建但为 Single/HA 分别实现显式恢复模式。
+已采用双入口：在线 Snapshot 由正确角色 Engine 生成；停机维护只能用 `snapshot-primary`，由 durable
+Replication State 及其 hash-linked 前态提供 Primary provenance 和 committed boundary，并拒绝 unresolved
+suffix。普通 `snapshot` 永远不推断 HA commit。
 
 ### D2 HA 恢复是自动协议还是强约束运维流程
 
-两种都可以安全，但不能停留在半自动：
+第一版已经选择强约束运维流程，同时保留未来自动协议方向：
 
 - 自动：Replication RPC 提供 Snapshot 协商、分块传输/对象地址、Pin Lease、安装确认和后续 catch-up；
-- 运维驱动：Primary 明确进入 `NEEDS_SNAPSHOT`，生成带身份的恢复任务，工具执行完整事务，节点只有在
-  状态机确认后重新加入。
+- 运维驱动：当前由失败关闭、`snapshot-primary`、verify、install/resume 和重启 catch-up 组成，并由
+  Compose HA 执行；后续应把 `NEEDS_SNAPSHOT` 诊断和恢复任务身份进一步结构化。
 
 ### D3 Rejoin 是否允许截断未提交后缀
 
@@ -542,7 +549,7 @@ Review 通过后的建议顺序：
 2. WAL GC 代码级独占所有权已完成；后续只在端到端运维测试中验证命令退出和锁恢复；
 3. 冻结 Snapshot Catch-up/Rejoin 的自动化边界；
 4. 完成真实空盘 Standby、WAL 已回收、旧主 divergent suffix 的端到端恢复测试；
-5. 统一 Single/Primary/Standby 的进程生命周期骨架；
+5. Role/Install 恢复前置边界已统一；其余 gRPC/admin/maintenance 进程生命周期骨架仍待抽取；
 6. 再实施 Segment Descriptor/Directory 的有界启动加载；
 7. 执行规模、长稳、磁盘压力、etcd quorum 和恢复演练；
 8. 根据证据把对应设计章节从 Draft 提升为 Implemented/Accepted。

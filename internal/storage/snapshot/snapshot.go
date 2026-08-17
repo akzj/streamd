@@ -1,6 +1,7 @@
 package snapshot
 
 import (
+	"context"
 	"crypto/rand"
 	"errors"
 	"fmt"
@@ -18,6 +19,18 @@ import (
 	"github.com/akzj/streamd/internal/storage/replicationstate"
 	"github.com/akzj/streamd/internal/storage/segment"
 )
+
+type offlinePrimaryGuard struct{}
+
+func (offlinePrimaryGuard) CanCommit() error { return nil }
+
+type offlinePrimaryReplica struct{}
+
+func (offlinePrimaryReplica) Replicate(context.Context, [][]byte) (uint64, error) {
+	return 0, fmt.Errorf("offline Primary Snapshot source cannot append")
+}
+
+func (offlinePrimaryReplica) AdvanceCommit(context.Context, uint64) error { return nil }
 
 type Result struct {
 	Path               string
@@ -56,6 +69,51 @@ func Create(dataRoot, destination string) (result Result, err error) {
 	return createOnline(store, destination, 0)
 }
 
+// CreatePrimaryOffline creates a Snapshot from a stopped Strict Primary. A
+// clean shutdown releases leadership and persists RECOVERING, so that state is
+// accepted only when its hash-linked immediate predecessor is a Strict Primary
+// in the same Term. OpenReplicated revalidates the state under the data-root
+// lock and rejects any WAL suffix beyond committed.
+func CreatePrimaryOffline(dataRoot, destination string) (result Result, err error) {
+	dataAbs, err := filepath.Abs(dataRoot)
+	if err != nil {
+		return result, err
+	}
+	node, err := identity.Load(dataAbs)
+	if err != nil {
+		return result, fmt.Errorf("NODE: %w", err)
+	}
+	states, err := replicationstate.Open(dataAbs, node)
+	if err != nil {
+		return result, fmt.Errorf("Replication State: %w", err)
+	}
+	current, ok := states.Current()
+	if !ok || current.Header.Durability != format.ReplicationDurabilityStrict || current.Header.Term == 0 {
+		return result, fmt.Errorf("offline Primary Snapshot requires durable Strict PRIMARY provenance")
+	}
+	options := engine.ReplicationOptions{Term: current.Header.Term, Role: current.Header.Role, Durability: format.ReplicationDurabilityStrict, Guard: offlinePrimaryGuard{}, ExpectedStateID: current.Header.StateID, RejectUncommittedSuffix: true}
+	switch current.Header.Role {
+	case format.ReplicationRolePrimary:
+		options.Replica = offlinePrimaryReplica{}
+	case format.ReplicationRoleRecovering:
+		previous, found, previousErr := states.Previous()
+		if previousErr != nil {
+			return result, fmt.Errorf("Primary provenance: %w", previousErr)
+		}
+		if !found || previous.Header.Role != format.ReplicationRolePrimary || previous.Header.Durability != format.ReplicationDurabilityStrict || previous.Header.Term != current.Header.Term {
+			return result, fmt.Errorf("offline Primary Snapshot requires RECOVERING state to directly continue a Strict PRIMARY in the same Term")
+		}
+	default:
+		return result, fmt.Errorf("offline Primary Snapshot requires durable Strict PRIMARY provenance")
+	}
+	store, err := engine.OpenReplicated(dataAbs, node, options)
+	if err != nil {
+		return result, err
+	}
+	defer func() { err = errors.Join(err, store.Close()) }()
+	return create(store, destination, current.Header.Term, true)
+}
+
 // CreateOnline takes a short engine checkpoint and then copies only immutable
 // artifacts from that exact Manifest. Appends may continue while the files are
 // copied because no later mutable CURRENT file is used as Snapshot input.
@@ -64,13 +122,17 @@ func CreateOnline(store *engine.Store, destination string) (result Result, err e
 		return result, fmt.Errorf("Snapshot engine is required")
 	}
 	health := store.Health()
-	if err = validateSource(health); err != nil {
+	if err = validateSource(health, false); err != nil {
 		return result, err
 	}
 	return createOnline(store, destination, health.Term)
 }
 
 func createOnline(store *engine.Store, destination string, term uint64) (result Result, err error) {
+	return create(store, destination, term, false)
+}
+
+func create(store *engine.Store, destination string, term uint64, allowReleasedPrimary bool) (result Result, err error) {
 	if store == nil {
 		return result, fmt.Errorf("Snapshot engine is required")
 	}
@@ -97,13 +159,13 @@ func createOnline(store *engine.Store, destination string, term uint64) (result 
 		return result, fmt.Errorf("empty data roots do not have an installable V1 Manifest")
 	}
 	health := store.Health()
-	if err = validateSource(health); err != nil {
+	if err = validateSource(health, allowReleasedPrimary); err != nil {
 		return result, err
 	}
 	if health.Term != term {
 		return result, fmt.Errorf("Snapshot source Term changed from %d to %d", term, health.Term)
 	}
-	if health.Role == format.ReplicationRolePrimary && (!health.Watermarks.HasCommitted || manifest.Header.LastEntryID > health.Watermarks.Committed) {
+	if (health.Role == format.ReplicationRolePrimary || allowReleasedPrimary && health.Role == format.ReplicationRoleRecovering) && (!health.Watermarks.HasCommitted || manifest.Header.LastEntryID > health.Watermarks.Committed) {
 		return result, fmt.Errorf("Snapshot checkpoint Entry %d is not covered by committed watermark", manifest.Header.LastEntryID)
 	}
 	node, err := identity.Load(dataAbs)
@@ -244,7 +306,7 @@ func createOnline(store *engine.Store, destination string, term uint64) (result 
 	return Result{Path: destination, SnapshotID: snapshotID, GroupID: node.GroupID, Term: term, ManifestGeneration: manifest.Header.Generation, CheckpointEntryID: manifest.Header.LastEntryID, CheckpointCRC32C: manifest.Header.LastEntryCRC32C, Artifacts: uint64(len(artifacts))}, nil
 }
 
-func validateSource(health engine.Health) error {
+func validateSource(health engine.Health, allowReleasedPrimary bool) error {
 	if health.Fatal != nil {
 		return fmt.Errorf("Snapshot source is failed: %w", health.Fatal)
 	}
@@ -259,6 +321,10 @@ func validateSource(health engine.Health) error {
 		}
 		if health.WriteUnavailable != nil {
 			return fmt.Errorf("Strict Primary is not safely writable: %w", health.WriteUnavailable)
+		}
+	case format.ReplicationRoleRecovering:
+		if !allowReleasedPrimary || health.Durability != format.ReplicationDurabilityStrict {
+			return fmt.Errorf("Snapshot source role %d cannot create a Snapshot", health.Role)
 		}
 	default:
 		return fmt.Errorf("Snapshot source role %d cannot create a Snapshot", health.Role)

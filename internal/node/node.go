@@ -38,10 +38,8 @@ func Run(ctx context.Context, config Config, logger *slog.Logger) error {
 		return fmt.Errorf("load mTLS credentials: %w", err)
 	}
 	nodeIdentity, _ := config.nodeIdentity()
-	if resumed, resumeErr := snapshot.ResumeInstall(config.DataDirectory, nil); resumeErr != nil {
-		return fmt.Errorf("resume Snapshot install: %w", resumeErr)
-	} else if resumed {
-		logger.Info("resumed Snapshot install before recovery")
+	if err = resumePendingSnapshotInstall(config.DataDirectory, logger); err != nil {
+		return err
 	}
 	store, err := engine.OpenWithIdentity(config.DataDirectory, nodeIdentity)
 	if err != nil {
@@ -149,6 +147,15 @@ func Run(ctx context.Context, config Config, logger *slog.Logger) error {
 	closed = true
 	logger.Info("streamd stopped")
 	return errors.Join(serveErr, closeErr)
+}
+
+func resumePendingSnapshotInstall(dataDirectory string, logger *slog.Logger) error {
+	if resumed, err := snapshot.ResumeInstall(dataDirectory, nil); err != nil {
+		return fmt.Errorf("resume Snapshot install: %w", err)
+	} else if resumed {
+		logger.Info("resumed Snapshot install before recovery")
+	}
+	return nil
 }
 
 func compactStore(store *engine.Store, config Config, logger *slog.Logger) {

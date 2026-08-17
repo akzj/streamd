@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
 	"slices"
 	"sync"
 	"time"
@@ -80,6 +81,12 @@ type ReplicationOptions struct {
 	Replica        commit.Replica
 	Guard          commit.Guard
 	ReplicaTimeout time.Duration
+	// ExpectedStateID closes the check-to-lock race for offline callers that
+	// made a decision from one exact immutable Replication State.
+	ExpectedStateID format.UUID
+	// RejectUncommittedSuffix is for offline recovery boundaries that must
+	// never silently discard durable entries beyond committed.
+	RejectUncommittedSuffix bool
 }
 type streamKey struct {
 	namespace string
@@ -193,6 +200,29 @@ func open(path string, node *format.NodeIdentity, replication *ReplicationOption
 			return nil, err
 		}
 	}
+	if replication == nil {
+		modeIdentity := node
+		if modeIdentity == nil {
+			loaded, loadErr := identity.Load(root.Path())
+			if loadErr == nil {
+				modeIdentity = &loaded
+			} else if !errors.Is(loadErr, os.ErrNotExist) {
+				root.Close()
+				return nil, fmt.Errorf("load NODE for storage mode: %w", loadErr)
+			}
+		}
+		if modeIdentity != nil {
+			stateStore, stateErr := replicationstate.Open(root.Path(), *modeIdentity)
+			if stateErr != nil {
+				root.Close()
+				return nil, stateErr
+			}
+			if current, ok := stateStore.Current(); ok && current.Header.Role != format.ReplicationRoleSingle {
+				root.Close()
+				return nil, fmt.Errorf("durable Replication State role %d cannot open as Single", current.Header.Role)
+			}
+		}
+	}
 	var checkpoint *format.ReplicationState
 	var applyThrough *uint64
 	if replication != nil && node != nil {
@@ -202,6 +232,10 @@ func open(path string, node *format.NodeIdentity, replication *ReplicationOption
 			return nil, stateErr
 		}
 		if current, ok := stateStore.Current(); ok {
+			if replication.ExpectedStateID != (format.UUID{}) && current.Header.StateID != replication.ExpectedStateID {
+				root.Close()
+				return nil, fmt.Errorf("durable Replication State changed before engine lock")
+			}
 			if current.Header.Term != replication.Term || current.Header.Role != replication.Role || current.Header.Durability != replication.Durability {
 				root.Close()
 				return nil, fmt.Errorf("replicated engine options do not match durable Replication State")
@@ -218,7 +252,7 @@ func open(path string, node *format.NodeIdentity, replication *ReplicationOption
 		root.Close()
 		return nil, err
 	}
-	if checkpoint != nil && replication.Role == format.ReplicationRolePrimary && state.WAL.NextEntryID() > 0 && (!checkpoint.Header.Committed.Present || state.WAL.NextEntryID()-1 > checkpoint.Header.Committed.EntryID) {
+	if checkpoint != nil && (replication.Role == format.ReplicationRolePrimary || replication.RejectUncommittedSuffix) && state.WAL.NextEntryID() > 0 && (!checkpoint.Header.Committed.Present || state.WAL.NextEntryID()-1 > checkpoint.Header.Committed.EntryID) {
 		state.Close()
 		root.Close()
 		return nil, fmt.Errorf("Primary has an unresolved durable WAL suffix after its committed watermark")

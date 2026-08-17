@@ -45,6 +45,9 @@ func runReplicated(ctx context.Context, config Config, logger *slog.Logger) erro
 	if err != nil {
 		return fmt.Errorf("load mTLS credentials: %w", err)
 	}
+	if err = resumePendingSnapshotInstall(config.DataDirectory, logger); err != nil {
+		return err
+	}
 	etcdClient, coordinator, err := openCoordinator(config)
 	if err != nil {
 		return err

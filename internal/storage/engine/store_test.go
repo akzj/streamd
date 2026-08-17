@@ -6,12 +6,14 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/akzj/streamd/internal/storage/errdefs"
 	"github.com/akzj/streamd/internal/storage/format"
+	"github.com/akzj/streamd/internal/storage/replicationstate"
 )
 
 type engineGuard struct {
@@ -114,6 +116,54 @@ func TestReplicatedEngineUsesTermGuardAndStrictWatermarks(t *testing.T) {
 	_, err = store.Append(context.Background(), AppendRequest{Namespace: "strict", Stream: "events", ExpectedSequence: 1, RequestID: []byte("two"), Producer: "test", Records: []InputRecord{{}}})
 	if !errors.Is(err, errdefs.ErrNotLeader) {
 		t.Fatalf("expired Lease error = %v", err)
+	}
+}
+
+func TestSingleEngineRejectsReplicatedDataRoot(t *testing.T) {
+	root := t.TempDir()
+	node := format.NodeIdentity{ClusterID: engineID(1), GroupID: engineID(2), NodeID: engineID(3), CreatedAt: 1}
+	store, err := OpenWithIdentity(root, node)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	states, err := replicationstate.Open(root, node)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = states.Update(time.Now(), func(header *format.ReplicationStateHeader) error {
+		header.Term = 7
+		header.Role = format.ReplicationRoleRecovering
+		header.Durability = format.ReplicationDurabilityStrict
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = OpenWithIdentity(root, node); err == nil || !strings.Contains(err.Error(), "cannot open as Single") {
+		t.Fatalf("OpenWithIdentity replicated root error = %v", err)
+	}
+	if _, err = Open(root); err == nil || !strings.Contains(err.Error(), "cannot open as Single") {
+		t.Fatalf("Open replicated root error = %v", err)
+	}
+
+	recovering, err := OpenReplicated(root, node, ReplicationOptions{Term: 7, Role: format.ReplicationRoleRecovering, Durability: format.ReplicationDurabilityStrict, Guard: &engineGuard{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = recovering.Close(); err != nil {
+		t.Fatal(err)
+	}
+	stale, ok := states.Current()
+	if !ok {
+		t.Fatal("missing Replication State")
+	}
+	if _, err = states.Update(time.Now(), func(*format.ReplicationStateHeader) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = OpenReplicated(root, node, ReplicationOptions{Term: 7, Role: format.ReplicationRoleRecovering, Durability: format.ReplicationDurabilityStrict, Guard: &engineGuard{}, ExpectedStateID: stale.Header.StateID}); err == nil || !strings.Contains(err.Error(), "changed before engine lock") {
+		t.Fatalf("stale Replication State open error = %v", err)
 	}
 }
 
