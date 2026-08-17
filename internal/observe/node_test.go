@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/akzj/streamd/internal/diagnostics"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 )
@@ -17,17 +18,17 @@ func TestNodeMetricsExposeBoundedStateAndStorage(t *testing.T) {
 	writeMetricFile(t, filepath.Join(root, "snapshots", "snap", "segments", "SEG.seg"), []byte("snapshot"))
 	writeMetricFile(t, filepath.Join(root, "CURRENT"), []byte("other"))
 	now := time.Unix(1000, 0)
-	collector, err := NewNodeMetrics(root, func() (NodeState, error) {
-		return NodeState{
-			Role: "primary", Durability: "replicated_strict", Term: 9,
-			LeaseExpiresAt: now.Add(12 * time.Second), WriteReady: true,
-			Watermarks: [len(watermarkStages)]Watermark{
-				{Present: true, EntryID: 12}, {Present: true, EntryID: 12},
-				{Present: true, EntryID: 10}, {Present: true, EntryID: 10},
-				{Present: true, EntryID: 8},
-			},
-		}, nil
-	})
+	leaseEnd := now.Add(12 * time.Second)
+	collector, err := NewNodeMetrics(root, diagnostics.ProviderFunc(func() diagnostics.Snapshot {
+		return diagnostics.Snapshot{
+			SchemaVersion: "v1", Status: diagnostics.StatusReadyWrite, Ready: true, WriteReady: true,
+			Role: "primary", Durability: "replicated_strict", Term: 9, LeaseExpiresAt: &leaseEnd,
+			Watermarks: diagnostics.Watermarks{
+				Appended: metricUint64(12), LocalDurable: metricUint64(12), Replicated: metricUint64(10),
+				Committed: metricUint64(10), Applied: metricUint64(8),
+			}, ReplicationLagEntries: 2, ApplyLagEntries: 2, Reasons: []diagnostics.Reason{},
+		}
+	}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,11 +55,11 @@ func TestNodeMetricsExposeBoundedStateAndStorage(t *testing.T) {
 }
 
 func TestNodeMetricsPreserveEntryZeroAndRejectInvalidWatermarks(t *testing.T) {
-	valid, err := NewNodeMetrics(t.TempDir(), func() (NodeState, error) {
-		return NodeState{Role: "single", Durability: "single_sync", WriteReady: true, Watermarks: [len(watermarkStages)]Watermark{
-			{Present: true}, {Present: true}, {}, {Present: true}, {Present: true},
-		}}, nil
-	})
+	valid, err := NewNodeMetrics(t.TempDir(), diagnostics.ProviderFunc(func() diagnostics.Snapshot {
+		return diagnostics.Snapshot{SchemaVersion: "v1", Status: diagnostics.StatusReadyWrite, Ready: true, WriteReady: true, Role: "single", Durability: "single_sync", Reasons: []diagnostics.Reason{}, Watermarks: diagnostics.Watermarks{
+			Appended: metricUint64(0), LocalDurable: metricUint64(0), Committed: metricUint64(0), Applied: metricUint64(0),
+		}}
+	}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,12 +72,11 @@ func TestNodeMetricsPreserveEntryZeroAndRejectInvalidWatermarks(t *testing.T) {
 	assertMetric(t, families, "streamd_watermark_entry_id", map[string]string{"stage": "appended"}, 0)
 	assertMetric(t, families, "streamd_watermark_present", map[string]string{"stage": "appended"}, 1)
 
-	invalid, err := NewNodeMetrics(t.TempDir(), func() (NodeState, error) {
-		return NodeState{Role: "primary", Durability: "replicated_strict", Watermarks: [len(watermarkStages)]Watermark{
-			{Present: true, EntryID: 2}, {Present: true, EntryID: 2},
-			{Present: true, EntryID: 0}, {Present: true, EntryID: 1},
-		}}, nil
-	})
+	invalid, err := NewNodeMetrics(t.TempDir(), diagnostics.ProviderFunc(func() diagnostics.Snapshot {
+		return diagnostics.Snapshot{SchemaVersion: "v1", Status: diagnostics.StatusReadyRead, Role: "primary", Durability: "replicated_strict", Reasons: []diagnostics.Reason{}, Watermarks: diagnostics.Watermarks{
+			Appended: metricUint64(2), LocalDurable: metricUint64(2), Replicated: metricUint64(0), Committed: metricUint64(1),
+		}}
+	}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,6 +91,8 @@ func TestNodeMetricsPreserveEntryZeroAndRejectInvalidWatermarks(t *testing.T) {
 		t.Fatal("invalid state was exported as healthy node information")
 	}
 }
+
+func metricUint64(value uint64) *uint64 { return &value }
 
 func writeMetricFile(t *testing.T, path string, contents []byte) {
 	t.Helper()

@@ -12,6 +12,7 @@ import (
 
 	streamdv1 "github.com/akzj/streamd/api/streamd/v1"
 	"github.com/akzj/streamd/internal/access"
+	"github.com/akzj/streamd/internal/diagnostics"
 	"github.com/akzj/streamd/internal/storage/engine"
 	"github.com/akzj/streamd/internal/storage/format"
 	readstore "github.com/akzj/streamd/internal/storage/read"
@@ -42,11 +43,13 @@ type Server struct {
 	drainCtx    context.Context
 	drainCancel context.CancelFunc
 	draining    atomic.Bool
+	lease       diagnostics.LeaseProvider
 }
 
 type Options struct {
 	SubscribeSendTimeout time.Duration
 	Limits               Limits
+	Lease                diagnostics.LeaseProvider
 }
 
 type Limits struct {
@@ -94,7 +97,7 @@ func NewWithOptions(backend Backend, authorizer access.Authorizer, options Optio
 		return nil, err
 	}
 	drainCtx, drainCancel := context.WithCancel(context.Background())
-	return &Server{backend: backend, authorizer: authorizer, sendTimeout: options.SubscribeSendTimeout, limits: limits, subs: make(map[subscriptionKey]uint32), rateBuckets: make(map[subscriptionKey]rateBucket), drainCtx: drainCtx, drainCancel: drainCancel}, nil
+	return &Server{backend: backend, authorizer: authorizer, sendTimeout: options.SubscribeSendTimeout, limits: limits, subs: make(map[subscriptionKey]uint32), rateBuckets: make(map[subscriptionKey]rateBucket), drainCtx: drainCtx, drainCancel: drainCancel, lease: options.Lease}, nil
 }
 
 func (s *Server) BeginDrain() {
@@ -104,8 +107,13 @@ func (s *Server) BeginDrain() {
 }
 
 func (s *Server) ReadyWrite() bool {
-	health := s.backend.Health()
-	return !s.draining.Load() && health.Fatal == nil && health.WriteUnavailable == nil
+	return s.Snapshot().WriteReady
+}
+
+func (s *Server) Ready() bool { return s.Snapshot().Ready }
+
+func (s *Server) Snapshot() diagnostics.Snapshot {
+	return diagnostics.EngineSnapshot(s.backend.Health(), s.draining.Load(), s.lease)
 }
 
 func (s *Server) Append(ctx context.Context, request *streamdv1.AppendRequest) (*streamdv1.AppendResponse, error) {
@@ -302,40 +310,60 @@ func (s *Server) InspectStream(ctx context.Context, request *streamdv1.InspectSt
 }
 
 func (s *Server) Health(context.Context, *streamdv1.HealthRequest) (*streamdv1.HealthResponse, error) {
-	health := s.backend.Health()
+	snapshot := s.Snapshot()
 	response := &streamdv1.HealthResponse{
-		Status:     streamdv1.HealthStatus_HEALTH_STATUS_READY_WRITE,
-		Role:       roleProto(health.Role),
-		Durability: durabilityProto(health.Durability),
+		Status:     diagnosticStatusProto(snapshot.Status),
+		Role:       diagnosticRoleProto(snapshot.Role),
+		Durability: diagnosticDurabilityProto(snapshot.Durability),
 	}
-	if health.Term > 0 {
-		response.Term = uint64ptr(health.Term)
+	if snapshot.Term > 0 {
+		response.Term = uint64ptr(snapshot.Term)
 	}
-	if health.Fatal != nil {
-		response.Status = streamdv1.HealthStatus_HEALTH_STATUS_FAILED
-		response.Reasons = []string{"commit core failed"}
+	response.LocalDurableEntryId = snapshot.Watermarks.LocalDurable
+	response.CommitEntryId = snapshot.Watermarks.Committed
+	response.AppliedEntryId = snapshot.Watermarks.Applied
+	if snapshot.Watermarks.Replicated != nil {
+		response.ReplicationLagEntries = uint64ptr(snapshot.ReplicationLagEntries)
 	}
-	if s.draining.Load() && health.Fatal == nil {
-		response.Status = streamdv1.HealthStatus_HEALTH_STATUS_READY_READ
-		response.Reasons = []string{"server is draining"}
-	}
-	if health.WriteUnavailable != nil && health.Fatal == nil && !s.draining.Load() {
-		response.Status = streamdv1.HealthStatus_HEALTH_STATUS_READY_READ
-		response.Reasons = []string{health.WriteUnavailable.Error()}
-	}
-	if health.Watermarks.HasLocalDurable {
-		response.LocalDurableEntryId = uint64ptr(health.Watermarks.LocalDurable)
-	}
-	if health.Watermarks.HasCommitted {
-		response.CommitEntryId = uint64ptr(health.Watermarks.Committed)
-	}
-	if health.Watermarks.HasApplied {
-		response.AppliedEntryId = uint64ptr(health.Watermarks.Applied)
-	}
-	if health.Watermarks.HasLocalDurable && health.Watermarks.HasReplicated && health.Watermarks.LocalDurable >= health.Watermarks.Replicated {
-		response.ReplicationLagEntries = uint64ptr(health.Watermarks.LocalDurable - health.Watermarks.Replicated)
+	for _, reason := range snapshot.Reasons {
+		response.Reasons = append(response.Reasons, string(reason.Code))
 	}
 	return response, nil
+}
+
+func diagnosticStatusProto(value diagnostics.Status) streamdv1.HealthStatus {
+	switch value {
+	case diagnostics.StatusStarting:
+		return streamdv1.HealthStatus_HEALTH_STATUS_STARTING
+	case diagnostics.StatusReadyRead:
+		return streamdv1.HealthStatus_HEALTH_STATUS_READY_READ
+	case diagnostics.StatusReadyWrite:
+		return streamdv1.HealthStatus_HEALTH_STATUS_READY_WRITE
+	case diagnostics.StatusDegraded:
+		return streamdv1.HealthStatus_HEALTH_STATUS_DEGRADED
+	default:
+		return streamdv1.HealthStatus_HEALTH_STATUS_FAILED
+	}
+}
+
+func diagnosticRoleProto(value string) streamdv1.NodeRole {
+	switch value {
+	case "primary":
+		return streamdv1.NodeRole_NODE_ROLE_PRIMARY
+	case "standby":
+		return streamdv1.NodeRole_NODE_ROLE_STANDBY
+	case "recovering":
+		return streamdv1.NodeRole_NODE_ROLE_RECOVERING
+	default:
+		return streamdv1.NodeRole_NODE_ROLE_SINGLE
+	}
+}
+
+func diagnosticDurabilityProto(value string) streamdv1.Durability {
+	if value == "replicated_strict" {
+		return streamdv1.Durability_DURABILITY_REPLICATED_STRICT
+	}
+	return streamdv1.Durability_DURABILITY_SINGLE_SYNC
 }
 
 func durabilityProto(value format.ReplicationDurability) streamdv1.Durability {
@@ -346,19 +374,6 @@ func durabilityProto(value format.ReplicationDurability) streamdv1.Durability {
 		return streamdv1.Durability_DURABILITY_DEGRADED_LOCAL_ONLY
 	default:
 		return streamdv1.Durability_DURABILITY_SINGLE_SYNC
-	}
-}
-
-func roleProto(value format.ReplicationRole) streamdv1.NodeRole {
-	switch value {
-	case format.ReplicationRolePrimary:
-		return streamdv1.NodeRole_NODE_ROLE_PRIMARY
-	case format.ReplicationRoleStandby:
-		return streamdv1.NodeRole_NODE_ROLE_STANDBY
-	case format.ReplicationRoleRecovering:
-		return streamdv1.NodeRole_NODE_ROLE_RECOVERING
-	default:
-		return streamdv1.NodeRole_NODE_ROLE_SINGLE
 	}
 }
 

@@ -10,11 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/akzj/streamd/internal/leadership"
-	"github.com/akzj/streamd/internal/replication"
-	"github.com/akzj/streamd/internal/storage/commit"
-	"github.com/akzj/streamd/internal/storage/engine"
-	"github.com/akzj/streamd/internal/storage/format"
+	"github.com/akzj/streamd/internal/diagnostics"
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/sys/unix"
 )
@@ -22,25 +18,9 @@ import (
 var watermarkStages = [...]string{"appended", "local_durable", "replicated", "committed", "applied"}
 var storageKinds = [...]string{"wal", "segment", "snapshot", "manifest", "staging", "trash", "other"}
 
-type Watermark struct {
-	Present bool
-	EntryID uint64
-}
-
-type NodeState struct {
-	Role           string
-	Durability     string
-	Term           uint64
-	LeaseExpiresAt time.Time
-	WriteReady     bool
-	Watermarks     [len(watermarkStages)]Watermark
-}
-
-type StateProvider func() (NodeState, error)
-
 type NodeMetrics struct {
 	root     string
-	state    StateProvider
+	state    diagnostics.Provider
 	now      func() time.Time
 	nodeInfo *prometheus.Desc
 	term     *prometheus.Desc
@@ -58,7 +38,7 @@ type NodeMetrics struct {
 	success  *prometheus.Desc
 }
 
-func NewNodeMetrics(root string, state StateProvider) (*NodeMetrics, error) {
+func NewNodeMetrics(root string, state diagnostics.Provider) (*NodeMetrics, error) {
 	if root == "" || state == nil {
 		return nil, fmt.Errorf("data root and state Provider are required")
 	}
@@ -89,8 +69,8 @@ func (m *NodeMetrics) Describe(output chan<- *prometheus.Desc) {
 
 func (m *NodeMetrics) Collect(output chan<- prometheus.Metric) {
 	success := true
-	state, err := m.state()
-	if err != nil || validateNodeState(state) != nil {
+	state := m.state.Snapshot()
+	if diagnostics.Validate(state) != nil {
 		success = false
 	} else {
 		m.collectState(output, state)
@@ -109,93 +89,28 @@ func (m *NodeMetrics) Collect(output chan<- prometheus.Metric) {
 	output <- prometheus.MustNewConstMetric(m.success, prometheus.GaugeValue, boolFloat(success))
 }
 
-func (m *NodeMetrics) collectState(output chan<- prometheus.Metric, state NodeState) {
+func (m *NodeMetrics) collectState(output chan<- prometheus.Metric, state diagnostics.Snapshot) {
 	output <- prometheus.MustNewConstMetric(m.nodeInfo, prometheus.GaugeValue, 1, state.Role, state.Durability)
 	output <- prometheus.MustNewConstMetric(m.term, prometheus.GaugeValue, float64(state.Term))
 	leaseEnd, leaseRemaining := float64(0), float64(0)
-	if !state.LeaseExpiresAt.IsZero() {
+	if state.LeaseExpiresAt != nil {
 		leaseEnd = float64(state.LeaseExpiresAt.UnixNano()) / float64(time.Second)
 		leaseRemaining = max(0, state.LeaseExpiresAt.Sub(m.now()).Seconds())
 	}
 	output <- prometheus.MustNewConstMetric(m.leaseEnd, prometheus.GaugeValue, leaseEnd)
 	output <- prometheus.MustNewConstMetric(m.leaseTTL, prometheus.GaugeValue, leaseRemaining)
 	output <- prometheus.MustNewConstMetric(m.ready, prometheus.GaugeValue, boolFloat(state.WriteReady))
+	watermarks := [...]*uint64{state.Watermarks.Appended, state.Watermarks.LocalDurable, state.Watermarks.Replicated, state.Watermarks.Committed, state.Watermarks.Applied}
 	for index, stage := range watermarkStages {
-		watermark := state.Watermarks[index]
-		output <- prometheus.MustNewConstMetric(m.water, prometheus.GaugeValue, float64(watermark.EntryID), stage)
-		output <- prometheus.MustNewConstMetric(m.present, prometheus.GaugeValue, boolFloat(watermark.Present), stage)
+		value := float64(0)
+		if watermarks[index] != nil {
+			value = float64(*watermarks[index])
+		}
+		output <- prometheus.MustNewConstMetric(m.water, prometheus.GaugeValue, value, stage)
+		output <- prometheus.MustNewConstMetric(m.present, prometheus.GaugeValue, boolFloat(watermarks[index] != nil), stage)
 	}
-	output <- prometheus.MustNewConstMetric(m.replLag, prometheus.GaugeValue, lag(state.Watermarks[1], state.Watermarks[2]))
-	output <- prometheus.MustNewConstMetric(m.applyLag, prometheus.GaugeValue, lag(state.Watermarks[3], state.Watermarks[4]))
-}
-
-func EngineStateProvider(store *engine.Store, controller *leadership.Controller, ready func() bool) StateProvider {
-	return func() (NodeState, error) {
-		if store == nil || ready == nil {
-			return NodeState{}, fmt.Errorf("Engine and readiness Provider are required")
-		}
-		health := store.Health()
-		role, err := roleName(health.Role)
-		if err != nil {
-			return NodeState{}, err
-		}
-		durability, err := durabilityName(health.Durability)
-		if err != nil {
-			return NodeState{}, err
-		}
-		state := NodeState{Role: role, Durability: durability, Term: health.Term, WriteReady: ready(), Watermarks: commitWatermarks(health.Watermarks)}
-		if controller != nil {
-			leadershipState := controller.Snapshot()
-			if leadershipState.Term != state.Term {
-				return NodeState{}, fmt.Errorf("Engine Term %d differs from leadership Term %d", state.Term, leadershipState.Term)
-			}
-			state.LeaseExpiresAt = leadershipState.ExpiresAt
-		}
-		return state, nil
-	}
-}
-
-func StandbyStateProvider(receiver *replication.Receiver) StateProvider {
-	return func() (NodeState, error) {
-		if receiver == nil {
-			return NodeState{}, fmt.Errorf("Standby Receiver is required")
-		}
-		state, err := receiver.State()
-		if err != nil {
-			return NodeState{}, err
-		}
-		return NodeState{Role: "standby", Durability: "replicated_strict", Term: state.Term, Watermarks: [len(watermarkStages)]Watermark{
-			positionWatermark(state.LastAppended), positionWatermark(state.LocalDurable), {}, positionWatermark(state.Committed), positionWatermark(state.Applied),
-		}}, nil
-	}
-}
-
-func validateNodeState(state NodeState) error {
-	if state.Role != "single" && state.Role != "primary" && state.Role != "standby" && state.Role != "recovering" {
-		return fmt.Errorf("unknown role %q", state.Role)
-	}
-	if state.Durability != "single_sync" && state.Durability != "replicated_strict" {
-		return fmt.Errorf("unknown durability %q", state.Durability)
-	}
-	ordered := []int{0, 1, 3, 4}
-	for index := 1; index < len(ordered); index++ {
-		previous, current := state.Watermarks[ordered[index-1]], state.Watermarks[ordered[index]]
-		if current.Present && (!previous.Present || current.EntryID > previous.EntryID) {
-			return fmt.Errorf("watermark %s is ahead of %s", watermarkStages[ordered[index]], watermarkStages[ordered[index-1]])
-		}
-	}
-	if state.Role == "primary" {
-		local, replicated, committed := state.Watermarks[1], state.Watermarks[2], state.Watermarks[3]
-		if replicated.Present && (!local.Present || replicated.EntryID > local.EntryID) {
-			return fmt.Errorf("replicated watermark is ahead of local durable watermark")
-		}
-		if committed.Present && (!replicated.Present || committed.EntryID > replicated.EntryID) {
-			return fmt.Errorf("committed watermark is ahead of replicated watermark")
-		}
-	} else if state.Watermarks[2].Present {
-		return fmt.Errorf("replicated watermark is only valid on a Primary")
-	}
-	return nil
+	output <- prometheus.MustNewConstMetric(m.replLag, prometheus.GaugeValue, float64(state.ReplicationLagEntries))
+	output <- prometheus.MustNewConstMetric(m.applyLag, prometheus.GaugeValue, float64(state.ApplyLagEntries))
 }
 
 func collectStorage(root string) ([len(storageKinds)]uint64, [len(storageKinds)]uint64, uint64, uint64, error) {
@@ -263,52 +178,6 @@ func storageKind(root, path string) int {
 	}
 }
 
-func commitWatermarks(value commit.Watermarks) [len(watermarkStages)]Watermark {
-	return [len(watermarkStages)]Watermark{
-		{Present: value.HasValue, EntryID: value.Appended},
-		{Present: value.HasLocalDurable, EntryID: value.LocalDurable},
-		{Present: value.HasReplicated, EntryID: value.Replicated},
-		{Present: value.HasCommitted, EntryID: value.Committed},
-		{Present: value.HasApplied, EntryID: value.Applied},
-	}
-}
-
-func positionWatermark(value replication.Position) Watermark {
-	return Watermark{Present: value.Valid, EntryID: value.EntryID}
-}
-
-func roleName(value format.ReplicationRole) (string, error) {
-	switch value {
-	case format.ReplicationRoleSingle:
-		return "single", nil
-	case format.ReplicationRolePrimary:
-		return "primary", nil
-	case format.ReplicationRoleStandby:
-		return "standby", nil
-	case format.ReplicationRoleRecovering:
-		return "recovering", nil
-	default:
-		return "", fmt.Errorf("unknown replication role %d", value)
-	}
-}
-
-func durabilityName(value format.ReplicationDurability) (string, error) {
-	switch value {
-	case format.ReplicationDurabilitySingleSync:
-		return "single_sync", nil
-	case format.ReplicationDurabilityStrict:
-		return "replicated_strict", nil
-	default:
-		return "", fmt.Errorf("unknown replication durability %d", value)
-	}
-}
-
-func lag(a, b Watermark) float64 {
-	if !a.Present || !b.Present || b.EntryID >= a.EntryID {
-		return 0
-	}
-	return float64(a.EntryID - b.EntryID)
-}
 func boolFloat(value bool) float64 {
 	if value {
 		return 1

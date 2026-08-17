@@ -189,7 +189,7 @@ func TestDrainRejectsWritesAndReportsReadOnly(t *testing.T) {
 	_, err = server.Append(context.Background(), &streamdv1.AppendRequest{Stream: &streamdv1.StreamRef{Namespace: "n", Stream: "s"}, RequestId: []byte("r"), Record: &streamdv1.InputRecord{}})
 	assertError(t, err, codes.Unavailable, streamdv1.ErrorCode_ERROR_CODE_UNSPECIFIED, false)
 	health, err := server.Health(context.Background(), &streamdv1.HealthRequest{})
-	if err != nil || health.Status != streamdv1.HealthStatus_HEALTH_STATUS_READY_READ {
+	if err != nil || health.Status != streamdv1.HealthStatus_HEALTH_STATUS_READY_READ || len(health.Reasons) != 1 || health.Reasons[0] != "server_draining" {
 		t.Fatalf("draining Health = %+v, %v", health, err)
 	}
 }

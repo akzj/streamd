@@ -15,6 +15,7 @@ import (
 	streamdv1 "github.com/akzj/streamd/api/streamd/v1"
 	"github.com/akzj/streamd/internal/access"
 	etcdcoordinator "github.com/akzj/streamd/internal/coordinator/etcd"
+	"github.com/akzj/streamd/internal/diagnostics"
 	"github.com/akzj/streamd/internal/leadership"
 	"github.com/akzj/streamd/internal/observe"
 	"github.com/akzj/streamd/internal/replication"
@@ -26,7 +27,6 @@ import (
 	"github.com/akzj/streamd/internal/storage/replicationstate"
 	"github.com/akzj/streamd/internal/storage/wal"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"google.golang.org/grpc"
@@ -139,7 +139,11 @@ func runPrimary(ctx context.Context, config Config, nodeIdentity format.NodeIden
 	}()
 	authorizer := newAuthorizer(config)
 	sendTimeout, _ := config.subscribeSendDuration()
-	streamService, err := service.NewWithOptions(store, authorizer, service.Options{SubscribeSendTimeout: sendTimeout, Limits: config.Limits})
+	leaseProvider := func() diagnostics.LeaseState {
+		state := controller.Snapshot()
+		return diagnostics.LeaseState{Term: state.Term, ExpiresAt: state.ExpiresAt, Unsafe: state.Role != leadership.RolePrimary || !state.Fenced || state.LastReason != ""}
+	}
+	streamService, err := service.NewWithOptions(store, authorizer, service.Options{SubscribeSendTimeout: sendTimeout, Limits: config.Limits, Lease: leaseProvider})
 	if err != nil {
 		return err
 	}
@@ -156,7 +160,7 @@ func runPrimary(ctx context.Context, config Config, nodeIdentity format.NodeIden
 	}
 	registry := prometheus.NewRegistry()
 	registry.MustRegister(prometheus.NewGoCollector(), prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}))
-	nodeMetrics, err := observe.NewNodeMetrics(config.DataDirectory, observe.EngineStateProvider(store, controller, streamService.ReadyWrite))
+	nodeMetrics, err := observe.NewNodeMetrics(config.DataDirectory, streamService)
 	if err != nil {
 		return err
 	}
@@ -165,7 +169,7 @@ func runPrimary(ctx context.Context, config Config, nodeIdentity format.NodeIden
 	grpcServer := grpc.NewServer(grpc.Creds(serverCredentials), grpc.MaxRecvMsgSize(int(replicationMessageLimit(config.Replication))), grpc.MaxSendMsgSize(int(replicationMessageLimit(config.Replication))), grpc.StatsHandler(otelgrpc.NewServerHandler()), grpc.ChainUnaryInterceptor(rpcMetrics.UnaryInterceptor()), grpc.ChainStreamInterceptor(rpcMetrics.StreamInterceptor()))
 	streamdv1.RegisterStreamServiceServer(grpcServer, streamService)
 	streamdv1.RegisterReplicationServiceServer(grpcServer, protocolServer)
-	grpcListener, adminListener, admin, serveErrors, err := serveHA(config, grpcServer, func() bool { return streamService.ReadyWrite() }, registry)
+	grpcListener, adminListener, admin, serveErrors, err := serveHA(config, grpcServer, streamService, registry)
 	if err != nil {
 		return err
 	}
@@ -252,9 +256,13 @@ func runStandby(ctx context.Context, config Config, nodeIdentity format.NodeIden
 		return err
 	}
 	protocolServer.SetStatusProvider(store.Hello)
+	diagnosticProvider, err := diagnostics.NewStandbyProvider(store.Receiver())
+	if err != nil {
+		return err
+	}
 	registry := prometheus.NewRegistry()
 	registry.MustRegister(prometheus.NewGoCollector(), prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}))
-	nodeMetrics, err := observe.NewNodeMetrics(config.DataDirectory, observe.StandbyStateProvider(store.Receiver()))
+	nodeMetrics, err := observe.NewNodeMetrics(config.DataDirectory, diagnosticProvider)
 	if err != nil {
 		return err
 	}
@@ -262,10 +270,7 @@ func runStandby(ctx context.Context, config Config, nodeIdentity format.NodeIden
 	rpcMetrics := observe.NewRPCMetrics(registry)
 	grpcServer := grpc.NewServer(grpc.Creds(serverCredentials), grpc.MaxRecvMsgSize(int(replicationMessageLimit(config.Replication))), grpc.MaxSendMsgSize(int(replicationMessageLimit(config.Replication))), grpc.StatsHandler(otelgrpc.NewServerHandler()), grpc.ChainUnaryInterceptor(rpcMetrics.UnaryInterceptor()), grpc.ChainStreamInterceptor(rpcMetrics.StreamInterceptor()))
 	streamdv1.RegisterReplicationServiceServer(grpcServer, protocolServer)
-	grpcListener, adminListener, admin, serveErrors, err := serveHA(config, grpcServer, func() bool {
-		_, stateErr := store.Receiver().State()
-		return stateErr == nil
-	}, registry)
+	grpcListener, adminListener, admin, serveErrors, err := serveHA(config, grpcServer, diagnosticProvider, registry)
 	if err != nil {
 		return err
 	}
@@ -527,7 +532,7 @@ func newAuthorizer(config Config) access.Controller {
 	return access.Controller{Authenticator: access.MTLSAuthenticator{PrincipalsByURI: config.PrincipalsByURI}, Policy: access.StaticPolicy{Rules: config.Authorization}}
 }
 
-func serveHA(config Config, grpcServer *grpc.Server, ready func() bool, registry *prometheus.Registry) (net.Listener, net.Listener, *http.Server, <-chan error, error) {
+func serveHA(config Config, grpcServer *grpc.Server, provider diagnostics.Provider, registry *prometheus.Registry) (net.Listener, net.Listener, *http.Server, <-chan error, error) {
 	grpcListener, err := net.Listen("tcp", config.ListenAddress)
 	if err != nil {
 		return nil, nil, nil, nil, err
@@ -537,22 +542,7 @@ func serveHA(config Config, grpcServer *grpc.Server, ready func() bool, registry
 		grpcListener.Close()
 		return nil, nil, nil, nil, err
 	}
-	mux := http.NewServeMux()
-	mux.HandleFunc("/livez", func(response http.ResponseWriter, _ *http.Request) {
-		response.WriteHeader(http.StatusOK)
-		_, _ = response.Write([]byte("ok\n"))
-	})
-	mux.HandleFunc("/readyz", func(response http.ResponseWriter, _ *http.Request) {
-		if !ready() {
-			response.WriteHeader(http.StatusServiceUnavailable)
-			_, _ = response.Write([]byte("not ready\n"))
-			return
-		}
-		response.WriteHeader(http.StatusOK)
-		_, _ = response.Write([]byte("ready\n"))
-	})
-	mux.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{}))
-	admin := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 30 * time.Second}
+	admin := adminServer(provider, registry)
 	serveErrors := make(chan error, 2)
 	go func() { serveErrors <- grpcServer.Serve(grpcListener) }()
 	go func() { serveErrors <- admin.Serve(adminListener) }()

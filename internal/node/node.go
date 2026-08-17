@@ -2,6 +2,7 @@ package node
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -11,6 +12,7 @@ import (
 
 	streamdv1 "github.com/akzj/streamd/api/streamd/v1"
 	"github.com/akzj/streamd/internal/access"
+	"github.com/akzj/streamd/internal/diagnostics"
 	"github.com/akzj/streamd/internal/observe"
 	"github.com/akzj/streamd/internal/service"
 	"github.com/akzj/streamd/internal/storage/engine"
@@ -63,7 +65,7 @@ func Run(ctx context.Context, config Config, logger *slog.Logger) error {
 
 	registry := prometheus.NewRegistry()
 	registry.MustRegister(prometheus.NewGoCollector(), prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}))
-	nodeMetrics, err := observe.NewNodeMetrics(config.DataDirectory, observe.EngineStateProvider(store, nil, streamService.ReadyWrite))
+	nodeMetrics, err := observe.NewNodeMetrics(config.DataDirectory, streamService)
 	if err != nil {
 		return err
 	}
@@ -146,23 +148,48 @@ func Run(ctx context.Context, config Config, logger *slog.Logger) error {
 	return errors.Join(serveErr, closeErr)
 }
 
-func adminServer(streamService *service.Server, registry *prometheus.Registry) *http.Server {
+func adminServer(provider diagnostics.Provider, registry *prometheus.Registry) *http.Server {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/livez", func(response http.ResponseWriter, _ *http.Request) {
-		response.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		response.WriteHeader(http.StatusOK)
-		_, _ = response.Write([]byte("ok\n"))
-	})
-	mux.HandleFunc("/readyz", func(response http.ResponseWriter, _ *http.Request) {
-		response.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		if !streamService.ReadyWrite() {
-			response.WriteHeader(http.StatusServiceUnavailable)
-			_, _ = response.Write([]byte("not ready\n"))
+	mux.HandleFunc("/livez", func(response http.ResponseWriter, request *http.Request) {
+		if !readOnlyMethod(response, request) {
 			return
 		}
+		response.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		response.WriteHeader(http.StatusOK)
-		_, _ = response.Write([]byte("ready\n"))
+		if request.Method != http.MethodHead {
+			_, _ = response.Write([]byte("ok\n"))
+		}
 	})
+	mux.HandleFunc("/readyz", diagnosticHandler(provider, true))
+	mux.HandleFunc("/diagnostics", diagnosticHandler(provider, false))
 	mux.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{}))
 	return &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 30 * time.Second}
+}
+
+func diagnosticHandler(provider diagnostics.Provider, readiness bool) http.HandlerFunc {
+	return func(response http.ResponseWriter, request *http.Request) {
+		if !readOnlyMethod(response, request) {
+			return
+		}
+		snapshot := provider.Snapshot()
+		response.Header().Set("Content-Type", "application/json")
+		response.Header().Set("Cache-Control", "no-store")
+		status := http.StatusOK
+		if readiness && !snapshot.Ready {
+			status = http.StatusServiceUnavailable
+		}
+		response.WriteHeader(status)
+		if request.Method != http.MethodHead {
+			_ = json.NewEncoder(response).Encode(snapshot)
+		}
+	}
+}
+
+func readOnlyMethod(response http.ResponseWriter, request *http.Request) bool {
+	if request.Method == http.MethodGet || request.Method == http.MethodHead {
+		return true
+	}
+	response.Header().Set("Allow", "GET, HEAD")
+	http.Error(response, "method not allowed", http.StatusMethodNotAllowed)
+	return false
 }
