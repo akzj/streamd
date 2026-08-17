@@ -369,3 +369,39 @@ func TestCompactSwitchesGenerationBeforeRetiringInputs(t *testing.T) {
 		}
 	}
 }
+
+func TestPinnedManifestDefersCompactionRetirement(t *testing.T) {
+	dir := t.TempDir()
+	store, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	for i, payload := range []string{"one", "two"} {
+		_, err = store.Append(context.Background(), AppendRequest{Namespace: "agent", Stream: "events", ExpectedSequence: uint64(i), RequestID: []byte(payload), Producer: "test", Records: []InputRecord{{Payload: []byte(payload)}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, created, checkpointErr := store.Checkpoint(); checkpointErr != nil || !created {
+			t.Fatalf("Checkpoint created=%v error=%v", created, checkpointErr)
+		}
+	}
+	pinned, _, release, err := store.CheckpointAndPin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.Compact(CompactionOptions{MinSegments: 2, MaxInputSegments: 4, MaxInputBytes: 64 << 20}); err != nil {
+		t.Fatal(err)
+	}
+	for _, reference := range pinned.SegmentReferences {
+		if _, err = os.Stat(filepath.Join(dir, reference.LocalPath)); err != nil {
+			t.Fatalf("pinned Segment retired: %v", err)
+		}
+	}
+	release()
+	for _, reference := range pinned.SegmentReferences {
+		if _, err = os.Stat(filepath.Join(dir, reference.LocalPath)); !os.IsNotExist(err) {
+			t.Fatalf("released Segment remains live: %v", err)
+		}
+	}
+}

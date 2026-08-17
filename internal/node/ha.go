@@ -191,6 +191,8 @@ func runPrimary(ctx context.Context, config Config, nodeIdentity format.NodeIden
 					logger.Error("storage checkpoint failed", "error", checkpointErr)
 				} else if _, stateErr := store.CheckpointReplicationState(states); stateErr != nil {
 					logger.Error("replication checkpoint failed", "error", stateErr)
+				} else {
+					compactStore(store, config, logger)
 				}
 			}
 		}

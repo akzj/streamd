@@ -410,6 +410,35 @@ func (s *Store) Append(ctx context.Context, request AppendRequest) (AppendResult
 func (s *Store) Checkpoint() (format.Manifest, bool, error) {
 	s.maintenanceMu.Lock()
 	defer s.maintenanceMu.Unlock()
+	return s.checkpointLocked()
+}
+
+// CheckpointAndPin publishes a checkpoint and pins every Segment referenced by
+// that exact Manifest Generation. The release function must be called after an
+// online Snapshot or transfer no longer needs those immutable files.
+func (s *Store) CheckpointAndPin() (format.Manifest, bool, func(), error) {
+	s.maintenanceMu.Lock()
+	defer s.maintenanceMu.Unlock()
+	manifest, created, err := s.checkpointLocked()
+	if err != nil {
+		return format.Manifest{}, false, nil, err
+	}
+	releases := make([]func(), 0, len(manifest.SegmentReferences))
+	for _, reference := range manifest.SegmentReferences {
+		releases = append(releases, s.lifecycle.Pin(reference.SegmentID))
+	}
+	var once sync.Once
+	release := func() {
+		once.Do(func() {
+			for _, unpin := range releases {
+				unpin()
+			}
+		})
+	}
+	return manifest, created, release, nil
+}
+
+func (s *Store) checkpointLocked() (format.Manifest, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.shutdown {

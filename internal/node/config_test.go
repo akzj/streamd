@@ -69,3 +69,21 @@ func TestConfigValidatesStrictReplicationTopology(t *testing.T) {
 		t.Fatal("unsafe Lease timing was accepted")
 	}
 }
+
+func TestConfigValidatesCompactionBudgets(t *testing.T) {
+	config := Config{ListenAddress: "0.0.0.0:7443", AdminAddress: "127.0.0.1:9090", DataDirectory: "/data", ClusterID: "11111111111111111111111111111111", GroupID: "22222222222222222222222222222222", NodeID: "33333333333333333333333333333333", TLS: TLSConfig{CertificateFile: "c", PrivateKeyFile: "k", ClientCAFile: "ca"}}
+	config.PrincipalsByURI = map[string]access.Principal{"spiffe://example/a": {Tenant: "t", Service: "s"}}
+	config.Authorization = []access.Rule{{Tenant: "t", Service: "s", Namespace: "n", Operations: []access.Operation{access.Read}}}
+	config.Compaction = CompactionConfig{MinSegments: 16, MaxInputSegments: 4, MaxInputBytes: 8 << 20}
+	if err := config.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	config.Compaction.MaxInputSegments = 17
+	if err := config.Validate(); err == nil {
+		t.Fatal("Compaction input width larger than trigger was accepted")
+	}
+	config.Compaction = CompactionConfig{MinSegments: 16, MaxInputSegments: 4, MaxInputBytes: 1024}
+	if err := config.Validate(); err == nil {
+		t.Fatal("undersized Compaction byte budget was accepted")
+	}
+}

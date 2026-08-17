@@ -108,8 +108,11 @@ func Run(ctx context.Context, config Config, logger *slog.Logger) error {
 				manifest, created, checkpointErr := store.Checkpoint()
 				if checkpointErr != nil {
 					logger.Error("checkpoint failed", "error", checkpointErr)
-				} else if created {
-					logger.Info("checkpoint published", "generation", manifest.Header.Generation, "entry_id", manifest.Header.LastEntryID)
+				} else {
+					if created {
+						logger.Info("checkpoint published", "generation", manifest.Header.Generation, "entry_id", manifest.Header.LastEntryID)
+					}
+					compactStore(store, config, logger)
 				}
 			}
 		}
@@ -146,6 +149,18 @@ func Run(ctx context.Context, config Config, logger *slog.Logger) error {
 	closed = true
 	logger.Info("streamd stopped")
 	return errors.Join(serveErr, closeErr)
+}
+
+func compactStore(store *engine.Store, config Config, logger *slog.Logger) {
+	minSegments, maxInputSegments, maxInputBytes, _ := config.compactionLimits()
+	result, err := store.Compact(engine.CompactionOptions{MinSegments: minSegments, MaxInputSegments: maxInputSegments, MaxInputBytes: maxInputBytes})
+	if err != nil {
+		logger.Error("Segment Compaction failed", "error", err)
+		return
+	}
+	if result.Created {
+		logger.Info("Segment Compaction published", "generation", result.Manifest.Header.Generation, "input_segments", result.InputSegments, "input_bytes", result.InputBytes, "live_segments", len(result.Manifest.SegmentReferences))
+	}
 }
 
 func adminServer(provider diagnostics.Provider, registry *prometheus.Registry) *http.Server {

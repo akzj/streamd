@@ -82,10 +82,11 @@ func createOnline(store *engine.Store, destination string, term uint64) (result 
 		}
 		return result, err
 	}
-	manifest, _, err := store.Checkpoint()
+	manifest, _, releaseManifest, err := store.CheckpointAndPin()
 	if err != nil {
 		return result, err
 	}
+	defer releaseManifest()
 	node, err := identity.Load(dataAbs)
 	if err != nil {
 		return result, fmt.Errorf("NODE: %w", err)

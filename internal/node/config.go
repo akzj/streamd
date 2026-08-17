@@ -29,12 +29,19 @@ type Config struct {
 	ShutdownTimeout      string                      `json:"shutdown_timeout"`
 	SubscribeSendTimeout string                      `json:"subscribe_send_timeout"`
 	CheckpointInterval   string                      `json:"checkpoint_interval"`
+	Compaction           CompactionConfig            `json:"compaction,omitempty"`
 	TLS                  TLSConfig                   `json:"tls"`
 	PrincipalsByURI      map[string]access.Principal `json:"principals_by_uri"`
 	Authorization        []access.Rule               `json:"authorization"`
 	Limits               service.Limits              `json:"limits"`
 	OTLPTraceEndpoint    string                      `json:"otlp_trace_endpoint,omitempty"`
 	Replication          ReplicationConfig           `json:"replication,omitempty"`
+}
+
+type CompactionConfig struct {
+	MinSegments      int    `json:"min_segments,omitempty"`
+	MaxInputSegments int    `json:"max_input_segments,omitempty"`
+	MaxInputBytes    uint64 `json:"max_input_bytes,omitempty"`
 }
 
 type ReplicationConfig struct {
@@ -118,6 +125,9 @@ func (c Config) Validate() error {
 	if c.TLS.CertificateFile == "" || c.TLS.PrivateKeyFile == "" || c.TLS.ClientCAFile == "" {
 		return fmt.Errorf("server certificate, private key, and client CA are required")
 	}
+	if _, _, _, err := c.compactionLimits(); err != nil {
+		return err
+	}
 	if len(c.PrincipalsByURI) == 0 || len(c.Authorization) == 0 {
 		return fmt.Errorf("at least one client Principal and authorization rule are required")
 	}
@@ -160,6 +170,31 @@ func (c Config) Validate() error {
 		}
 	}
 	return nil
+}
+
+func (c Config) compactionLimits() (int, int, uint64, error) {
+	minSegments := c.Compaction.MinSegments
+	if minSegments == 0 {
+		minSegments = 32
+	}
+	maxInputSegments := c.Compaction.MaxInputSegments
+	if maxInputSegments == 0 {
+		maxInputSegments = 8
+	}
+	maxInputBytes := c.Compaction.MaxInputBytes
+	if maxInputBytes == 0 {
+		maxInputBytes = 64 << 20
+	}
+	if minSegments < 2 {
+		return 0, 0, 0, fmt.Errorf("compaction.min_segments must be at least 2")
+	}
+	if maxInputSegments < 2 || maxInputSegments > minSegments {
+		return 0, 0, 0, fmt.Errorf("compaction.max_input_segments must be between 2 and min_segments")
+	}
+	if maxInputBytes < 1<<20 {
+		return 0, 0, 0, fmt.Errorf("compaction.max_input_bytes must be at least 1 MiB")
+	}
+	return minSegments, maxInputSegments, maxInputBytes, nil
 }
 
 func (c ReplicationConfig) validate() error {
