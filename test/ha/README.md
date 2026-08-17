@@ -1,7 +1,7 @@
 # Local Strict HA integration test
 
-This suite runs the real `streamd` binaries against a TLS-enabled single-node
-etcd development cluster. Docker Compose owns the etcd, Primary, Standby,
+This suite runs the real `streamd` binaries against a TLS-enabled three-member
+etcd development cluster. Docker Compose owns etcd, Primary, Standby,
 Toxiproxy, isolated networks, and disposable volumes. The Go test runner uses
 the public mTLS API and never mounts a host data directory.
 
@@ -29,5 +29,6 @@ Primary-to-Standby Toxiproxy link to prove that a new Strict append is not
 acknowledged. It deliberately runs serially because the partition is a
 cluster-wide fault.
 
-This development topology does not validate etcd quorum loss or member
-replacement. Those scenarios belong to the three-member acceptance profile.
+Each streamd node reaches all three etcd members through independent
+Toxiproxy client links so later acceptance cases can isolate one path without
+weakening TLS identity checks.

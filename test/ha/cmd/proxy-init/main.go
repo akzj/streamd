@@ -19,8 +19,12 @@ type proxy struct {
 func main() {
 	endpoint := env("TOXIPROXY_API", "http://toxiproxy:8474")
 	proxies := []proxy{
-		{Name: "etcd-primary", Listen: "0.0.0.0:12379", Upstream: "etcd:2379", Enabled: true},
-		{Name: "etcd-standby", Listen: "0.0.0.0:22379", Upstream: "etcd:2379", Enabled: true},
+		{Name: "etcd-primary-1", Listen: "0.0.0.0:12379", Upstream: "etcd-1:2379", Enabled: true},
+		{Name: "etcd-primary-2", Listen: "0.0.0.0:12380", Upstream: "etcd-2:2379", Enabled: true},
+		{Name: "etcd-primary-3", Listen: "0.0.0.0:12381", Upstream: "etcd-3:2379", Enabled: true},
+		{Name: "etcd-standby-1", Listen: "0.0.0.0:22379", Upstream: "etcd-1:2379", Enabled: true},
+		{Name: "etcd-standby-2", Listen: "0.0.0.0:22380", Upstream: "etcd-2:2379", Enabled: true},
+		{Name: "etcd-standby-3", Listen: "0.0.0.0:22381", Upstream: "etcd-3:2379", Enabled: true},
 		{Name: "standby", Listen: "0.0.0.0:17443", Upstream: "streamd-standby:7443", Enabled: true},
 	}
 	client := &http.Client{Timeout: 2 * time.Second}

@@ -1,30 +1,92 @@
 services:
-  etcd:
+  etcd-1:
     image: gcr.io/etcd-development/etcd:v3.6.5@sha256:042ef9c02799eb9303abf1aa99b09f09d94b8ee3ba0c2dd3f42dc4e1d3dce534
     command:
       - /usr/local/bin/etcd
-      - --name=etcd
+      - --name=etcd-1
       - --data-dir=/var/lib/etcd
       - --listen-client-urls=https://0.0.0.0:2379
-      - --advertise-client-urls=https://etcd:2379
+      - --advertise-client-urls=https://etcd-1:2379
       - --cert-file=/certs/etcd.crt
       - --key-file=/certs/etcd.key
       - --trusted-ca-file=/certs/ca.crt
       - --client-cert-auth=true
       - --listen-peer-urls=https://0.0.0.0:2380
-      - --initial-advertise-peer-urls=https://etcd:2380
+      - --initial-advertise-peer-urls=https://etcd-1:2380
       - --peer-cert-file=/certs/etcd.crt
       - --peer-key-file=/certs/etcd.key
       - --peer-trusted-ca-file=/certs/ca.crt
       - --peer-client-cert-auth=true
-      - --initial-cluster=etcd=https://etcd:2380
+      - --initial-cluster=etcd-1=https://etcd-1:2380,etcd-2=https://etcd-2:2380,etcd-3=https://etcd-3:2380
       - --initial-cluster-state=new
       - --initial-cluster-token=streamd-ha-test
     volumes:
-      - etcd-data:/var/lib/etcd
+      - etcd-1-data:/var/lib/etcd
       - ${HA_RUN_DIR:?HA_RUN_DIR is required}/certs:/certs:ro
     healthcheck:
-      test: ["CMD", "/usr/local/bin/etcdctl", "--endpoints=https://etcd:2379", "--cacert=/certs/ca.crt", "--cert=/certs/etcd-client.crt", "--key=/certs/etcd-client.key", "endpoint", "health"]
+      test: ["CMD", "/usr/local/bin/etcdctl", "--endpoints=https://etcd-1:2379", "--cacert=/certs/ca.crt", "--cert=/certs/etcd-client.crt", "--key=/certs/etcd-client.key", "endpoint", "health"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+    networks: [ha]
+
+  etcd-2:
+    image: gcr.io/etcd-development/etcd:v3.6.5@sha256:042ef9c02799eb9303abf1aa99b09f09d94b8ee3ba0c2dd3f42dc4e1d3dce534
+    command:
+      - /usr/local/bin/etcd
+      - --name=etcd-2
+      - --data-dir=/var/lib/etcd
+      - --listen-client-urls=https://0.0.0.0:2379
+      - --advertise-client-urls=https://etcd-2:2379
+      - --cert-file=/certs/etcd.crt
+      - --key-file=/certs/etcd.key
+      - --trusted-ca-file=/certs/ca.crt
+      - --client-cert-auth=true
+      - --listen-peer-urls=https://0.0.0.0:2380
+      - --initial-advertise-peer-urls=https://etcd-2:2380
+      - --peer-cert-file=/certs/etcd.crt
+      - --peer-key-file=/certs/etcd.key
+      - --peer-trusted-ca-file=/certs/ca.crt
+      - --peer-client-cert-auth=true
+      - --initial-cluster=etcd-1=https://etcd-1:2380,etcd-2=https://etcd-2:2380,etcd-3=https://etcd-3:2380
+      - --initial-cluster-state=new
+      - --initial-cluster-token=streamd-ha-test
+    volumes:
+      - etcd-2-data:/var/lib/etcd
+      - ${HA_RUN_DIR:?HA_RUN_DIR is required}/certs:/certs:ro
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/etcdctl", "--endpoints=https://etcd-2:2379", "--cacert=/certs/ca.crt", "--cert=/certs/etcd-client.crt", "--key=/certs/etcd-client.key", "endpoint", "health"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+    networks: [ha]
+
+  etcd-3:
+    image: gcr.io/etcd-development/etcd:v3.6.5@sha256:042ef9c02799eb9303abf1aa99b09f09d94b8ee3ba0c2dd3f42dc4e1d3dce534
+    command:
+      - /usr/local/bin/etcd
+      - --name=etcd-3
+      - --data-dir=/var/lib/etcd
+      - --listen-client-urls=https://0.0.0.0:2379
+      - --advertise-client-urls=https://etcd-3:2379
+      - --cert-file=/certs/etcd.crt
+      - --key-file=/certs/etcd.key
+      - --trusted-ca-file=/certs/ca.crt
+      - --client-cert-auth=true
+      - --listen-peer-urls=https://0.0.0.0:2380
+      - --initial-advertise-peer-urls=https://etcd-3:2380
+      - --peer-cert-file=/certs/etcd.crt
+      - --peer-key-file=/certs/etcd.key
+      - --peer-trusted-ca-file=/certs/ca.crt
+      - --peer-client-cert-auth=true
+      - --initial-cluster=etcd-1=https://etcd-1:2380,etcd-2=https://etcd-2:2380,etcd-3=https://etcd-3:2380
+      - --initial-cluster-state=new
+      - --initial-cluster-token=streamd-ha-test
+    volumes:
+      - etcd-3-data:/var/lib/etcd
+      - ${HA_RUN_DIR:?HA_RUN_DIR is required}/certs:/certs:ro
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/etcdctl", "--endpoints=https://etcd-3:2379", "--cacert=/certs/ca.crt", "--cert=/certs/etcd-client.crt", "--key=/certs/etcd-client.key", "endpoint", "health"]
       interval: 1s
       timeout: 3s
       retries: 30
@@ -59,7 +121,11 @@ services:
       - ${HA_RUN_DIR:?HA_RUN_DIR is required}/certs:/etc/streamd/tls:ro
       - ${HA_RUN_DIR:?HA_RUN_DIR is required}/certs:/etc/streamd/etcd:ro
     depends_on:
-      etcd:
+      etcd-1:
+        condition: service_healthy
+      etcd-2:
+        condition: service_healthy
+      etcd-3:
         condition: service_healthy
       proxy-init:
         condition: service_completed_successfully
@@ -83,7 +149,11 @@ services:
       - ${HA_RUN_DIR:?HA_RUN_DIR is required}/certs:/etc/streamd/tls:ro
       - ${HA_RUN_DIR:?HA_RUN_DIR is required}/certs:/etc/streamd/etcd:ro
     depends_on:
-      etcd:
+      etcd-1:
+        condition: service_healthy
+      etcd-2:
+        condition: service_healthy
+      etcd-3:
         condition: service_healthy
       proxy-init:
         condition: service_completed_successfully
@@ -118,6 +188,8 @@ networks:
   ha: {}
 
 volumes:
-  etcd-data: {}
+  etcd-1-data: {}
+  etcd-2-data: {}
+  etcd-3-data: {}
   primary-data: {}
   standby-data: {}

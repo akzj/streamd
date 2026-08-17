@@ -127,7 +127,7 @@ func prepare(out string) error {
 		uris []string
 		both bool
 	}{
-		{name: "etcd", dns: []string{"etcd"}, both: true},
+		{name: "etcd", dns: []string{"etcd", "etcd-1", "etcd-2", "etcd-3"}, both: true},
 		{name: "etcd-client"},
 		{name: "primary", dns: []string{"streamd-primary"}, uris: []string{nodeURI(clusterID, groupID, primaryNodeID)}, both: true},
 		{name: "standby", dns: []string{"streamd-standby"}, uris: []string{nodeURI(clusterID, groupID, standbyNodeID)}, both: true},
@@ -196,7 +196,7 @@ func (a *authority) issue(directory, name string, dns, uriStrings []string, both
 }
 
 func makeConfig(role, nodeID string) nodeConfig {
-	etcdPort := 12379
+	etcdPorts := []int{12379, 12380, 12381}
 	config := nodeConfig{
 		ListenAddress: "0.0.0.0:7443", AdminAddress: "127.0.0.1:9090", DataDirectory: "/var/lib/streamd", ClusterID: clusterID, GroupID: groupID, NodeID: nodeID,
 		ShutdownTimeout: "5s", SubscribeSendTimeout: "5s", CheckpointInterval: "1s",
@@ -205,9 +205,13 @@ func makeConfig(role, nodeID string) nodeConfig {
 		Authorization:   []authorizationRule{{Tenant: "ha", Service: "test", Namespace: "ha", StreamPrefix: "", Operations: []string{"append", "read", "subscribe", "inspect"}}},
 	}
 	if role == "standby" {
-		etcdPort = 22379
+		etcdPorts = []int{22379, 22380, 22381}
 	}
-	config.Replication = replicationConfig{Role: role, LeaseTTL: "15s", LeaseSafetyMargin: "3s", RenewInterval: "3s", MaxEntries: 1024, MaxBytes: 16 << 20, Etcd: etcdConfig{Endpoints: []string{fmt.Sprintf("https://toxiproxy:%d", etcdPort)}, Prefix: "/streamd/ha-test", DialTimeout: "3s", ServerName: "etcd", CertificateFile: "/etc/streamd/etcd/etcd-client.crt", PrivateKeyFile: "/etc/streamd/etcd/etcd-client.key", CAFile: "/etc/streamd/etcd/ca.crt"}}
+	endpoints := make([]string, 0, len(etcdPorts))
+	for _, port := range etcdPorts {
+		endpoints = append(endpoints, fmt.Sprintf("https://toxiproxy:%d", port))
+	}
+	config.Replication = replicationConfig{Role: role, LeaseTTL: "15s", LeaseSafetyMargin: "3s", RenewInterval: "3s", MaxEntries: 1024, MaxBytes: 16 << 20, Etcd: etcdConfig{Endpoints: endpoints, Prefix: "/streamd/ha-test", DialTimeout: "3s", ServerName: "etcd", CertificateFile: "/etc/streamd/etcd/etcd-client.crt", PrivateKeyFile: "/etc/streamd/etcd/etcd-client.key", CAFile: "/etc/streamd/etcd/ca.crt"}}
 	if role == "primary" {
 		config.Replication.PeerAddress = "toxiproxy:17443"
 		config.Replication.PeerServerName = "streamd-standby"

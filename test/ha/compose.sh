@@ -59,7 +59,7 @@ case "$command" in
     ;;
   up)
     prepare
-    compose up -d --build --wait --wait-timeout 120 etcd toxiproxy proxy-init streamd-primary streamd-standby
+    compose up -d --build --wait --wait-timeout 120 etcd-1 etcd-2 etcd-3 toxiproxy proxy-init streamd-primary streamd-standby
     ;;
   test)
     prepare
@@ -76,7 +76,7 @@ case "$command" in
   all)
     prepare
     trap 'down >/dev/null 2>&1 || true; cleanup_files' EXIT INT TERM
-    compose up -d --build --wait --wait-timeout 120 etcd toxiproxy proxy-init streamd-primary streamd-standby
+    compose up -d --build --wait --wait-timeout 120 etcd-1 etcd-2 etcd-3 toxiproxy proxy-init streamd-primary streamd-standby
     compose --profile test run --rm --build test-runner
     ;;
   *)
