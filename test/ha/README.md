@@ -11,6 +11,13 @@ Run the complete test with automatic cleanup:
 make test-ha
 ```
 
+Repeat the complete isolated acceptance run (default 10 times):
+
+```bash
+make test-ha-repeat
+HA_REPEAT=100 make test-ha-repeat
+```
+
 For interactive diagnosis:
 
 ```bash
@@ -45,3 +52,8 @@ Finally, the suite creates and verifies an offline installable Snapshot, runs
 the guarded WAL collector, resets only the disposable Standby data volume,
 installs the Snapshot, and proves the restored Standby can rejoin and sustain a
 new Strict append. WAL files are never removed directly by the harness.
+
+On failure the harness still removes containers, networks, and volumes, but
+first preserves service logs below `.tmp/ha-artifacts/`. CI uploads that
+directory as a short-lived diagnostic artifact. The nightly workflow runs ten
+fresh projects; the 100-run command is the release-candidate stability gate.

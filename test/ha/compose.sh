@@ -56,6 +56,21 @@ cleanup_files() {
   fi
 }
 
+finish_all() {
+  status=$?
+  trap - EXIT INT TERM
+  set +e
+  if [ "$status" -ne 0 ]; then
+    artifact_dir=${HA_ARTIFACT_DIR:-"$repo_root/.tmp/ha-artifacts"}
+    mkdir -p "$artifact_dir"
+    compose --profile test --profile maintenance logs --no-color >"$artifact_dir/$project.log" 2>&1
+    echo "HA diagnostic logs: $artifact_dir/$project.log" >&2
+  fi
+  down >/dev/null 2>&1
+  cleanup_files
+  exit "$status"
+}
+
 case "$command" in
   prepare)
     prepare
@@ -78,7 +93,9 @@ case "$command" in
     ;;
   all)
     prepare
-    trap 'down >/dev/null 2>&1 || true; cleanup_files' EXIT INT TERM
+    trap finish_all EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
     compose up -d --build --wait --wait-timeout 120 etcd-1 etcd-2 etcd-3 toxiproxy proxy-init streamd-primary streamd-standby
     compose --profile test run --rm --build test-runner
     compose stop -t 1 etcd-3
