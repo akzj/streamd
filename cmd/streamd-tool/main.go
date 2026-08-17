@@ -9,6 +9,8 @@ import (
 	"strings"
 
 	"github.com/akzj/streamd/internal/storage/format"
+	"github.com/akzj/streamd/internal/storage/identity"
+	"github.com/akzj/streamd/internal/storage/retention"
 	"github.com/akzj/streamd/internal/storage/scrub"
 	"github.com/akzj/streamd/internal/storage/snapshot"
 )
@@ -67,6 +69,24 @@ func main() {
 		var resumed bool
 		resumed, err = snapshot.ResumeInstall(*data, nil)
 		result = map[string]bool{"resumed": resumed}
+	case "collect-wal":
+		flags := flag.NewFlagSet("collect-wal", flag.ExitOnError)
+		data := flags.String("data", "", "offline streamd data directory")
+		snapshotPath := flags.String("snapshot", "", "verified Snapshot pinned below the data snapshots directory")
+		maxRetainedBytes := flags.Uint64("max-retained-bytes", 0, "optional retained WAL byte budget")
+		_ = flags.Parse(os.Args[2:])
+		if *data == "" || *snapshotPath == "" {
+			usage()
+		}
+		var node format.NodeIdentity
+		node, err = identity.Load(*data)
+		if err == nil {
+			var manager *retention.Manager
+			manager, err = retention.Open(*data, node)
+			if err == nil {
+				result, err = manager.Collect(*snapshotPath, *maxRetainedBytes)
+			}
+		}
 	default:
 		usage()
 	}
@@ -83,7 +103,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: streamd-tool scrub -data DIR | snapshot -data DIR -out DIR | verify-snapshot -path DIR | install-snapshot -data DIR -path DIR -term N -leader-id UUID | resume-install -data DIR")
+	fmt.Fprintln(os.Stderr, "usage: streamd-tool scrub -data DIR | snapshot -data DIR -out DIR | verify-snapshot -path DIR | install-snapshot -data DIR -path DIR -term N -leader-id UUID | resume-install -data DIR | collect-wal -data DIR -snapshot DIR [-max-retained-bytes N]")
 	os.Exit(2)
 }
 

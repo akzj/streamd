@@ -308,6 +308,20 @@ Strict Standby 提供单节点故障 RPO=0；Snapshot 提供磁盘全损、误�
 
 没有 Restore Drill 的 Snapshot 不视为已验证备份体系。
 
+### 9.4 WAL 回收
+
+WAL 只能在节点离线时通过已验证且固定在数据根 `snapshots/` 下的 Snapshot 回收：
+
+```bash
+streamd-tool collect-wal \
+  -data /var/lib/streamd \
+  -snapshot /var/lib/streamd/snapshots/checkpoint
+```
+
+命令同时校验 Manifest 覆盖、Snapshot Checkpoint、Strict 副本 durable 水位和连续 WAL
+前缀，并原子推进 `earliest_wal_entry_id`。禁止直接删除 `wal/` 文件。可选的
+`-max-retained-bytes` 只报告保留压力，不会越过安全水位强制删除。
+
 ## 10. Failover Runbook
 
 ### 10.1 自动切换前提
