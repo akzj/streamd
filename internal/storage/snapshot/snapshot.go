@@ -39,20 +39,21 @@ func Create(dataRoot, destination string) (result Result, err error) {
 	if err != nil {
 		return result, fmt.Errorf("NODE: %w", err)
 	}
-	term := uint64(0)
 	states, err := replicationstate.Open(dataAbs, node)
 	if err != nil {
 		return result, fmt.Errorf("Replication State: %w", err)
 	}
 	if current, ok := states.Current(); ok {
-		term = current.Header.Term
+		if current.Header.Role != format.ReplicationRoleSingle {
+			return result, fmt.Errorf("offline Snapshot creation is unavailable for replicated data roots; create it from a running Strict Primary")
+		}
 	}
 	store, err := engine.Open(dataAbs)
 	if err != nil {
 		return result, err
 	}
 	defer func() { err = errors.Join(err, store.Close()) }()
-	return createOnline(store, destination, term)
+	return createOnline(store, destination, 0)
 }
 
 // CreateOnline takes a short engine checkpoint and then copies only immutable
@@ -62,7 +63,11 @@ func CreateOnline(store *engine.Store, destination string) (result Result, err e
 	if store == nil {
 		return result, fmt.Errorf("Snapshot engine is required")
 	}
-	return createOnline(store, destination, store.Health().Term)
+	health := store.Health()
+	if err = validateSource(health); err != nil {
+		return result, err
+	}
+	return createOnline(store, destination, health.Term)
 }
 
 func createOnline(store *engine.Store, destination string, term uint64) (result Result, err error) {
@@ -88,6 +93,19 @@ func createOnline(store *engine.Store, destination string, term uint64) (result 
 		return result, err
 	}
 	defer releaseManifest()
+	if manifest.Header.RecordCount == 0 {
+		return result, fmt.Errorf("empty data roots do not have an installable V1 Manifest")
+	}
+	health := store.Health()
+	if err = validateSource(health); err != nil {
+		return result, err
+	}
+	if health.Term != term {
+		return result, fmt.Errorf("Snapshot source Term changed from %d to %d", term, health.Term)
+	}
+	if health.Role == format.ReplicationRolePrimary && (!health.Watermarks.HasCommitted || manifest.Header.LastEntryID > health.Watermarks.Committed) {
+		return result, fmt.Errorf("Snapshot checkpoint Entry %d is not covered by committed watermark", manifest.Header.LastEntryID)
+	}
 	node, err := identity.Load(dataAbs)
 	if err != nil {
 		return result, fmt.Errorf("NODE: %w", err)
@@ -103,9 +121,6 @@ func createOnline(store *engine.Store, destination string, term uint64) (result 
 	}
 	if verifiedManifest.Header.FileID != manifest.Header.FileID || verifiedManifest.Footer.ContentSHA256 != manifest.Footer.ContentSHA256 {
 		return result, fmt.Errorf("checkpoint Manifest changed while creating Snapshot")
-	}
-	if manifest.Header.RecordCount == 0 {
-		return result, fmt.Errorf("empty data roots do not have an installable V1 Manifest")
 	}
 	parent := filepath.Dir(destination)
 	staging, err := os.MkdirTemp(parent, ".streamd-snapshot-")
@@ -227,6 +242,28 @@ func createOnline(store *engine.Store, destination string, term uint64) (result 
 		return result, err
 	}
 	return Result{Path: destination, SnapshotID: snapshotID, GroupID: node.GroupID, Term: term, ManifestGeneration: manifest.Header.Generation, CheckpointEntryID: manifest.Header.LastEntryID, CheckpointCRC32C: manifest.Header.LastEntryCRC32C, Artifacts: uint64(len(artifacts))}, nil
+}
+
+func validateSource(health engine.Health) error {
+	if health.Fatal != nil {
+		return fmt.Errorf("Snapshot source is failed: %w", health.Fatal)
+	}
+	switch health.Role {
+	case format.ReplicationRoleSingle:
+		if health.Durability != format.ReplicationDurabilitySingleSync {
+			return fmt.Errorf("Single Snapshot source has invalid durability %d", health.Durability)
+		}
+	case format.ReplicationRolePrimary:
+		if health.Durability != format.ReplicationDurabilityStrict {
+			return fmt.Errorf("replicated Snapshot source is not a Strict Primary")
+		}
+		if health.WriteUnavailable != nil {
+			return fmt.Errorf("Strict Primary is not safely writable: %w", health.WriteUnavailable)
+		}
+	default:
+		return fmt.Errorf("Snapshot source role %d cannot create a Snapshot", health.Role)
+	}
+	return nil
 }
 
 func Verify(path string) (Result, error) {

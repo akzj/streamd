@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -15,6 +16,26 @@ import (
 )
 
 var errInstallCrash = errors.New("install crash")
+
+type snapshotGuard struct {
+	err error
+}
+
+func (g *snapshotGuard) CanCommit() error { return g.err }
+
+type snapshotReplica struct {
+	err error
+}
+
+func (r *snapshotReplica) Replicate(_ context.Context, encoded [][]byte) (uint64, error) {
+	if r.err != nil {
+		return 0, r.err
+	}
+	entry, err := format.UnmarshalWALEntry(encoded[len(encoded)-1])
+	return entry.EntryID, err
+}
+
+func (*snapshotReplica) AdvanceCommit(context.Context, uint64) error { return nil }
 
 func TestCreateVerifyAndScrubSnapshot(t *testing.T) {
 	data := filepath.Join(t.TempDir(), "data")
@@ -95,7 +116,7 @@ func TestCreateVerifyAndScrubSnapshot(t *testing.T) {
 	}
 }
 
-func TestOfflineCreatePreservesDurableReplicationTerm(t *testing.T) {
+func TestOfflineCreateRejectsReplicatedDataRoot(t *testing.T) {
 	data := filepath.Join(t.TempDir(), "data")
 	node := format.NodeIdentity{ClusterID: snapshotID(1), GroupID: snapshotID(2), NodeID: snapshotID(3), CreatedAt: 1}
 	store, err := engine.OpenWithIdentity(data, node)
@@ -135,12 +156,73 @@ func TestOfflineCreatePreservesDurableReplicationTerm(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	created, err := Create(data, filepath.Join(t.TempDir(), "snapshot"))
+	destination := filepath.Join(t.TempDir(), "snapshot")
+	if _, err = Create(data, destination); err == nil || !strings.Contains(err.Error(), "running Strict Primary") {
+		t.Fatalf("offline replicated Snapshot error = %v", err)
+	}
+	if _, statErr := os.Stat(destination); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("rejected Snapshot destination exists: %v", statErr)
+	}
+}
+
+func TestCreateOnlineStrictPrimaryRequiresCommittedWritableSource(t *testing.T) {
+	data := filepath.Join(t.TempDir(), "data")
+	node := format.NodeIdentity{ClusterID: snapshotID(1), GroupID: snapshotID(2), NodeID: snapshotID(3), CreatedAt: 1}
+	guard := &snapshotGuard{}
+	replica := &snapshotReplica{}
+	store, err := engine.OpenReplicated(data, node, engine.ReplicationOptions{Term: 7, Role: format.ReplicationRolePrimary, Durability: format.ReplicationDurabilityStrict, Replica: replica, Guard: guard})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if created.Term != 7 {
-		t.Fatalf("Snapshot Term = %d, want 7", created.Term)
+	defer store.Close()
+	if _, err = store.Append(context.Background(), engine.AppendRequest{Namespace: "n", Stream: "s", RequestID: []byte("r"), Producer: "test", Records: []engine.InputRecord{{Payload: []byte("record")}}}); err != nil {
+		t.Fatal(err)
+	}
+	created, err := CreateOnline(store, filepath.Join(t.TempDir(), "snapshot"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	health := store.Health()
+	if created.Term != 7 || !health.Watermarks.HasCommitted || created.CheckpointEntryID > health.Watermarks.Committed {
+		t.Fatalf("Snapshot = %+v, Health = %+v", created, health)
+	}
+
+	guard.err = errors.New("lease expired")
+	destination := filepath.Join(t.TempDir(), "unsafe-snapshot")
+	if _, err = CreateOnline(store, destination); err == nil || !strings.Contains(err.Error(), "not safely writable") {
+		t.Fatalf("unsafe Primary Snapshot error = %v", err)
+	}
+	if _, statErr := os.Stat(destination); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("unsafe Snapshot destination exists: %v", statErr)
+	}
+}
+
+func TestCreateOnlineRejectsUncertainStrictSuffix(t *testing.T) {
+	data := filepath.Join(t.TempDir(), "data")
+	node := format.NodeIdentity{ClusterID: snapshotID(1), GroupID: snapshotID(2), NodeID: snapshotID(3), CreatedAt: 1}
+	guard := &snapshotGuard{}
+	replica := &snapshotReplica{}
+	store, err := engine.OpenReplicated(data, node, engine.ReplicationOptions{Term: 7, Role: format.ReplicationRolePrimary, Durability: format.ReplicationDurabilityStrict, Replica: replica, Guard: guard})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.Append(context.Background(), engine.AppendRequest{Namespace: "n", Stream: "s", RequestID: []byte("committed"), Producer: "test", Records: []engine.InputRecord{{Payload: []byte("record")}}}); err != nil {
+		t.Fatal(err)
+	}
+	replica.err = errors.New("standby unavailable")
+	_, appendErr := store.Append(context.Background(), engine.AppendRequest{Namespace: "n", Stream: "s", ExpectedSequence: 1, RequestID: []byte("uncertain"), Producer: "test", Records: []engine.InputRecord{{Payload: []byte("uncertain")}}})
+	if appendErr == nil {
+		t.Fatal("partitioned Strict Append succeeded")
+	}
+	destination := filepath.Join(t.TempDir(), "snapshot")
+	if _, err = CreateOnline(store, destination); err == nil || !strings.Contains(err.Error(), "source is failed") {
+		t.Fatalf("uncertain suffix Snapshot error = %v", err)
+	}
+	if _, statErr := os.Stat(destination); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("uncertain Snapshot destination exists: %v", statErr)
+	}
+	if closeErr := store.Close(); closeErr == nil {
+		t.Fatal("failed Strict commit was absent from Close error")
 	}
 }
 

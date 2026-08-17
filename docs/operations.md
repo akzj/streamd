@@ -285,7 +285,7 @@ FAILED
 
 ## 9. 备份与 Snapshot
 
-单节点 V1 提供离线工具：
+Single V1 提供离线工具：
 
 ```bash
 streamd-tool scrub -data /var/lib/streamd
@@ -294,6 +294,12 @@ streamd-tool verify-snapshot -path /backup/streamd-snapshot-001
 ```
 
 三个命令都会失败关闭。`scrub` 需要取得数据目录独占锁并逐 Frame、Segment SHA-256、Manifest 引用、Stream Extent 和 WAL 链校验；`snapshot` 同样要求节点离线，先完成 Checkpoint，再原子发布包含 CURRENT、Manifest、全部 Segment 和 Snapshot Manifest 的新目录。目标目录不得位于数据根内部且必须尚不存在。
+
+离线 `snapshot` 只接受 Single 数据目录。它遇到 PRIMARY、STANDBY 或 RECOVERING Replication
+State 时必须拒绝，不能按 Single 恢复规则把物理 WAL 尾部推断为 committed。Strict HA Snapshot
+只能由运行中的 Strict Primary Engine 创建：创建前后都要求节点无 fatal、Lease Guard 可写，并验证
+Snapshot Checkpoint 不晚于 committed watermark。当前 `CreateOnline` 是内部集成入口，尚未提供管理
+RPC 或周期调度；在该入口接入以前，Strict HA 不得使用离线命令替代。
 
 ### 9.1 策略
 
