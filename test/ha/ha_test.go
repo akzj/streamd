@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -39,6 +40,9 @@ func TestComposeStrictHA(t *testing.T) {
 		return
 	case "recovery-lease-loss":
 		testRecoveryLeaseLoss(t)
+		return
+	case "log-diverged":
+		testLogDivergedDiagnostics(t)
 		return
 	}
 	client, closeClient := streamClient(t)
@@ -70,6 +74,9 @@ func TestComposeStrictHA(t *testing.T) {
 		return
 	case "after-snapshot":
 		testAfterSnapshot(t, client)
+		return
+	case "after-divergence-recovery":
+		testAfterDivergenceRecovery(t, client)
 		return
 	case "":
 	default:
@@ -137,6 +144,44 @@ func TestComposeStrictHA(t *testing.T) {
 
 }
 
+func testLogDivergedDiagnostics(t *testing.T) {
+	expectedEntryID := envUint64(t, "HA_DIVERGED_ENTRY_ID")
+	expectedCRC := uint32(envUint64(t, "HA_DIVERGED_CRC32C"))
+	connection, err := net.DialTimeout("tcp", primaryAddress, time.Second)
+	if err == nil {
+		_ = connection.Close()
+		t.Fatal("log-diverged Primary public gRPC listener is open")
+	}
+	deadline := time.Now().Add(30 * time.Second)
+	var snapshot diagnostics.Snapshot
+	for {
+		snapshot, err = fetchDiagnostics("http://streamd-primary:19090/diagnostics")
+		if err == nil && snapshot.Recovery != nil && snapshot.Recovery.Reason == diagnostics.RecoveryLogDiverged {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("log-diverged diagnostics did not become available: snapshot=%+v error=%v", snapshot, err)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	task := snapshot.Recovery
+	if snapshot.Ready || snapshot.WriteReady || snapshot.Status != diagnostics.StatusDegraded || snapshot.Role != "primary" || !hasReason(snapshot, diagnostics.ReasonSnapshotRequired) || task.Action != diagnostics.RecoveryInstallSnapshot || task.SourceNodeID != "33333333333333333333333333333333" || task.TargetNodeID != "44444444444444444444444444444444" || task.TargetDurableEntryID == nil || *task.TargetDurableEntryID != expectedEntryID || task.TargetDurableCRC32C == nil || *task.TargetDurableCRC32C != expectedCRC || len(task.TaskID) != 64 {
+		t.Fatalf("log-diverged recovery diagnostics = %+v", snapshot)
+	}
+	repeated, repeatErr := fetchDiagnostics("http://streamd-primary:19090/diagnostics")
+	if repeatErr != nil || repeated.Recovery == nil || repeated.Recovery.TaskID != task.TaskID {
+		t.Fatalf("repeated log-diverged diagnostics = %+v, error = %v", repeated, repeatErr)
+	}
+	t.Logf("RECOVERY_TERM=%d RECOVERY_TASK_ID=%s", task.Term, task.TaskID)
+}
+
+func testAfterDivergenceRecovery(t *testing.T, client streamdv1.StreamServiceClient) {
+	waitReady(t, client)
+	assertStreamRecords(t, client, "snapshot-events", "before-snapshot", "after-snapshot")
+	appendRecord(t, client, "divergence-events", 0, "ha-divergence-recovered", "after-divergence-recovery")
+	assertStreamRecords(t, client, "divergence-events", "after-divergence-recovery")
+}
+
 func testRecoveryLeaseLoss(t *testing.T) {
 	expectedTaskID := env("HA_RECOVERY_TASK_ID", "")
 	if expectedTaskID == "" {
@@ -162,6 +207,16 @@ func hasReason(snapshot diagnostics.Snapshot, code diagnostics.ReasonCode) bool 
 		}
 	}
 	return false
+}
+
+func envUint64(t *testing.T, name string) uint64 {
+	t.Helper()
+	value := env(name, "")
+	parsed, err := strconv.ParseUint(value, 10, 64)
+	if err != nil {
+		t.Fatalf("%s=%q is not a uint64: %v", name, value, err)
+	}
+	return parsed
 }
 
 func testNeedsSnapshotDiagnostics(t *testing.T) {

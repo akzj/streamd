@@ -164,6 +164,33 @@ case "$command" in
       -term "$recovery_term" -leader-id 33333333-3333-3333-3333-333333333333
     compose up -d --force-recreate --wait --wait-timeout 120 streamd-primary streamd-standby
     compose --profile test run --rm --no-deps -e HA_SCENARIO=after-snapshot test-runner
+    compose stop -t 10 streamd-primary streamd-standby
+    divergence_snapshot_json=$(compose --profile maintenance run --rm --no-deps --build maintenance-primary \
+      snapshot-primary -data /var/lib/streamd -out /var/lib/streamd/snapshots/divergence)
+    divergence_snapshot_term=$(printf '%s\n' "$divergence_snapshot_json" | sed -n '/^{/,$p' | jq -er '.Term | select(. > 0)')
+    compose --profile maintenance run --rm --no-deps maintenance-primary \
+      verify-snapshot -path /var/lib/streamd/snapshots/divergence
+    divergence_json=$(compose --profile maintenance run --rm --no-deps --build inject-divergence \
+      -data /var/lib/streamd)
+    divergence_entry_id=$(printf '%s\n' "$divergence_json" | sed -n '/^{/,$p' | jq -er '.entry_id')
+    divergence_crc32c=$(printf '%s\n' "$divergence_json" | sed -n '/^{/,$p' | jq -er '.crc32c')
+    compose up -d --force-recreate streamd-primary streamd-standby
+    compose --profile test up -d --no-deps primary-admin-proxy
+    divergence_recovery_output=$(compose --profile test run --rm --no-deps \
+      -e HA_SCENARIO=log-diverged \
+      -e HA_DIVERGED_ENTRY_ID="$divergence_entry_id" \
+      -e HA_DIVERGED_CRC32C="$divergence_crc32c" \
+      test-runner 2>&1)
+    printf '%s\n' "$divergence_recovery_output"
+    divergence_recovery_term=$(printf '%s\n' "$divergence_recovery_output" | sed -n 's/.*RECOVERY_TERM=\([0-9][0-9]*\).*/\1/p' | tail -n 1)
+    test -n "$divergence_recovery_term"
+    test "$divergence_recovery_term" -ge "$divergence_snapshot_term"
+    compose stop -t 10 primary-admin-proxy streamd-primary streamd-standby
+    compose --profile maintenance run --rm --no-deps maintenance-standby \
+      install-snapshot -data /var/lib/streamd -path /snapshots/divergence \
+      -term "$divergence_recovery_term" -leader-id 33333333-3333-3333-3333-333333333333
+    compose up -d --force-recreate --wait --wait-timeout 120 streamd-primary streamd-standby
+    compose --profile test run --rm --no-deps -e HA_SCENARIO=after-divergence-recovery test-runner
     compose --profile test run --rm --no-deps -e HA_SCENARIO=standby-partition test-runner
     ;;
   *)

@@ -367,6 +367,13 @@ func TestInstallAndCrashResumeAreAtomic(t *testing.T) {
 			if resumeErr != nil || resumed {
 				t.Fatalf("completed Resume = %v, %v", resumed, resumeErr)
 			}
+			history, historyErr := wal.OpenHistory(target)
+			if historyErr != nil {
+				t.Fatalf("installed WAL history: %v", historyErr)
+			}
+			if _, _, present := history.Bounds(); present {
+				t.Fatal("installed Snapshot retained replaced WAL entries")
+			}
 			reopened, openErr := engine.OpenReplicated(target, targetNode, engine.ReplicationOptions{Term: 7, Role: format.ReplicationRoleStandby, Durability: format.ReplicationDurabilityStrict, Guard: &snapshotGuard{}})
 			if openErr != nil {
 				t.Fatal(openErr)

@@ -214,6 +214,9 @@ func resumeInstallLocked(root string, node format.NodeIdentity, now func() time.
 	if err = newWAL.Close(); err != nil {
 		return err
 	}
+	if err = removeReplacedWALFiles(root); err != nil {
+		return err
+	}
 	if hook != nil {
 		if err = hook("after_install_wal"); err != nil {
 			return err
@@ -273,6 +276,38 @@ func resumeInstallLocked(root string, node format.NodeIdentity, now func() time.
 		return err
 	}
 	return fsutil.SyncDir(filepath.Join(root, "staging"))
+}
+
+// removeReplacedWALFiles completes the WAL side of Snapshot replacement. Once
+// CreateAfter has durably published the new WAL-CURRENT, every older WAL file
+// belongs to the replaced history. Leaving the former active file in place is
+// unsafe because History correctly interprets every non-current WAL as sealed,
+// while an active file has no seal footer. The install journal makes this
+// operation restartable: a crash may publish another empty current WAL, and a
+// resumed install removes every superseded file again.
+func removeReplacedWALFiles(root string) error {
+	pointerBytes, err := os.ReadFile(filepath.Join(root, "WAL-CURRENT"))
+	if err != nil {
+		return err
+	}
+	pointer, err := format.UnmarshalWALCurrentPointer(pointerBytes)
+	if err != nil {
+		return err
+	}
+	walDir := filepath.Join(root, "wal")
+	paths, err := filepath.Glob(filepath.Join(walDir, "*.log"))
+	if err != nil {
+		return err
+	}
+	for _, path := range paths {
+		if filepath.Base(path) == pointer.FileName {
+			continue
+		}
+		if err = os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	return fsutil.SyncDir(walDir)
 }
 
 func readInstallJournal(path string) (installJournal, error) {

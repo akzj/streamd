@@ -258,6 +258,16 @@ services:
     network_mode: none
     profiles: [maintenance]
 
+  inject-divergence:
+    build:
+      context: ../..
+      dockerfile: test/ha/Dockerfile
+      target: ha-fault-injector
+    volumes:
+      - standby-data:/var/lib/streamd
+    network_mode: none
+    profiles: [maintenance]
+
   reset-standby:
     build:
       context: ../..
