@@ -63,6 +63,11 @@ func Run(ctx context.Context, config Config, logger *slog.Logger) error {
 
 	registry := prometheus.NewRegistry()
 	registry.MustRegister(prometheus.NewGoCollector(), prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}))
+	nodeMetrics, err := observe.NewNodeMetrics(config.DataDirectory, observe.EngineStateProvider(store, nil, streamService.ReadyWrite))
+	if err != nil {
+		return err
+	}
+	registry.MustRegister(nodeMetrics)
 	rpcMetrics := observe.NewRPCMetrics(registry)
 	grpcServer := grpc.NewServer(
 		grpc.Creds(credentials),

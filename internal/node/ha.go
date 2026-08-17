@@ -156,6 +156,11 @@ func runPrimary(ctx context.Context, config Config, nodeIdentity format.NodeIden
 	}
 	registry := prometheus.NewRegistry()
 	registry.MustRegister(prometheus.NewGoCollector(), prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}))
+	nodeMetrics, err := observe.NewNodeMetrics(config.DataDirectory, observe.EngineStateProvider(store, controller, streamService.ReadyWrite))
+	if err != nil {
+		return err
+	}
+	registry.MustRegister(nodeMetrics)
 	rpcMetrics := observe.NewRPCMetrics(registry)
 	grpcServer := grpc.NewServer(grpc.Creds(serverCredentials), grpc.MaxRecvMsgSize(int(replicationMessageLimit(config.Replication))), grpc.MaxSendMsgSize(int(replicationMessageLimit(config.Replication))), grpc.StatsHandler(otelgrpc.NewServerHandler()), grpc.ChainUnaryInterceptor(rpcMetrics.UnaryInterceptor()), grpc.ChainStreamInterceptor(rpcMetrics.StreamInterceptor()))
 	streamdv1.RegisterStreamServiceServer(grpcServer, streamService)
@@ -249,6 +254,11 @@ func runStandby(ctx context.Context, config Config, nodeIdentity format.NodeIden
 	protocolServer.SetStatusProvider(store.Hello)
 	registry := prometheus.NewRegistry()
 	registry.MustRegister(prometheus.NewGoCollector(), prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}))
+	nodeMetrics, err := observe.NewNodeMetrics(config.DataDirectory, observe.StandbyStateProvider(store.Receiver()))
+	if err != nil {
+		return err
+	}
+	registry.MustRegister(nodeMetrics)
 	rpcMetrics := observe.NewRPCMetrics(registry)
 	grpcServer := grpc.NewServer(grpc.Creds(serverCredentials), grpc.MaxRecvMsgSize(int(replicationMessageLimit(config.Replication))), grpc.MaxSendMsgSize(int(replicationMessageLimit(config.Replication))), grpc.StatsHandler(otelgrpc.NewServerHandler()), grpc.ChainUnaryInterceptor(rpcMetrics.UnaryInterceptor()), grpc.ChainStreamInterceptor(rpcMetrics.StreamInterceptor()))
 	streamdv1.RegisterReplicationServiceServer(grpcServer, protocolServer)
