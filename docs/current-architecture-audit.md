@@ -3,33 +3,38 @@
 | 属性 | 内容 |
 | --- | --- |
 | 审计性质 | 代码现实版整体架构审计，不是目标架构复述 |
-| 审计基线 | `ddbbdd4f6202cddea07bd7e3f978415c5fa1d560` |
+| 审计基线 | `f0b7411`（`main`，2026-08-17） |
 | 审计日期 | 2026-08-17 |
-| 审计后实施 | Snapshot/WAL GC Safety；Role/Install Recovery；显式 `snapshot-primary` 运维恢复路径 |
+| 相对上次审计新增 | Snapshot/WAL GC Safety；Role/Install Recovery；结构化 Recovery Task；三成员 etcd HA；`LOG_DIVERGED` 恢复验收 |
 | 覆盖范围 | API、存储、索引、Checkpoint、Compaction、恢复、Snapshot、WAL GC、Strict HA、并发与运维入口 |
-| 不在本次范围 | 新功能实现、性能压测、生产部署验收、协议或格式变更 |
+| 验证边界 | 代码、单元/race/vet、Compose HA；不等同于性能、长稳、磁盘故障或生产部署验收 |
 
 ## 1. 审计结论
 
-当前代码已经形成一条可以运行、测试和继续演进的单节点主路径，以及一条能够完成双 WAL
-Strict Append 的主备路径。WAL、MemTable、Segment、Manifest、投影索引、mTLS/RBAC、复制水位、
-Lease Fencing 和诊断接口之间已经存在真实调用关系，不是只有接口或设计占位。
+当前代码已经形成两条真实主路径：Single 本地同步存储，以及固定双节点的 Strict Primary/Standby。
+后者已经在三成员 etcd 下验证双 WAL durable ack、单成员故障、quorum 丢失写入 Fencing、进程级
+Failover/Failback、Snapshot 安装、WAL GC、空盘 Standby 恢复和恢复阻塞期间 Lease 失效。WAL、
+Segment、Manifest、投影索引、mTLS/RBAC、复制水位和诊断不是设计占位。
 
-但当前实现还不能按“生产级完整 HA Stream Store”验收。主要原因不是某个局部模块缺失，而是以下
-跨模块闭环尚未完成：
+上次审计列出的三项数据安全风险已经关闭：HA Snapshot 不再走 Single 恢复语义；WAL GC 持有数据根
+独占锁；所有角色都会在恢复和监听前续做 Snapshot Install。`PlanSnapshot` 也不再只返回进程错误，而是
+进入只开放 loopback Admin 的 recovery-blocked 状态，输出确定性 Recovery Task。
 
-1. 复制规划能判断 `PlanSnapshot`，Snapshot 也能创建、校验和原子安装，但运行时没有 Snapshot
-   传输/安装协议；Primary 遇到该计划会直接启动失败。
-2. `ResolveRejoin` 已实现并测试，但没有接入节点启动、旧主回归或 WAL 后缀处理流程。
-3. 审计时 HA 数据目录的离线 Snapshot 会通过 Single Engine 恢复全部物理 WAL；审计后的 Safety
-   Boundary 已拒绝该路径，但在线 HA Snapshot 尚未接入节点管理入口。
-4. 审计时 WAL GC 没有取得数据目录独占锁；审计后的 Safety Boundary 已让 Retention Manager 在
-   全部读取、删除和 State 发布期间持有数据根独占锁。
-5. 启动仍加载全部 Segment Descriptor 和 Stream Directory；Locator/Registry 查询已经有界，
-   但百万 Stream 的启动内存目标尚未实现。
+当前仍不能按“生产级完整 HA Stream Store”验收，原因已经从局部数据正确性转向运行闭环和规模边界：
 
-因此，建议状态是：**可以继续开发，但应先完成架构决策和 P0/P1 正确性闭环，不应继续按局部模块
-自然生长，也不应宣称已可生产部署。**
+1. Snapshot 恢复是结构化人工任务，不包含传输、执行、确认或持久任务状态机；正常数据面在任务完成前
+   保持关闭。
+2. `ResolveRejoin` 没有生产调用者；V1 明确不自动截断 divergent suffix。独立 Compose 场景已经验证
+   `LOG_DIVERGED` 进入恢复阻塞、准确报告冲突水位，并通过 Snapshot 覆盖旧后缀后重新加入；该路径仍是
+   显式运维恢复，不是自动 Rejoin。
+3. Primary 等待暂时不可达的 Standby 时尚未开放 Admin 监听；Standby 找不到当前 Leader 时直接退出，
+   启动阶段的可观测性和重试所有权仍依赖外部编排器。
+4. 启动仍加载全部 Segment Descriptor、Stream Directory 和 Stream Tail；Locator/Registry 的正常查询
+   已有界，但百万 Stream 的启动 RSS/时延目标尚未实现。
+5. 没有生产级 Snapshot/GC 调度、对象存储、容量故障策略、长稳和规模验收。
+
+结论：**可以继续开发，当前代码适合作为正确性优先的 V1 工程基线；尚不能宣称生产就绪。后续应按
+跨模块风险推进，而不是继续增加彼此孤立的存储功能。**
 
 ## 2. 代码现实中的系统边界
 
@@ -62,7 +67,12 @@ streamd-bench
 - HA 节点上的 mTLS gRPC `ReplicationService`；
 - 独立管理监听地址上的 `/livez`、`/readyz`、`/diagnostics` 和 `/metrics`。
 
-当前没有业务 HTTP Gateway。管理 HTTP 不是 Record Stream API。
+当前没有业务 HTTP Gateway。管理 HTTP 不是 Record Stream API，也没有独立认证层；配置校验强制它绑定
+loopback，测试中的 Admin Proxy 只存在于隔离 Compose 网络。
+
+当前部署单元是“一个进程、一个数据目录、一个 replication group”。Strict 数据面固定为一个 Primary
+和一个 Standby，Peer NodeID/地址静态配置；etcd 只协调 Term/Lease，不保存 Record，也不把两副本扩展成
+多 Standby 或数据 quorum。
 
 ### 2.2 真实组件图
 
@@ -97,6 +107,11 @@ Strict Primary                         Strict Standby
        +---- etcd Lease / Term                 +---- local WAL + fsync
        |                                      +---- committed MemTable apply
        +---- Replication RPC ----------------->+---- replication state checkpoint
+
+Recovery-blocked Primary
+  ├── 保持/监视当前 Lease，不开放公共 gRPC
+  ├── loopback Admin: livez / readyz(503) / diagnostics / metrics
+  └── deterministic Recovery Task -> 外部运维执行 Snapshot create/install
 ```
 
 ## 3. 两种运行模式
@@ -124,7 +139,8 @@ Single 的成功 Append 在本地 WAL `fsync` 后可见。它不承诺节点或�
 真实启动顺序：
 
 ```text
-ensure RECOVERING replication state
+ResumeInstall
+-> ensure RECOVERING replication state
 -> etcd Acquire
 -> obtain globally increasing revision as Term
 -> Promote local durable suffix
@@ -132,6 +148,7 @@ ensure RECOVERING replication state
 -> connect fixed peer with mTLS node identity
 -> query Standby Status
 -> incremental WAL catch-up
+   └── Snapshot required: Admin-only recovery-blocked state
 -> engine.OpenReplicated
 -> expose StreamService + replication negotiation service
 -> periodic storage checkpoint
@@ -147,7 +164,8 @@ Primary 在 Standby 可连接并追到本地 durable watermark 以前不会开�
 真实启动顺序：
 
 ```text
-query current leader from etcd
+ResumeInstall
+-> query current leader from etcd
 -> OpenStandby
 -> recover only through durable committed watermark
 -> open WAL History
@@ -173,7 +191,7 @@ Standby 不注册 `StreamService`，因此当前不能承担读流量。它在�
 | Read stream cache | StreamID 到 Descriptor Extent 的回退缓存 | 是 | 容量 1024 LRU |
 | Segment handle cache | 打开的 Segment Reader | 是 | 容量 64、引用计数、LRU |
 | Replication State | Term、Role 和恢复水位的持久边界 | 不能用内存状态替代 | 双 Generation 指针式更新 |
-| Snapshot | 某个 committed checkpoint 的可安装 Artifact 集合 | 否；它本身是恢复副本 | 当前由离线工具生成/安装 |
+| Snapshot | 某个 committed checkpoint 的可安装 Artifact 集合 | 否；它本身是恢复副本 | 离线工具生成/安装；在线创建仅有库入口 |
 
 必须保留一个重要区分：Tail、Locator、Registry Snapshot 损坏可以回退事实数据；Manifest、唯一
 Segment、WAL 未覆盖后缀或唯一 Snapshot 损坏不能按“投影损坏”处理。
@@ -286,7 +304,8 @@ Snapshot Manifest、安装 Journal、崩溃续装以及三组 CURRENT 指针切�
 
 WAL GC 要求当前 Manifest、已验证且位于 `data/snapshots/` 的 Snapshot，以及 replication state 的
 committed 证据。它只删除被 Segment 和 Snapshot 同时覆盖的连续 sealed WAL 前缀；Catch-up Pin 会
-阻止删除正在传输的文件。
+阻止删除正在传输的文件。Retention Manager 从读取证据到删除和 State 发布全程持有数据根独占锁，
+在线进程存在时离线命令立即失败。
 
 ## 6. Strict HA 协议现实
 
@@ -328,6 +347,11 @@ durable 之后，Committer 进入 fatal，结果标记 uncertain。
 - 分批复制到 Primary 当前 local durable；
 - 推进 Standby committed；
 - 获得安全 Lease 后，Promotion 校验并提交本地完整 durable Batch 后缀。
+- `NO_RECOVERY_SOURCE`、`LOG_DIVERGED`、`NEEDS_SNAPSHOT` 和 `PlanSnapshot` 转为 Recovery Task；
+- Recovery Task 由 action/reason、Term、Group、source/target、Snapshot、earliest WAL 和目标 durable
+  position/checksum 确定性生成，同一组事实得到同一 `task_id`；
+- recovery-blocked Primary 不监听公共 gRPC，只提供 Admin 诊断；Lease 失效后转为
+  `failed/recovering`，任务身份保持不变。
 
 未接入的路径：
 
@@ -336,6 +360,23 @@ durable 之后，Committer 进入 fatal，结果标记 uncertain。
 - `ResolveRejoin` 没有生产调用者；
 - 没有自动隔离/截断旧主的 divergent uncommitted suffix；
 - 空盘 Standby 不能仅靠当前运行时自动加入。
+
+### 6.4 当前 HA 验收覆盖
+
+Compose 使用真实进程、mTLS、三成员 etcd、Toxiproxy 和一次性 Volume，串行验证：
+
+- Strict append/read/idempotency 与 Primary/Standby 诊断水位；
+- 一个 etcd member 失效仍可写、失去 quorum 后 Lease Safety Margin 内停止写、恢复后重新服务；
+- Primary `SIGKILL` 后提升 Standby、旧主以 Snapshot 重装后 Failback；
+- 离线安全 `snapshot-primary`、Snapshot verify、WAL GC、空盘 Standby 安装与增量追赶；
+- Snapshot 恢复任务、公共 gRPC 关闭、`readyz=503`，以及恢复阻塞期间再次失去 quorum；
+- 合法但未提交的 Standby WAL 冲突后缀触发 `LOG_DIVERGED`，Recovery Task 精确绑定目标 Entry/CRC，
+  Snapshot 安装替换全部旧 WAL 后恢复 Strict Append；
+- Standby 链路分区时 Strict Append 不能成功确认。
+
+这些测试不覆盖磁盘满/只读、I/O 延迟或损坏、etcd member replacement、跨版本滚动升级、长时间网络
+抖动、对象存储故障和生产数据规模。CI 每次 push/PR 运行一次完整 HA，nightly 重复十次；这仍是验收
+门禁，不是长期稳定性或容量证明。
 
 ## 7. 并发、锁和所有权
 
@@ -378,197 +419,162 @@ Catch-up 使用独立的 WAL file Pin。
 这些 Pin 都是进程内短期 Pin。持久 Snapshot 通过复制出独立 Artifact 集合获得生命周期独立性；当前
 没有通用的持久 Pin Registry 或传输 Lease。
 
-## 8. 设计声明与代码现实
+## 8. 当前能力矩阵
 
-| 能力 | 状态 | 代码现实 |
+状态只使用三类：`Implemented` 表示生产调用链已接入且有自动化证据；`Bounded` 表示已实现但存在明确
+运行边界；`Not implemented` 表示只有设计、库函数或没有入口。
+
+| 能力 | 状态 | 代码现实与边界 |
 | --- | --- | --- |
-| gRPC Record Stream API | 已实现 | Append、AppendBatch、Read、ResolveTime、Inspect、Subscribe |
-| mTLS + namespace RBAC | 已实现 | 客户端与复制 Peer 均有身份校验 |
-| WAL/Batch/Expected Sequence/幂等 | 已实现 | Request ID + Request Hash + 已知 Sequence 直接读取 |
-| Group Commit | 已实现 | 多 Stream 合并，WAL fsync 后 Apply |
-| Segment/Manifest/Checkpoint | 已实现 | 不可变文件 + 原子 CURRENT |
-| 有界 Segment Handle | 已实现 | 默认 64、引用计数 LRU |
-| Locator Page Cache | 已实现 | 默认 256 LRU，损坏回退 Descriptor |
-| Registry Block Cache | 已实现 | Sparse Index + 默认 64 LRU，损坏回退 Registry Stream |
-| 自动有界 Compaction | 已实现 | 相邻 Segment、受输入数和字节限制 |
-| Strict 双 WAL Append | 已实现 | 两端 durable 后成功，不自动降级 |
-| etcd Term/Lease/Fencing | 已实现 | 单 leader key，Revision Term，Safety Margin |
-| 增量 WAL Catch-up | 已实现 | 启动前同步并 Pin WAL |
-| Promotion | 已实现 | 更高 Term 下验证并提交 durable suffix |
-| Snapshot 格式/校验/原子安装 | 已实现但未接入 HA 网络闭环 | Single 可离线创建；HA 只允许安全在线 Primary Engine 创建，尚无管理触发入口 |
-| 自动 Snapshot Catch-up | 未实现 | `PlanSnapshot` 后 Primary 只提供 recovery-blocked Admin 诊断，等待运维安装 |
-| 旧主 Rejoin | 仅决策函数 | 无运行时调用者，无自动 suffix 处理 |
-| 自动 WAL GC | 未实现 | 只有离线工具 |
-| 在线 Snapshot 调度 | 未实现 | `CreateOnline` 只有测试/库调用 |
-| Standby Read | 未实现 | Standby 只注册 ReplicationService |
-| HTTP Gateway | 未实现 | 只有 admin HTTP |
-| 对象存储 | 未实现 | 仅格式字段与设计边界 |
-| mmap 读取 | 未实现 | 当前 Segment/投影主要使用 ReadAt/pread |
-| 全部 Extent 有界启动加载 | 未实现 | 所有 Descriptor/Directory 仍常驻 |
-| 百万 Stream 启动验收 | 未完成 | 文档也标明为过渡实现 |
-| 生产 Dashboard | 延后 | 当前只有 Prometheus 指标与诊断 JSON |
+| gRPC Record Stream API | Implemented | Append、AppendBatch、Read、ResolveTime、Inspect、Subscribe |
+| mTLS + namespace RBAC | Implemented | 业务 Client 和复制 Peer 均验证身份；Admin 仅允许 loopback |
+| WAL/Batch/Expected Sequence/幂等 | Implemented | Request ID + Request Hash；不确定结果可用原请求重试 |
+| Group Commit | Implemented | 多 Stream 合并；本地 fsync 后才进入后续提交阶段 |
+| Segment/Manifest/Checkpoint | Implemented | 不可变文件、校验 Footer、原子 CURRENT、Crash Test |
+| Tail/Locator/Registry 投影 | Implemented | 损坏可回退事实数据；正常查询使用有界 Cache |
+| Segment Handle/Locator Page/Registry Block Cache | Implemented | 默认容量 64/256/64；引用计数或 LRU |
+| 自动有界 Compaction | Bounded | 输入 Segment 数/字节有界；内部仍按 Stream 聚合完整输入 Frame |
+| Strict 双 WAL Append | Implemented | 两端 durable 后成功；不自动降级 |
+| 数据副本拓扑 | Bounded | 固定 1 Primary + 1 Standby；静态 Peer；不支持多 Standby/数据 quorum |
+| etcd Term/Lease/Fencing | Implemented | Revision Term、Lease value/ModRevision/LeaseID 校验、Safety Margin |
+| 增量 WAL Catch-up/Pin | Implemented | Primary 开放业务监听前追赶；传输期文件 Pin |
+| Promotion | Implemented | 新 Term 下验证并提交本地完整 durable Batch suffix |
+| Snapshot 格式/校验/原子安装 | Implemented | 安装 Journal、Crash Resume、角色与 committed boundary 校验；新 WAL 发布后清除被替换历史 |
+| Recovery Task | Bounded | 结构化且确定性；只存在于运行时诊断，不执行、不确认、不授权 |
+| 显式 Snapshot 恢复 | Implemented | 离线 create/verify/install/resume + Compose 空盘恢复证据 |
+| 自动 Snapshot 传输/安装 | Not implemented | 没有分块传输、对象地址、持久任务或安装确认协议 |
+| 旧主 Rejoin | Bounded | `ResolveRejoin` 仅决策函数；生产路径优先 Snapshot 重装 |
+| WAL GC | Bounded | 安全离线命令；无在线/周期调度 |
+| 在线 Snapshot | Bounded | `CreateOnline` 正确性边界已实现，但没有受控管理入口或调度 |
+| Standby Read | Not implemented | Standby 只注册 ReplicationService |
+| HTTP Gateway | Not implemented | 只有 loopback Admin HTTP |
+| 对象存储/归档 | Not implemented | 没有实现和故障语义 |
+| 有界启动元数据 | Not implemented | Descriptor、Directory、Tail 仍随 Segment/Stream 规模常驻 |
+| 百万 Stream/长稳/磁盘压力验收 | Not implemented | 现有 benchmark 不是生产容量证明 |
+| Dashboard | Deferred | 当前只有 Prometheus 指标和诊断 JSON |
 
 ## 9. 风险清单
 
-### P0：必须在生产或破坏性测试前解决
+### 9.1 已关闭的历史 Safety 风险
 
-#### P0-1 HA 离线 Snapshot 可能包含未提交 WAL 后缀（Safety Boundary 已实施）
+以下问题保留为回归门禁，不再列为当前 P0：
 
-审计基线中的 `streamd-tool snapshot` 调用 `snapshot.Create`，后者读取 replication state 的 Term，
-却用 `engine.Open` 按 Single 语义恢复数据。Single 恢复不使用 HA committed watermark，会 Apply
-全部物理完整 WAL Batch。
+1. **HA Snapshot 混用 Single 语义**：Single open 会拒绝 replicated role；`snapshot-primary` 通过 durable
+   role provenance、`ExpectedStateID` 和 `RejectUncommittedSuffix` 绑定 committed 边界。
+2. **WAL GC 与在线进程并发**：Retention Manager 全程持有数据根独占锁，读取、删除和 Replication
+   State 发布属于同一个离线所有权区间。
+3. **Snapshot Install 启动恢复不一致**：Single/Primary/Standby 都在 Coordinator、Engine 和 Listener
+   以前执行 `ResumeInstall`。
+4. **Snapshot required 只有非结构化错误**：协议错误已映射为确定性 Recovery Task；数据面关闭、
+   `readyz=503`，Lease 丢失后任务仍可审计。
+5. **Snapshot 覆盖非空副本后遗留旧 active WAL**：安装 Journal 下先发布新的 `WAL-CURRENT`，再删除并
+   fsync 全部被替换 WAL；续装可重复执行同一替换。单元测试直接重开完整 WAL History，Compose 使用
+   含冲突后缀的 Standby 验证进程重启。
 
-若节点曾在“本地 WAL durable、Strict commit 未完成”后失败，离线 Snapshot 可能把未提交 Record
-固化进 Manifest。`snapshot.Install` 校验 Artifact 完整性和目标水位，但无法证明来源 Snapshot 的
-checkpoint 曾 committed。
+这些边界不得为了自动化或缩短 RTO 而放宽。
 
-已实施门禁：普通离线创建检测到 replicated role 后直接拒绝；`CreateOnline` 只接受无 fatal、Lease
-Guard 安全的 Strict Primary，并验证 Checkpoint 被 committed watermark 覆盖；显式离线
-`snapshot-primary` 要求 durable Primary provenance，并由 Engine 拒绝 unresolved suffix。正常关闭产生的
-RECOVERING 只有在紧邻前态为同 Term Primary 时才成立。在线自动调度仍未实现，但 HA 运维恢复不再依赖
-不安全的 Single 推断。
+### 9.2 P0：生产声明前必须完成
 
-#### P0-2 WAL GC 没有代码级独占运行保证（Safety Boundary 已实施）
+当前没有发现新的、已由现有测试证明可直接破坏 committed 数据的开放 P0 缺陷；但以下验收缺口在
+生产声明前必须关闭：
 
-审计基线把 `collect-wal` 定义为离线命令，但 `retention.Open` 没有通过 `fsutil.OpenRoot` 或
-`LockExistingRoot` 获取数据目录锁。若误与在线进程并发执行，它可能删除在线 WAL History 中的 sealed
-文件；“靠 Runbook 不并发”不足以保护存储事实。
+- 磁盘满、只读文件系统、短写、fsync 延迟/失败和文件损坏的节点级故障矩阵；
+- Snapshot/Restore Drill 的真实数据规模、恢复耗时和容量预算；
+- 长稳、进程反复崩溃、网络抖动以及 etcd member replacement；
+- 升级/回滚和磁盘格式兼容门禁；
+- 明确的备份副本、密钥、审计与灾难恢复责任人。
 
-已实施门禁：`retention.Open` 先取得 `LockExistingRoot`，再在锁内读取 NODE、WAL、Manifest 和
-Replication State；Manager 持锁完成 Snapshot 校验、WAL 删除和 State 发布，显式 `Close` 后才释放。
-CLI 在成功和失败路径都关闭 Manager；在线 Store 与 Retention Manager 互相排斥，并由测试验证。
+在这些证据完成前，`make test-ha` 只能证明当前受控拓扑的协议闭环，不能作为生产就绪证明。
 
-#### P0-3 Snapshot Catch-up/Rejoin 不构成自动 HA 恢复闭环（显式运维闭环已验证）
+### 9.3 P1：下一阶段架构风险
 
-一旦 Standby 落后超过 earliest WAL、空盘或拥有 divergent suffix，自动路径仍无法恢复服务。当前
-采用明确的运维状态机：停止节点、`snapshot-primary`、校验、WAL GC、重置/安装 Standby、启动后增量
-追赶。Compose Strict HA 套件执行该完整路径。运行时尚未实现设计文档中的在线
-SnapshotOffer/SnapshotInstalled/Rejoin 消息。
+#### P1-1 Recovery Task 不是恢复状态机
 
-运行时现在把 `NO_RECOVERY_SOURCE`、`LOG_DIVERGED`、`NEEDS_SNAPSHOT` 和 `PlanSnapshot` 转换为
-确定性 Recovery Task。Primary 保持 Lease renewal，但关闭公共 gRPC，只在 Admin 端口暴露
-`snapshot_required`、恢复动作、Term、source/target、Snapshot/WAL/durable 边界和稳定 `task_id`。
-Compose 套件先观察并核对任务，再用任务 Term 安装 Snapshot，最后验证增量追赶。
-套件还会在恢复阻塞期间移除 etcd quorum，验证 Lease 失效后状态转为 `failed/recovering` 且任务身份
-保持不变，再恢复 Coordinator 并执行安装。
+任务没有持久记录、claim/ack、重试状态或自动执行器。相同事实通过 hash 得到稳定 ID，但进程重启获得
+新 Term 后会形成新任务。当前 Runbook 必须重新读取诊断并核对事实，不能把旧 `task_id` 当授权令牌。
 
-当前门禁：可以声称显式运维闭环拥有结构化、可审计的恢复任务并经过空盘 Standby 自动化验证；不能
-声称自动 Snapshot 传输/安装、无停机恢复或通用 divergent suffix truncate 已实现。
+#### P1-2 启动阶段管理面不连续
 
-### P1：继续扩展功能前解决或冻结明确约束
+Primary 对 Standby 的 transport unavailable 会在开放 Admin 前循环重试；Standby 无当前 Leader 时直接
+退出。恢复协议错误已有 Admin-only 状态，但普通启动等待没有 `/livez`、`readyz` 或结构化原因。需要决定
+由进程内 starting diagnostics 还是外部编排器负责重试，不能两边都隐含负责。
 
-#### P1-1 角色启动与 Snapshot install resume 不统一（已实施）
+#### P1-3 全量 Descriptor/Directory/Tail 常驻
 
-审计基线中 Single 启动自动调用 `ResumeInstall`，HA 启动路径不会；HA 依赖显式
-`streamd-tool resume-install`。同一个数据目录若使用错误的 Single 配置启动，`OpenWithIdentity`
-也不校验已有 replication role。
+Recovery 构造全部 `[]segment.Descriptor`、每 Stream Extent 列表和 MemTable Tail，Read Store 又持有
+Descriptor 副本。Locator 只优化正常冷读定位，不降低启动扫描和常驻元数据。该问题会线性放大启动时间
+与 RSS，是百万 Stream 目标的核心阻塞。
 
-已实施边界：Single、Primary、Standby 都在 Engine/Coordinator/Listener 以前调用同一 Resume helper；
-Engine 的 Single open 会加载 NODE 与 Replication State，并拒绝 PRIMARY、STANDBY、RECOVERING。
-Snapshot 安装后的 Standby 数据也必须用 replicated Engine 恢复。后续仍需冻结完整角色迁移状态机，
-但已不能通过错误的 Single 配置绕过现有角色。
+#### P1-4 后台 Maintenance 失败策略不完整
 
-#### P1-2 全量 Descriptor/Directory 常驻
+周期 Checkpoint、Replication State Checkpoint 和 Compaction 失败主要记录日志。Fatal Commit 会停止写，
+但持续非 fatal 失败没有统一退避、failure budget、readiness 降级或容量预测，可能直到磁盘耗尽才硬失败。
 
-Locator 解决了正常冷读不扫描全部 Extent，但 Recovery 和 fallback 仍构造全部
-`[]segment.Descriptor` 及其 Directories，Read Store 也保留副本。Segment 数和 Stream Extent 数继续
-线性放大启动时间与 RSS。
+#### P1-5 Node Runtime 生命周期重复
 
-#### P1-3 Single 与 HA 节点编排重复
+Single、Primary、Standby 分别管理 Listener、Admin、后台 ticker 和 shutdown。`ResumeInstall` 曾经因此
+发生行为漂移。可以抽取显式生命周期骨架，但角色、Durability 和恢复判断必须继续保留在强类型边界。
 
-两个入口分别实现 gRPC/admin 生命周期、Checkpoint ticker、Compaction 和 shutdown。功能增加时可能
-出现 Single/Primary 行为漂移，例如 Snapshot resume 已经不同。
+#### P1-6 Replication State 是持久下界而非实时真值
 
-建议抽取通用 Node Runtime 生命周期，但不要把存储角色安全判断抽象成隐式分支。
+State 周期落盘是避免每次 Group Commit 增加 metadata fsync 的有意取舍。Promotion、Snapshot、WAL GC
+和诊断必须结合物理 WAL；任何新模块都不能把 State watermark 当作每次提交后的精确实时值。
 
-#### P1-4 后台 maintenance 失败只记录日志
+### 9.4 P2：性能与运维成熟度
 
-周期 Checkpoint、Replication State Checkpoint 和 Compaction 失败后继续运行。Engine fatal 会使写停止，
-但非 fatal 的持续失败目前没有重试退避、failure budget 或 readiness 降级的统一策略。磁盘压力和长期
-Checkpoint 失败可能直到容量耗尽才变成硬故障。
+- Compaction 峰值内存仍与一次输入的记录量相关；
+- ResolveTime 是 Sequence 二分加随机 Record 读取，不是专用时间索引；
+- Locator 损坏会回退全 Descriptor 扫描，故障时延没有 SLO；
+- Registry 的反向 `LookupID` 可能跨 Block 顺序读取，当前不在业务热路径；
+- 没有 Snapshot/GC 自动调度、传输限速、持久 Pin Lease 或对象存储；
+- 已有磁盘容量/可用空间和按类型文件字节指标，但 Snapshot、GC、Compaction、Cache、Pin 的事件指标、
+  告警阈值和容量耗尽预测尚不足以形成完整 SLO；
+- 文档多数仍是 `Draft / V1 实现基线`，格式冻结、实现状态和提案没有统一版本发布机制。
 
-#### P1-5 Replication State 只周期落盘
+## 10. 已冻结决策与仍需 Review 的事项
 
-这是有意避免每次 Group Commit 增加 metadata fsync，恢复逻辑也会扫描物理 WAL 补足。但是
-Promotion、Snapshot、WAL GC 和运维诊断必须始终区分“持久 state 下界”和“物理 WAL 事实”，不能把
-周期 state 当实时精确水位。该约束应进入模块接口和测试命名。
+### 10.1 已冻结的 V1 决策
 
-### P2：规模与运维成熟度
+- **Snapshot 所有者**：Single 使用普通离线 Snapshot；HA 只允许受 committed boundary 约束的在线
+  Strict Primary 或安全 `snapshot-primary`。
+- **HA 恢复方式**：V1 是结构化、强约束的运维任务，不是 Agent/节点自行执行危险修复。
+- **Divergent suffix**：V1 不提供通用 truncate；无法证明安全时统一安装 Snapshot。
+- **读拓扑**：V1 Primary-only Read，Standby 不注册业务服务。
+- **开发顺序**：先完成数据安全与恢复证据，再修改大规模启动元数据模型。
 
-- Compaction 构建按 Stream 聚合完整输入 Frame，峰值内存尚未用生产上限验证；
-- ResolveTime 是多次随机 Record 读取，不是独立时间索引；
-- Locator 损坏回退会扫描全部 Descriptor，故障时延不受正常 Cache SLO 约束；
-- Registry Snapshot `LookupID` 需要顺序访问 Block，虽然当前热路径不使用；
-- 没有 Snapshot/WAL GC 自动调度、传输带宽隔离、持久传输 Lease 和对象存储实现；
-- 单节点 etcd Compose 验证不了 quorum loss、member replacement 和长期 Lease 抖动；
-- 指标已经覆盖节点、RPC 和核心水位，但 Snapshot、GC、Compaction、Cache、Pin 的细分 SLO 尚不完整；
-- 所有设计文档仍标记 Draft，当前代码与目标设计的状态没有统一发布版本。
+### 10.2 仍需 Review
 
-## 10. 需要架构 Review 决定的事项
-
-### D1 Snapshot 的生产所有者
-
-已采用双入口：在线 Snapshot 由正确角色 Engine 生成；停机维护只能用 `snapshot-primary`，由 durable
-Replication State 及其 hash-linked 前态提供 Primary provenance 和 committed boundary，并拒绝 unresolved
-suffix。普通 `snapshot` 永远不推断 HA commit。
-
-### D2 HA 恢复是自动协议还是强约束运维流程
-
-第一版已经选择强约束运维流程，同时保留未来自动协议方向：
-
-- 自动：Replication RPC 提供 Snapshot 协商、分块传输/对象地址、Pin Lease、安装确认和后续 catch-up；
-- 运维驱动：当前由结构化 Recovery Task、`snapshot-primary`、verify、install/resume 和重启 catch-up
-  组成，并由 Compose HA 执行。任务身份由持久恢复事实确定性生成；节点不自动 truncate 或安装。
-
-### D3 Rejoin 是否允许截断未提交后缀
-
-推荐：不提供通用 WAL truncate。只在 committed prefix 已证明一致、Coordinator Term 已提升且 suffix
-明确未提交时执行受审计的 suffix discard；否则安装 Snapshot。第一版可以全部走 Snapshot，牺牲 RTO
-换取较小正确性表面。
-
-### D4 Standby 是否需要读
-
-当前系统明确是 Primary-only Read。若目标只是审计流存储，第一版保持该约束更简单；如果要读扩展，
-必须定义 committed/applied lag、stale-read 契约、RBAC 和客户端路由，不能只注册 `StreamService`。
-
-### D5 百万 Stream 是否是进入 HA 闭环前的门槛
-
-推荐优先级：先修 P0 正确性和恢复闭环，再实现有界 Descriptor/Directory 启动。两者不要并行修改同一
-Recovery 主链，以免无法区分数据安全回归和内存模型变化。
-
-### D6 文档状态管理
-
-推荐把文档拆成：
-
-- `Implemented`：由代码和自动化测试持续证明；
-- `Accepted Design`：已经 Review、允许实现；
-- `Proposal`：仍需决定。
-
-当前所有文档统一写 Draft，容易让“格式已冻结”和“运行闭环已实现”混在一起。
+1. Recovery Task 是否只作为诊断契约，还是要发展为持久、可 claim/ack 的控制面资源；
+2. 在线 Snapshot 的触发者是独立运维控制面、受认证 Admin RPC，还是仅保留停机工具；
+3. 启动阶段 Admin 生命周期由节点统一提供，还是明确交给进程管理器重启并接受诊断空窗；
+4. 有界启动实现是否允许在投影损坏时牺牲启动速度进行全扫描，或要求独立修复工具；
+5. 文档如何发布 `Implemented / Accepted Design / Proposal` 状态以及格式兼容版本。
 
 ## 11. 后续开发门禁与建议顺序
 
-在用户 Review 本审计和 D1-D6 前，不继续自动开发新模块。
+建议按以下顺序推进，每项单独提交并重新做整体审计：
 
-Review 通过后的建议顺序：
+1. **补齐剩余恢复证据**：`LOG_DIVERGED` 已有独立端到端门禁；下一步增加
+   `NO_RECOVERY_SOURCE`/WAL race 场景，证明无 Snapshot 来源和 catch-up Pin/GC 竞争时仍然失败关闭。
+2. **统一启动可观测性**：先定义 starting/recovery-blocked Admin 生命周期，再抽取最小 Node Runtime
+   骨架；不改变角色和提交语义。
+3. **定义 Maintenance failure policy**：把连续 Checkpoint/Compaction/State 失败映射到稳定诊断、告警
+   和退避，补磁盘压力测试。
+4. **实现有界启动元数据**：按 Segment/Stream 规模设计 Descriptor/Directory/Tail 的分页或分层索引，
+   保留投影损坏时的明确恢复路径。
+5. **接入受控 Snapshot/GC 自动化**：只有在所有权、认证、幂等任务和 Pin 生命周期冻结后，才接入
+   online Snapshot、归档和 GC 调度。
+6. **执行生产候选验收**：规模 benchmark、长稳、磁盘故障、etcd member replacement、升级/回滚和
+   Restore Drill；证据达标后再讨论生产部署和 Dashboard。
 
-1. 将已完成 committed boundary 校验的 `CreateOnline` 接入受控 Primary 管理入口，并继续完善数据目录角色/模式校验；
-2. WAL GC 代码级独占所有权已完成；后续只在端到端运维测试中验证命令退出和锁恢复；
-3. Snapshot Catch-up 已冻结为结构化运维任务；后续若增加自动传输，必须保持同一任务和安全边界；
-4. 空盘 Standby/WAL 已回收恢复测试已完成；仍需补旧主 divergent suffix 的独立端到端演练；
-5. Role/Install 恢复前置边界已统一；其余 gRPC/admin/maintenance 进程生命周期骨架仍待抽取；
-6. 再实施 Segment Descriptor/Directory 的有界启动加载；
-7. 执行规模、长稳、磁盘压力、etcd quorum 和恢复演练；
-8. 根据证据把对应设计章节从 Draft 提升为 Implemented/Accepted。
+每个阶段完成条件：
 
-每个阶段完成条件不只是单元测试，而应包括：
-
-- 代码调用链已接入，不是只有库函数；
+- 调用链已接入，不是只有库函数；
 - crash point 前后保持同一事实边界；
-- 运维误用被代码拒绝，而不是仅写在 Runbook；
-- diagnostics/metrics 能解释当前阻塞原因；
-- 文档的“已实现”矩阵同步更新；
-- 独立 commit 后再进入下一个架构阶段。
+- 运维误用被代码拒绝；
+- diagnostics/metrics 能解释阻塞原因；
+- 单元、race、静态检查和相应故障场景通过；
+- 能力矩阵、Runbook 和设计状态同步更新。
 
 ## 12. 本次审计的证据入口
 
@@ -587,7 +593,9 @@ Review 通过后的建议顺序：
 | Strict Replication | `internal/replication/primary.go`, `receiver.go`, `standby.go`, `catchup.go` |
 | Plan/Promotion/Rejoin | `internal/replication/planner.go`, `promotion.go`, `rejoin.go` |
 | Term/Lease | `internal/coordinator/etcd/coordinator.go`, `internal/leadership/controller.go` |
+| Diagnostics/Metrics | `internal/diagnostics/`, `internal/observe/` |
 | 运维入口 | `cmd/streamd-tool/main.go` |
+| 真实 HA 验收 | `test/ha/compose.sh`, `test/ha/ha_test.go`, `test/ha/cmd/inject-divergence/`, `.github/workflows/ci.yaml` |
 
 本文件描述的是上述基线代码的现实。如果代码改变了启动顺序、事实边界、锁顺序、复制水位或运维
 所有权，必须先更新本审计矩阵，再继续声称架构结论仍然成立。

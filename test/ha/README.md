@@ -62,6 +62,17 @@ it stops both nodes, installs the named Snapshot using the task's current Term,
 and proves the restored Standby can rejoin and sustain a new Strict append. WAL
 files are never removed directly by the harness.
 
+The suite then snapshots the healthy Primary and uses a dedicated offline fault
+injector to append a valid but uncommitted conflicting WAL suffix to the stopped
+disposable Standby. The injector has no network, requires the data-root lock and
+a fully committed Standby checkpoint, and is not part of either production
+binary. After restart, the suite proves that `LOG_DIVERGED` closes the public
+gRPC listener and exposes a deterministic recovery task containing the exact
+target Entry ID and CRC. It installs the verified Snapshot without pre-clearing
+the Standby volume, restarts both nodes, verifies the committed prefix, and
+performs another Strict append. This also guards Snapshot installation against
+retaining a replaced active WAL as if it were a sealed history file.
+
 On failure the harness still removes containers, networks, and volumes, but
 first preserves service logs below `.tmp/ha-artifacts/`. CI uploads that
 directory as a short-lived diagnostic artifact. The nightly workflow runs ten
