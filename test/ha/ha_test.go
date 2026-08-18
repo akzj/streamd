@@ -44,6 +44,9 @@ func TestComposeStrictHA(t *testing.T) {
 	case "log-diverged":
 		testLogDivergedDiagnostics(t)
 		return
+	case "no-recovery-source":
+		testNoRecoverySourceDiagnostics(t)
+		return
 	}
 	client, closeClient := streamClient(t)
 	defer closeClient()
@@ -77,6 +80,9 @@ func TestComposeStrictHA(t *testing.T) {
 		return
 	case "after-divergence-recovery":
 		testAfterDivergenceRecovery(t, client)
+		return
+	case "after-no-source-recovery":
+		testAfterNoSourceRecovery(t, client)
 		return
 	case "":
 	default:
@@ -180,6 +186,43 @@ func testAfterDivergenceRecovery(t *testing.T, client streamdv1.StreamServiceCli
 	assertStreamRecords(t, client, "snapshot-events", "before-snapshot", "after-snapshot")
 	appendRecord(t, client, "divergence-events", 0, "ha-divergence-recovered", "after-divergence-recovery")
 	assertStreamRecords(t, client, "divergence-events", "after-divergence-recovery")
+}
+
+func testNoRecoverySourceDiagnostics(t *testing.T) {
+	expectedEarliestWAL := envUint64(t, "HA_EARLIEST_WAL")
+	connection, err := net.DialTimeout("tcp", primaryAddress, time.Second)
+	if err == nil {
+		_ = connection.Close()
+		t.Fatal("no-recovery-source Primary public gRPC listener is open")
+	}
+	deadline := time.Now().Add(30 * time.Second)
+	var snapshot diagnostics.Snapshot
+	for {
+		snapshot, err = fetchDiagnostics("http://streamd-primary:19090/diagnostics")
+		if err == nil && snapshot.Recovery != nil && snapshot.Recovery.Reason == diagnostics.RecoveryNoRecoverySource {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no-recovery-source diagnostics did not become available: snapshot=%+v error=%v", snapshot, err)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	task := snapshot.Recovery
+	if snapshot.Ready || snapshot.WriteReady || snapshot.Status != diagnostics.StatusDegraded || snapshot.Role != "primary" || !hasReason(snapshot, diagnostics.ReasonSnapshotRequired) || task.Action != diagnostics.RecoveryCreateAndInstallSnapshot || task.SnapshotID != "" || task.SnapshotCheckpoint != nil || task.EarliestWALEntryID != expectedEarliestWAL || task.TargetDurableEntryID != nil || task.TargetDurableCRC32C != nil || len(task.TaskID) != 64 {
+		t.Fatalf("no-recovery-source diagnostics = %+v", snapshot)
+	}
+	repeated, repeatErr := fetchDiagnostics("http://streamd-primary:19090/diagnostics")
+	if repeatErr != nil || repeated.Recovery == nil || repeated.Recovery.TaskID != task.TaskID {
+		t.Fatalf("repeated no-recovery-source diagnostics = %+v, error = %v", repeated, repeatErr)
+	}
+	t.Logf("RECOVERY_TERM=%d RECOVERY_TASK_ID=%s", task.Term, task.TaskID)
+}
+
+func testAfterNoSourceRecovery(t *testing.T, client streamdv1.StreamServiceClient) {
+	waitReady(t, client)
+	assertStreamRecords(t, client, "divergence-events", "after-divergence-recovery")
+	appendRecord(t, client, "no-source-events", 0, "ha-no-source-recovered", "after-no-source-recovery")
+	assertStreamRecords(t, client, "no-source-events", "after-no-source-recovery")
 }
 
 func testRecoveryLeaseLoss(t *testing.T) {

@@ -10,7 +10,8 @@ RUN CGO_ENABLED=0 go build -trimpath -o /out/streamd ./cmd/streamd \
  && CGO_ENABLED=0 go build -trimpath -o /out/streamd-tool ./cmd/streamd-tool \
  && CGO_ENABLED=0 go build -trimpath -o /out/proxy-init ./test/ha/cmd/proxy-init \
  && CGO_ENABLED=0 go build -trimpath -o /out/admin-proxy ./test/ha/cmd/admin-proxy \
- && CGO_ENABLED=0 go build -trimpath -o /out/inject-divergence ./test/ha/cmd/inject-divergence
+ && CGO_ENABLED=0 go build -trimpath -o /out/inject-divergence ./test/ha/cmd/inject-divergence \
+ && CGO_ENABLED=0 go build -trimpath -o /out/remove-snapshot-source ./test/ha/cmd/remove-snapshot-source
 
 FROM ${RUNTIME_IMAGE} AS streamd
 COPY --from=build /out/streamd /usr/local/bin/streamd
@@ -30,6 +31,7 @@ ENTRYPOINT ["/usr/local/bin/streamd-tool"]
 
 FROM ${RUNTIME_IMAGE} AS ha-fault-injector
 COPY --from=build /out/inject-divergence /usr/local/bin/inject-divergence
+COPY --from=build /out/remove-snapshot-source /usr/local/bin/remove-snapshot-source
 ENTRYPOINT ["/usr/local/bin/inject-divergence"]
 
 FROM build AS test-runner

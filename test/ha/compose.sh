@@ -191,6 +191,40 @@ case "$command" in
       -term "$divergence_recovery_term" -leader-id 33333333-3333-3333-3333-333333333333
     compose up -d --force-recreate --wait --wait-timeout 120 streamd-primary streamd-standby
     compose --profile test run --rm --no-deps -e HA_SCENARIO=after-divergence-recovery test-runner
+    compose stop -t 10 streamd-primary streamd-standby
+    no_source_snapshot_json=$(compose --profile maintenance run --rm --no-deps --build maintenance-primary \
+      snapshot-primary -data /var/lib/streamd -out /var/lib/streamd/snapshots/no-source)
+    no_source_snapshot_term=$(printf '%s\n' "$no_source_snapshot_json" | sed -n '/^{/,$p' | jq -er '.Term | select(. > 0)')
+    compose --profile maintenance run --rm --no-deps maintenance-primary \
+      verify-snapshot -path /var/lib/streamd/snapshots/no-source
+    no_source_gc_json=$(compose --profile maintenance run --rm --no-deps maintenance-primary \
+      collect-wal -data /var/lib/streamd -snapshot /var/lib/streamd/snapshots/no-source)
+    no_source_earliest_wal=$(printf '%s\n' "$no_source_gc_json" | sed -n '/^{/,$p' | jq -er '.EarliestWAL | select(. > 0)')
+    compose --profile maintenance run --rm --no-deps --build remove-snapshot-source \
+      -data /var/lib/streamd -snapshot /var/lib/streamd/snapshots/no-source
+    compose --profile maintenance run --rm --no-deps reset-standby
+    compose up -d --force-recreate streamd-primary streamd-standby
+    compose --profile test up -d --no-deps primary-admin-proxy
+    no_source_recovery_output=$(compose --profile test run --rm --no-deps \
+      -e HA_SCENARIO=no-recovery-source \
+      -e HA_EARLIEST_WAL="$no_source_earliest_wal" \
+      test-runner 2>&1)
+    printf '%s\n' "$no_source_recovery_output"
+    no_source_recovery_term=$(printf '%s\n' "$no_source_recovery_output" | sed -n 's/.*RECOVERY_TERM=\([0-9][0-9]*\).*/\1/p' | tail -n 1)
+    test -n "$no_source_recovery_term"
+    test "$no_source_recovery_term" -ge "$no_source_snapshot_term"
+    compose stop -t 10 primary-admin-proxy streamd-primary streamd-standby
+    replacement_snapshot_json=$(compose --profile maintenance run --rm --no-deps maintenance-primary \
+      snapshot-primary -data /var/lib/streamd -out /var/lib/streamd/snapshots/no-source-replacement)
+    replacement_snapshot_term=$(printf '%s\n' "$replacement_snapshot_json" | sed -n '/^{/,$p' | jq -er '.Term | select(. > 0)')
+    test "$replacement_snapshot_term" -eq "$no_source_recovery_term"
+    compose --profile maintenance run --rm --no-deps maintenance-primary \
+      verify-snapshot -path /var/lib/streamd/snapshots/no-source-replacement
+    compose --profile maintenance run --rm --no-deps maintenance-standby \
+      install-snapshot -data /var/lib/streamd -path /snapshots/no-source-replacement \
+      -term "$no_source_recovery_term" -leader-id 33333333-3333-3333-3333-333333333333
+    compose up -d --force-recreate --wait --wait-timeout 120 streamd-primary streamd-standby
+    compose --profile test run --rm --no-deps -e HA_SCENARIO=after-no-source-recovery test-runner
     compose --profile test run --rm --no-deps -e HA_SCENARIO=standby-partition test-runner
     ;;
   *)

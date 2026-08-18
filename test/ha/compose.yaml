@@ -268,6 +268,18 @@ services:
     network_mode: none
     profiles: [maintenance]
 
+  remove-snapshot-source:
+    build:
+      context: ../..
+      dockerfile: test/ha/Dockerfile
+      target: ha-fault-injector
+    entrypoint: ["/usr/local/bin/remove-snapshot-source"]
+    volumes:
+      - primary-data:/var/lib/streamd
+      - snapshot-data:/var/lib/streamd/snapshots
+    network_mode: none
+    profiles: [maintenance]
+
   reset-standby:
     build:
       context: ../..

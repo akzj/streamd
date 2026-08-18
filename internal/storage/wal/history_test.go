@@ -232,7 +232,21 @@ func TestHistoryGCRequiresSnapshotCoverageAndHonorsPins(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	result, err = history.Collect(GCOptions{SegmentedThrough: 3, SnapshotThrough: 3, SnapshotVerified: true})
+	type collection struct {
+		result GCResult
+		err    error
+	}
+	collected := make(chan collection, 1)
+	go func() {
+		value, collectErr := history.Collect(GCOptions{SegmentedThrough: 3, SnapshotThrough: 3, SnapshotVerified: true})
+		collected <- collection{value, collectErr}
+	}()
+	select {
+	case value := <-collected:
+		result, err = value.result, value.err
+	case <-time.After(time.Second):
+		t.Fatal("GC did not complete while a catch-up Pin was held")
+	}
 	if err != nil || len(result.DeletedFiles) != 0 {
 		t.Fatalf("pinned GC = %+v, %v", result, err)
 	}

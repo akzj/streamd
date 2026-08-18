@@ -26,6 +26,7 @@ import (
 	"github.com/akzj/streamd/internal/storage/fsutil"
 	"github.com/akzj/streamd/internal/storage/identity"
 	"github.com/akzj/streamd/internal/storage/replicationstate"
+	"github.com/akzj/streamd/internal/storage/snapshot"
 	"github.com/akzj/streamd/internal/storage/wal"
 	"github.com/prometheus/client_golang/prometheus"
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -176,11 +177,11 @@ func runPrimary(ctx context.Context, config Config, nodeIdentity format.NodeIden
 	}
 	auth := replication.MTLSPeerAuthenticator{ClusterID: nodeIdentity.ClusterID, GroupID: nodeIdentity.GroupID, ExpectedNodeID: peerNodeID}
 	protocolServer, err := replication.NewRPCServer(nil, func(hello replication.ReplicaHello) (replication.ReplicationPlan, error) {
-		view, viewErr := primaryView(config.DataDirectory, nodeIdentity, grant.Term, states)
+		_, plan, viewErr := planReplication(config.DataDirectory, nodeIdentity, grant.Term, states, hello)
 		if viewErr != nil {
 			return replication.ReplicationPlan{}, viewErr
 		}
-		return replication.Plan(view, hello)
+		return plan, nil
 	}, auth, limits)
 	if err != nil {
 		return err
@@ -376,11 +377,7 @@ func catchUpStandby(ctx context.Context, root string, node format.NodeIdentity, 
 	if hello.NodeID != peerNodeID {
 		return fmt.Errorf("Standby status node_id does not match configured peer_node_id")
 	}
-	view, err := primaryView(root, node, term, states)
-	if err != nil {
-		return err
-	}
-	plan, err := replication.Plan(view, hello)
+	view, plan, err := planReplication(root, node, term, states, hello)
 	if err != nil {
 		if replication.IsCode(err, replication.ErrNoRecoverySource) {
 			return newStandbyRecoveryRequired(diagnostics.RecoveryNoRecoverySource, view, hello, replication.ReplicationPlan{}, err)
@@ -480,10 +477,36 @@ func primaryView(root string, node format.NodeIdentity, term uint64, states *rep
 		return 0, false
 	}
 	view := replication.PrimaryView{GroupID: node.GroupID, LeaderID: node.NodeID, Term: term, EarliestWAL: earliest, LastAppended: replicationPosition(state.Header.LastAppended), LocalDurable: replicationPosition(state.Header.LocalDurable), Committed: replicationPosition(state.Header.Committed), ChecksumAt: checksumAt}
-	if state.Header.HasInstalledSnapshot {
-		view.Snapshot = &replication.InstallableSnapshot{SnapshotID: state.Header.InstalledSnapshotID, Checkpoint: replicationPosition(state.Header.InstalledSnapshotEntry)}
-	}
 	return view, nil
+}
+
+func planReplication(root string, node format.NodeIdentity, term uint64, states *replicationstate.Store, hello replication.ReplicaHello) (replication.PrimaryView, replication.ReplicationPlan, error) {
+	view, err := primaryView(root, node, term, states)
+	if err != nil {
+		return replication.PrimaryView{}, replication.ReplicationPlan{}, err
+	}
+	plan, err := replication.Plan(view, hello)
+	needsSource := replication.IsCode(err, replication.ErrNoRecoverySource)
+	if !needsSource && !replication.IsCode(err, replication.ErrLogDiverged) {
+		return view, plan, err
+	}
+	state, ok := states.Current()
+	if !ok || !state.Header.HasInstalledSnapshot {
+		return view, plan, err
+	}
+	available, found, findErr := snapshot.FindAvailable(root, state.Header.InstalledSnapshotID, node.GroupID, state.Header.InstalledSnapshotEntry.EntryID, state.Header.InstalledSnapshotEntry.CRC32C)
+	if findErr != nil {
+		return view, replication.ReplicationPlan{}, fmt.Errorf("discover installable Snapshot: %w", findErr)
+	}
+	if !found {
+		return view, plan, err
+	}
+	view.Snapshot = &replication.InstallableSnapshot{SnapshotID: available.SnapshotID, Checkpoint: replicationPosition(state.Header.InstalledSnapshotEntry)}
+	if !needsSource {
+		return view, plan, err
+	}
+	plan, err = replication.Plan(view, hello)
+	return view, plan, err
 }
 
 func replicationPosition(value format.ReplicationPosition) replication.Position {
