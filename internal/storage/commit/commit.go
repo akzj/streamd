@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/akzj/streamd/internal/storage/format"
@@ -59,6 +60,46 @@ type Result struct {
 	ResultUncertain bool
 }
 
+// Stats is a cumulative, lock-free snapshot of the single WAL writer. Queue
+// wait is summed per request; stage durations are summed once per commit group.
+type Stats struct {
+	Groups           uint64
+	Requests         uint64
+	Entries          uint64
+	Bytes            uint64
+	LocalSyncs       uint64
+	ReplicatedGroups uint64
+	MaxGroupRequests uint64
+	MaxGroupBytes    uint64
+	QueueWaitNanos   uint64
+	CollectNanos     uint64
+	AppendNanos      uint64
+	LocalSyncNanos   uint64
+	ReplicateNanos   uint64
+	ApplyNanos       uint64
+	ProcessNanos     uint64
+	QueueDepth       uint64
+	QueueCapacity    uint64
+}
+
+type counters struct {
+	groups           atomic.Uint64
+	requests         atomic.Uint64
+	entries          atomic.Uint64
+	bytes            atomic.Uint64
+	localSyncs       atomic.Uint64
+	replicatedGroups atomic.Uint64
+	maxGroupRequests atomic.Uint64
+	maxGroupBytes    atomic.Uint64
+	queueWaitNanos   atomic.Uint64
+	collectNanos     atomic.Uint64
+	appendNanos      atomic.Uint64
+	localSyncNanos   atomic.Uint64
+	replicateNanos   atomic.Uint64
+	applyNanos       atomic.Uint64
+	processNanos     atomic.Uint64
+}
+
 type completion struct {
 	result Result
 	err    error
@@ -78,6 +119,7 @@ type pending struct {
 	entries    []format.WALEntry
 	streamID   uint64
 	bytes      uint64
+	enqueuedAt time.Time
 	completion chan completion
 }
 
@@ -112,6 +154,7 @@ type Committer struct {
 	watermarks Watermarks
 	replica    Replica
 	guard      Guard
+	stats      counters
 }
 
 func New(log DurableLog, table *memtable.Table) *Committer {
@@ -156,6 +199,7 @@ func (c *Committer) Enqueue(encoded [][]byte) (*Future, error) {
 	if closed {
 		return nil, fmt.Errorf("commit core is closed")
 	}
+	pending.enqueuedAt = time.Now()
 	c.queue <- pending
 	return &Future{completion: pending.completion}, nil
 }
@@ -221,6 +265,18 @@ func (c *Committer) FatalError() error {
 	return c.fatal
 }
 
+func (c *Committer) Stats() Stats {
+	return Stats{
+		Groups: c.stats.groups.Load(), Requests: c.stats.requests.Load(), Entries: c.stats.entries.Load(), Bytes: c.stats.bytes.Load(),
+		LocalSyncs: c.stats.localSyncs.Load(), ReplicatedGroups: c.stats.replicatedGroups.Load(),
+		MaxGroupRequests: c.stats.maxGroupRequests.Load(), MaxGroupBytes: c.stats.maxGroupBytes.Load(),
+		QueueWaitNanos: c.stats.queueWaitNanos.Load(), CollectNanos: c.stats.collectNanos.Load(),
+		AppendNanos: c.stats.appendNanos.Load(), LocalSyncNanos: c.stats.localSyncNanos.Load(), ReplicateNanos: c.stats.replicateNanos.Load(),
+		ApplyNanos: c.stats.applyNanos.Load(), ProcessNanos: c.stats.processNanos.Load(),
+		QueueDepth: uint64(len(c.queue)), QueueCapacity: uint64(cap(c.queue)),
+	}
+}
+
 func (c *Committer) run() {
 	defer close(c.done)
 	var carry *pending
@@ -239,6 +295,7 @@ func (c *Committer) run() {
 		group := []*pending{first}
 		streams := map[uint64]struct{}{first.streamID: {}}
 		groupBytes := first.bytes
+		collectStarted := time.Now()
 		timer := time.NewTimer(c.options.MaxDelay)
 	collect:
 		for len(group) < c.options.MaxRequests {
@@ -265,7 +322,7 @@ func (c *Committer) run() {
 			default:
 			}
 		}
-		c.process(group)
+		c.process(group, time.Since(collectStarted))
 	}
 }
 
@@ -281,7 +338,25 @@ func (c *Committer) handleControl(pending *pending) bool {
 	return pending.kind == pendingShutdown
 }
 
-func (c *Committer) process(group []*pending) {
+func (c *Committer) process(group []*pending, collectDuration time.Duration) {
+	processStarted := time.Now()
+	defer func() { c.stats.processNanos.Add(durationNanos(time.Since(processStarted))) }()
+	c.stats.groups.Add(1)
+	c.stats.requests.Add(uint64(len(group)))
+	c.stats.collectNanos.Add(durationNanos(collectDuration))
+	updateMax(&c.stats.maxGroupRequests, uint64(len(group)))
+	for _, request := range group {
+		c.stats.entries.Add(uint64(len(request.entries)))
+		c.stats.bytes.Add(request.bytes)
+		if !request.enqueuedAt.IsZero() {
+			c.stats.queueWaitNanos.Add(durationNanos(processStarted.Sub(request.enqueuedAt)))
+		}
+	}
+	var groupBytes uint64
+	for _, request := range group {
+		groupBytes += request.bytes
+	}
+	updateMax(&c.stats.maxGroupBytes, groupBytes)
 	c.stateMu.Lock()
 	fatal := c.fatal
 	c.stateMu.Unlock()
@@ -304,7 +379,10 @@ func (c *Committer) process(group []*pending) {
 		}
 		flattened = append(flattened, request.encoded...)
 	}
-	if err := c.log.Append(flattened...); err != nil {
+	appendStarted := time.Now()
+	err := c.log.Append(flattened...)
+	c.stats.appendNanos.Add(durationNanos(time.Since(appendStarted)))
+	if err != nil {
 		c.setFatal(err)
 		completeGroup(group, true, err)
 		return
@@ -314,7 +392,11 @@ func (c *Committer) process(group []*pending) {
 	c.watermarks.HasValue = true
 	c.watermarks.Appended = last
 	c.stateMu.Unlock()
-	if err := c.log.Sync(); err != nil {
+	syncStarted := time.Now()
+	err = c.log.Sync()
+	c.stats.localSyncNanos.Add(durationNanos(time.Since(syncStarted)))
+	c.stats.localSyncs.Add(1)
+	if err != nil {
 		c.setFatal(err)
 		completeGroup(group, true, err)
 		return
@@ -333,7 +415,10 @@ func (c *Committer) process(group []*pending) {
 	}
 	if c.replica != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), c.options.ReplicaTimeout)
+		replicateStarted := time.Now()
 		replicated, err := c.replica.Replicate(ctx, flattened)
+		c.stats.replicateNanos.Add(durationNanos(time.Since(replicateStarted)))
+		c.stats.replicatedGroups.Add(1)
 		cancel()
 		if err != nil {
 			wrapped := fmt.Errorf("replicate durable WAL group: %w", err)
@@ -364,6 +449,7 @@ func (c *Committer) process(group []*pending) {
 	c.watermarks.HasCommitted = true
 	c.watermarks.Committed = last
 	c.stateMu.Unlock()
+	applyStarted := time.Now()
 	for _, request := range group {
 		if err := c.table.ApplyBatch(request.entries); err != nil {
 			wrapped := fmt.Errorf("durable Batch could not Apply: %w", err)
@@ -377,6 +463,7 @@ func (c *Committer) process(group []*pending) {
 		c.watermarks.Applied = applied
 		c.stateMu.Unlock()
 	}
+	c.stats.applyNanos.Add(durationNanos(time.Since(applyStarted)))
 	if c.replica != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), c.options.ReplicaTimeout)
 		_ = c.replica.AdvanceCommit(ctx, last)
@@ -386,6 +473,21 @@ func (c *Committer) process(group []*pending) {
 		first := request.entries[0].EntryID
 		last := request.entries[len(request.entries)-1].EntryID
 		request.completion <- completion{result: Result{FirstEntryID: first, LastEntryID: last, RecordCount: uint32(len(request.entries))}}
+	}
+}
+
+func durationNanos(duration time.Duration) uint64 {
+	if duration <= 0 {
+		return 0
+	}
+	return uint64(duration)
+}
+
+func updateMax(target *atomic.Uint64, value uint64) {
+	for current := target.Load(); value > current; current = target.Load() {
+		if target.CompareAndSwap(current, value) {
+			return
+		}
 	}
 }
 

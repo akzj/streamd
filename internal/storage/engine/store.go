@@ -81,12 +81,20 @@ type ReplicationOptions struct {
 	Replica        commit.Replica
 	Guard          commit.Guard
 	ReplicaTimeout time.Duration
+	GroupCommit    GroupCommitOptions
 	// ExpectedStateID closes the check-to-lock race for offline callers that
 	// made a decision from one exact immutable Replication State.
 	ExpectedStateID format.UUID
 	// RejectUncommittedSuffix is for offline recovery boundaries that must
 	// never silently discard durable entries beyond committed.
 	RejectUncommittedSuffix bool
+}
+
+type GroupCommitOptions struct {
+	MaxDelay      time.Duration
+	MaxRequests   int
+	MaxBytes      uint64
+	QueueCapacity int
 }
 type streamKey struct {
 	namespace string
@@ -125,6 +133,8 @@ type Store struct {
 	durability     format.ReplicationDurability
 	guard          commit.Guard
 	commitOptions  commit.Options
+	commitStats    commit.Stats
+	commitArchived bool
 }
 
 func (s *Store) DataRoot() string { return s.root.Path() }
@@ -171,12 +181,64 @@ func (s *Store) Health() Health {
 	return Health{Watermarks: s.committer.Watermarks(), Fatal: errors.Join(s.committer.FatalError(), s.fatalError()), WriteUnavailable: s.writeUnavailable(), Role: s.role, Durability: s.durability, Term: s.term}
 }
 
+func (s *Store) CommitStats() commit.Stats {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.commitArchived {
+		return s.commitStats
+	}
+	return mergeCommitStats(s.commitStats, s.committer.Stats())
+}
+
+// CommitBarrier waits until every Append admitted before this call has left
+// the Committer. It does not rotate the WAL, build Segments, or publish a new
+// Manifest Generation.
+func (s *Store) CommitBarrier(ctx context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.shutdown {
+		return errdefs.ErrClosed
+	}
+	if err := s.fatalError(); err != nil {
+		return fmt.Errorf("engine failed: %w", err)
+	}
+	return s.committer.Barrier(ctx)
+}
+
+func (s *Store) archiveCommitterLocked() {
+	if s.commitArchived {
+		return
+	}
+	s.commitStats = mergeCommitStats(s.commitStats, s.committer.Stats())
+	s.commitArchived = true
+}
+
+func mergeCommitStats(a, b commit.Stats) commit.Stats {
+	return commit.Stats{
+		Groups: a.Groups + b.Groups, Requests: a.Requests + b.Requests, Entries: a.Entries + b.Entries, Bytes: a.Bytes + b.Bytes,
+		LocalSyncs: a.LocalSyncs + b.LocalSyncs, ReplicatedGroups: a.ReplicatedGroups + b.ReplicatedGroups,
+		MaxGroupRequests: max(a.MaxGroupRequests, b.MaxGroupRequests), MaxGroupBytes: max(a.MaxGroupBytes, b.MaxGroupBytes),
+		QueueWaitNanos: a.QueueWaitNanos + b.QueueWaitNanos, CollectNanos: a.CollectNanos + b.CollectNanos,
+		AppendNanos: a.AppendNanos + b.AppendNanos, LocalSyncNanos: a.LocalSyncNanos + b.LocalSyncNanos,
+		ReplicateNanos: a.ReplicateNanos + b.ReplicateNanos, ApplyNanos: a.ApplyNanos + b.ApplyNanos,
+		ProcessNanos: a.ProcessNanos + b.ProcessNanos, QueueDepth: b.QueueDepth, QueueCapacity: b.QueueCapacity,
+	}
+}
+
 func Open(path string) (*Store, error) {
-	return open(path, nil, nil)
+	return open(path, nil, nil, GroupCommitOptions{})
+}
+
+func OpenWithGroupCommit(path string, options GroupCommitOptions) (*Store, error) {
+	return open(path, nil, nil, options)
 }
 
 func OpenWithIdentity(path string, node format.NodeIdentity) (*Store, error) {
-	return open(path, &node, nil)
+	return open(path, &node, nil, GroupCommitOptions{})
+}
+
+func OpenWithIdentityAndGroupCommit(path string, node format.NodeIdentity, options GroupCommitOptions) (*Store, error) {
+	return open(path, &node, nil, options)
 }
 
 func OpenReplicated(path string, node format.NodeIdentity, options ReplicationOptions) (*Store, error) {
@@ -186,10 +248,13 @@ func OpenReplicated(path string, node format.NodeIdentity, options ReplicationOp
 	if options.Role == format.ReplicationRolePrimary && options.Durability == format.ReplicationDurabilityStrict && options.Replica == nil {
 		return nil, fmt.Errorf("Strict Primary requires a replica")
 	}
-	return open(path, &node, &options)
+	return open(path, &node, &options, options.GroupCommit)
 }
 
-func open(path string, node *format.NodeIdentity, replication *ReplicationOptions) (*Store, error) {
+func open(path string, node *format.NodeIdentity, replication *ReplicationOptions, groupCommit GroupCommitOptions) (*Store, error) {
+	if groupCommit.MaxDelay < 0 || groupCommit.MaxRequests < 0 || groupCommit.QueueCapacity < 0 {
+		return nil, fmt.Errorf("group commit options cannot be negative")
+	}
 	root, err := fsutil.OpenRoot(path)
 	if err != nil {
 		return nil, err
@@ -273,10 +338,12 @@ func open(path string, node *format.NodeIdentity, replication *ReplicationOption
 	role, durability := format.ReplicationRoleSingle, format.ReplicationDurabilitySingleSync
 	var term uint64
 	var guard commit.Guard
-	var commitOptions commit.Options
+	commitOptions := commit.Options{MaxDelay: groupCommit.MaxDelay, MaxRequests: groupCommit.MaxRequests, MaxBytes: groupCommit.MaxBytes, QueueCapacity: groupCommit.QueueCapacity}
 	if replication != nil {
 		term, role, durability, guard = replication.Term, replication.Role, replication.Durability, replication.Guard
-		commitOptions = commit.Options{Replica: replication.Replica, Guard: replication.Guard, ReplicaTimeout: replication.ReplicaTimeout}
+		commitOptions.Replica = replication.Replica
+		commitOptions.Guard = replication.Guard
+		commitOptions.ReplicaTimeout = replication.ReplicaTimeout
 		if checkpoint != nil {
 			commitOptions.InitialWatermarks = watermarksFromState(checkpoint.Header)
 		}
@@ -308,6 +375,7 @@ func (s *Store) Close() error {
 	s.shutdown = true
 	s.closeNotifications()
 	commitErr := s.committer.Close()
+	s.archiveCommitterLocked()
 	s.viewMu.Lock()
 	defer s.viewMu.Unlock()
 	return errors.Join(commitErr, s.reader.Close(), s.state.Close(), s.root.Close())
@@ -550,9 +618,11 @@ func (s *Store) checkpointLocked(states *replicationstate.Store) (format.Manifes
 	lastCRC := s.state.WAL.PreviousEntryCRC32C()
 	s.commitOptions.InitialWatermarks = s.committer.Watermarks()
 	if err := s.committer.Close(); err != nil {
+		s.archiveCommitterLocked()
 		s.setFatal(err)
 		return format.Manifest{}, false, err
 	}
+	s.archiveCommitterLocked()
 	if err := s.state.WAL.Rotate(s.term, s.now()); err != nil {
 		s.setFatal(err)
 		return format.Manifest{}, false, err
@@ -639,6 +709,7 @@ func (s *Store) checkpointLocked(states *replicationstate.Store) (format.Manifes
 	s.state.Locator = nextLocator
 	s.state.Registry = nextRegistry
 	s.committer = commit.NewWithOptions(s.state.WAL, newTable, s.commitOptions)
+	s.commitArchived = false
 	s.reader = readstore.New(newTable, s.state.TailResolver, s.root.Path(), published.Header.Generation, s.state.Segments, nextLocator, defaultStreamCacheCapacity, defaultSegmentHandleCapacity)
 	closeErr := oldReader.Close()
 	if oldTailCatalog != nil {

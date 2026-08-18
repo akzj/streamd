@@ -280,6 +280,10 @@ func TestGroupCommitCombinesDifferentStreams(t *testing.T) {
 	if appendCalls != 1 || syncs != 1 {
 		t.Fatalf("append calls = %d, syncs = %d", appendCalls, syncs)
 	}
+	stats := c.Stats()
+	if stats.Groups != 1 || stats.Requests != 2 || stats.Entries != 2 || stats.LocalSyncs != 1 || stats.MaxGroupRequests != 2 || stats.MaxGroupBytes == 0 || stats.QueueCapacity != 8 {
+		t.Fatalf("group commit stats = %+v", stats)
+	}
 	if tail, ok := table.Tail(2); !ok || tail.LastEntryID != 1 {
 		t.Fatalf("stream 2 tail = %+v, ok = %v", tail, ok)
 	}
@@ -314,6 +318,31 @@ func TestGroupCommitSeparatesSameStream(t *testing.T) {
 	log.mu.Unlock()
 	if syncs != 2 {
 		t.Fatalf("syncs = %d", syncs)
+	}
+}
+
+func TestBarrierDrainsPriorGroupsBeforeStatsSnapshot(t *testing.T) {
+	log := &fakeLog{}
+	c := NewWithOptions(log, memtable.New(0), Options{MaxDelay: time.Millisecond, MaxRequests: 8, QueueCapacity: 8})
+	defer c.Close()
+	first := encodedEntry(t, 0, 1, 0, 0)
+	decoded, err := format.UnmarshalWALEntry(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second := encodedEntry(t, 1, 2, 0, decoded.CRC32C)
+	if _, err = c.Enqueue([][]byte{first}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = c.Enqueue([][]byte{second}); err != nil {
+		t.Fatal(err)
+	}
+	if err = c.Barrier(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	stats := c.Stats()
+	if stats.Groups != stats.LocalSyncs || stats.Requests != 2 || stats.QueueDepth != 0 {
+		t.Fatalf("drained stats = %+v", stats)
 	}
 }
 

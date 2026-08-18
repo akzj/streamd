@@ -93,6 +93,61 @@ func TestAppendBatchDeduplicateAndRestart(t *testing.T) {
 	}
 }
 
+func TestCommitStatsSurviveCheckpointWithoutDuplication(t *testing.T) {
+	store, err := OpenWithGroupCommit(t.TempDir(), GroupCommitOptions{MaxDelay: time.Microsecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := AppendRequest{Namespace: "stats", Stream: "events", RequestID: []byte("one"), Producer: "test", Records: []InputRecord{{Payload: []byte("one")}}}
+	if _, err = store.Append(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	before := store.CommitStats()
+	if before.Groups == 0 || before.Groups != before.LocalSyncs {
+		t.Fatalf("before checkpoint stats = %+v", before)
+	}
+	if _, created, checkpointErr := store.Checkpoint(); checkpointErr != nil || !created {
+		t.Fatalf("checkpoint created=%v error=%v", created, checkpointErr)
+	}
+	afterCheckpoint := store.CommitStats()
+	if afterCheckpoint.Groups != before.Groups || afterCheckpoint.LocalSyncs != before.LocalSyncs {
+		t.Fatalf("checkpoint duplicated or lost stats: before=%+v after=%+v", before, afterCheckpoint)
+	}
+	request.ExpectedSequence = 1
+	request.RequestID = []byte("two")
+	if _, err = store.Append(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	afterAppend := store.CommitStats()
+	if afterAppend.Groups != before.Groups+1 || afterAppend.LocalSyncs != before.LocalSyncs+1 {
+		t.Fatalf("new Committer generation stats = %+v, before = %+v", afterAppend, before)
+	}
+	if repeated := store.CommitStats(); repeated.Groups != afterAppend.Groups || repeated.LocalSyncs != afterAppend.LocalSyncs {
+		t.Fatalf("repeated snapshot duplicated stats: first=%+v repeated=%+v", afterAppend, repeated)
+	}
+	if err = store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	closed := store.CommitStats()
+	if closed.Groups != afterAppend.Groups || closed.LocalSyncs != afterAppend.LocalSyncs {
+		t.Fatalf("Close duplicated stats: before=%+v closed=%+v", afterAppend, closed)
+	}
+}
+
+func TestOpenRejectsNegativeGroupCommitOptions(t *testing.T) {
+	tests := []GroupCommitOptions{
+		{MaxDelay: -time.Nanosecond},
+		{MaxRequests: -1},
+		{QueueCapacity: -1},
+	}
+	for _, options := range tests {
+		if store, err := OpenWithGroupCommit(t.TempDir(), options); err == nil {
+			_ = store.Close()
+			t.Fatalf("accepted negative Group Commit options: %+v", options)
+		}
+	}
+}
+
 func TestReplicatedEngineUsesTermGuardAndStrictWatermarks(t *testing.T) {
 	identity := format.NodeIdentity{ClusterID: engineID(1), GroupID: engineID(2), NodeID: engineID(3), CreatedAt: 1}
 	guard := &engineGuard{}

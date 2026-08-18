@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -13,7 +14,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/akzj/streamd/internal/storage/commit"
 	"github.com/akzj/streamd/internal/storage/engine"
+	"github.com/akzj/streamd/internal/storage/errdefs"
 	"github.com/akzj/streamd/internal/storage/format"
 	"github.com/akzj/streamd/internal/storage/fsutil"
 	"github.com/akzj/streamd/internal/storage/scrub"
@@ -21,24 +24,60 @@ import (
 )
 
 type report struct {
-	DurationSeconds  float64 `json:"duration_seconds"`
-	Workers          int     `json:"workers"`
-	Streams          int     `json:"streams"`
-	BatchRecords     int     `json:"batch_records"`
-	PayloadBytes     int     `json:"payload_bytes"`
-	Requests         uint64  `json:"requests"`
-	Records          uint64  `json:"records"`
-	Bytes            uint64  `json:"bytes"`
-	Errors           uint64  `json:"errors"`
-	RequestsPerSec   float64 `json:"requests_per_second"`
-	RecordsPerSec    float64 `json:"records_per_second"`
-	MiBPerSec        float64 `json:"mib_per_second"`
-	DataDirectory    string  `json:"data_directory,omitempty"`
-	Scrubbed         bool    `json:"scrubbed"`
-	ScrubSegments    uint64  `json:"scrub_segments,omitempty"`
-	Mode             string  `json:"mode"`
-	StandbyDirectory string  `json:"standby_directory,omitempty"`
-	StandbyVerified  bool    `json:"standby_verified"`
+	DurationSeconds  float64      `json:"duration_seconds"`
+	SetupSeconds     float64      `json:"setup_seconds"`
+	DrainSeconds     float64      `json:"drain_seconds"`
+	Precreated       bool         `json:"precreated_streams"`
+	Workers          int          `json:"workers"`
+	Streams          int          `json:"streams"`
+	BatchRecords     int          `json:"batch_records"`
+	PayloadBytes     int          `json:"payload_bytes"`
+	Requests         uint64       `json:"requests"`
+	Records          uint64       `json:"records"`
+	Bytes            uint64       `json:"bytes"`
+	Errors           uint64       `json:"errors"`
+	DeadlineExits    uint64       `json:"deadline_exits"`
+	UncertainResults uint64       `json:"uncertain_results"`
+	RequestsPerSec   float64      `json:"requests_per_second"`
+	RecordsPerSec    float64      `json:"records_per_second"`
+	MiBPerSec        float64      `json:"mib_per_second"`
+	DataDirectory    string       `json:"data_directory,omitempty"`
+	Scrubbed         bool         `json:"scrubbed"`
+	ScrubSegments    uint64       `json:"scrub_segments,omitempty"`
+	Mode             string       `json:"mode"`
+	StandbyDirectory string       `json:"standby_directory,omitempty"`
+	StandbyVerified  bool         `json:"standby_verified"`
+	GroupCommit      commitReport `json:"group_commit"`
+}
+
+type commitReport struct {
+	ConfiguredDelayMicros   float64 `json:"configured_delay_micros"`
+	ConfiguredMaxRequests   int     `json:"configured_max_requests"`
+	ConfiguredMaxBytes      uint64  `json:"configured_max_bytes"`
+	ConfiguredQueueCapacity int     `json:"configured_queue_capacity"`
+	Groups                  uint64  `json:"groups"`
+	Requests                uint64  `json:"requests"`
+	Entries                 uint64  `json:"entries"`
+	Bytes                   uint64  `json:"bytes"`
+	LocalSyncs              uint64  `json:"local_syncs"`
+	ReplicatedGroups        uint64  `json:"replicated_groups"`
+	AverageRequestsPerGroup float64 `json:"average_requests_per_group"`
+	AverageEntriesPerGroup  float64 `json:"average_entries_per_group"`
+	MaxRequestsPerGroup     uint64  `json:"max_requests_per_group"`
+	MaxBytesPerGroup        uint64  `json:"max_bytes_per_group"`
+	AverageQueueWaitMicros  float64 `json:"average_queue_wait_micros"`
+	AverageCollectMicros    float64 `json:"average_collect_micros"`
+	AppendSeconds           float64 `json:"append_seconds"`
+	LocalSyncSeconds        float64 `json:"local_sync_seconds"`
+	ReplicateSeconds        float64 `json:"replicate_seconds"`
+	ApplySeconds            float64 `json:"apply_seconds"`
+	ProcessSeconds          float64 `json:"process_seconds"`
+	LocalSyncProcessRatio   float64 `json:"local_sync_process_ratio"`
+	LocalSyncWallRatio      float64 `json:"local_sync_wall_ratio"`
+	ReplicateProcessRatio   float64 `json:"replicate_process_ratio"`
+	ProcessWallRatio        float64 `json:"process_wall_ratio"`
+	FinalQueueDepth         uint64  `json:"final_queue_depth"`
+	QueueCapacity           uint64  `json:"queue_capacity"`
 }
 
 type durableReplica struct{ log *wal.Log }
@@ -72,10 +111,16 @@ func main() {
 	verify := flag.Bool("verify", true, "checkpoint and scrub the data after the timed run")
 	mode := flag.String("mode", "single", "durability mode: single or strict")
 	standbyData := flag.String("standby-data", "", "new or empty Standby WAL directory for strict mode")
+	groupDelay := flag.Duration("group-delay", 250*time.Microsecond, "maximum time the first request waits for WAL group formation")
+	groupRequests := flag.Int("group-requests", 64, "maximum requests per WAL group")
+	groupBytes := flag.Uint64("group-bytes", 4<<20, "maximum encoded bytes per WAL group")
+	queueCapacity := flag.Int("queue-capacity", 1024, "bounded WAL request queue capacity")
+	precreate := flag.Bool("precreate-streams", false, "create every Stream before the timed steady-state run")
 	flag.Parse()
-	if *duration <= 0 || *workers <= 0 || *streams < *workers || *batch <= 0 || *payloadBytes < 0 || *checkpoint < 0 || (*mode != "single" && *mode != "strict") {
+	if *duration <= 0 || *workers <= 0 || *streams < *workers || *batch <= 0 || *payloadBytes < 0 || *checkpoint < 0 || *groupDelay <= 0 || *groupRequests <= 0 || *groupBytes == 0 || *queueCapacity <= 0 || (*mode != "single" && *mode != "strict") {
 		fatal(fmt.Errorf("invalid benchmark arguments"))
 	}
+	groupOptions := engine.GroupCommitOptions{MaxDelay: *groupDelay, MaxRequests: *groupRequests, MaxBytes: *groupBytes, QueueCapacity: *queueCapacity}
 	dataPath := *data
 	temporary := dataPath == ""
 	if temporary {
@@ -123,9 +168,9 @@ func main() {
 	}
 	var store *engine.Store
 	if *mode == "strict" {
-		store, err = engine.OpenReplicated(dataPath, identity, engine.ReplicationOptions{Term: 1, Role: format.ReplicationRolePrimary, Durability: format.ReplicationDurabilityStrict, Replica: durableReplica{log: standbyLog}, Guard: benchmarkGuard{}})
+		store, err = engine.OpenReplicated(dataPath, identity, engine.ReplicationOptions{Term: 1, Role: format.ReplicationRolePrimary, Durability: format.ReplicationDurabilityStrict, Replica: durableReplica{log: standbyLog}, Guard: benchmarkGuard{}, GroupCommit: groupOptions})
 	} else {
-		store, err = engine.OpenWithIdentity(dataPath, identity)
+		store, err = engine.OpenWithIdentityAndGroupCommit(dataPath, identity, groupOptions)
 	}
 	if err != nil {
 		fatal(err)
@@ -142,9 +187,20 @@ func main() {
 			_ = standbyRoot.Close()
 		}
 	}()
+	setupStarted := time.Now()
+	if *precreate {
+		if err = precreateStreams(store, *streams); err != nil {
+			fatal(err)
+		}
+		if err = store.CommitBarrier(context.Background()); err != nil {
+			fatal(err)
+		}
+	}
+	setupSeconds := time.Since(setupStarted).Seconds()
+	commitBaseline := store.CommitStats()
 	ctx, cancel := context.WithTimeout(context.Background(), *duration)
 	defer cancel()
-	var requests, records, bytesWritten, failures atomic.Uint64
+	var requests, records, bytesWritten, failures, deadlineExits, uncertainResults atomic.Uint64
 	payload := make([]byte, *payloadBytes)
 	var wait sync.WaitGroup
 	started := time.Now()
@@ -154,6 +210,10 @@ func main() {
 			defer wait.Done()
 			workerStreams := (*streams - worker + *workers - 1) / *workers
 			sequences := make(map[int]uint64)
+			initialSequence := uint64(0)
+			if *precreate {
+				initialSequence = 1
+			}
 			counter := uint64(0)
 			for ctx.Err() == nil {
 				streamIndex := worker + int(counter%uint64(workerStreams))**workers
@@ -164,14 +224,24 @@ func main() {
 				requestID := make([]byte, 16)
 				binary.LittleEndian.PutUint64(requestID[:8], uint64(worker))
 				binary.LittleEndian.PutUint64(requestID[8:], counter)
-				_, appendErr := store.Append(ctx, engine.AppendRequest{Namespace: "benchmark", Stream: fmt.Sprintf("stream-%08d", streamIndex), ExpectedSequence: sequences[streamIndex], RequestID: requestID, Producer: "streamd-bench", Records: inputs})
+				expected, present := sequences[streamIndex]
+				if !present {
+					expected = initialSequence
+				}
+				_, appendErr := store.Append(ctx, engine.AppendRequest{Namespace: "benchmark", Stream: fmt.Sprintf("stream-%08d", streamIndex), ExpectedSequence: expected, RequestID: requestID, Producer: "streamd-bench", Records: inputs})
 				if appendErr != nil {
-					if ctx.Err() == nil {
+					var writeErr *errdefs.WriteError
+					if errors.As(appendErr, &writeErr) && writeErr.ResultUncertain {
+						uncertainResults.Add(1)
+					}
+					if ctx.Err() != nil {
+						deadlineExits.Add(1)
+					} else {
 						failures.Add(1)
 					}
 					continue
 				}
-				sequences[streamIndex] += uint64(*batch)
+				sequences[streamIndex] = expected + uint64(*batch)
 				requests.Add(1)
 				records.Add(uint64(*batch))
 				bytesWritten.Add(uint64(*batch * *payloadBytes))
@@ -202,10 +272,17 @@ func main() {
 	wait.Wait()
 	<-checkpointDone
 	elapsed := time.Since(started).Seconds()
-	output := report{DurationSeconds: elapsed, Workers: *workers, Streams: *streams, BatchRecords: *batch, PayloadBytes: *payloadBytes, Requests: requests.Load(), Records: records.Load(), Bytes: bytesWritten.Load(), Errors: failures.Load(), DataDirectory: dataPath, Mode: *mode, StandbyDirectory: standbyPath}
+	drainStarted := time.Now()
+	if err = store.CommitBarrier(context.Background()); err != nil {
+		fatal(err)
+	}
+	drainSeconds := time.Since(drainStarted).Seconds()
+	commitStats := subtractCommitStats(store.CommitStats(), commitBaseline)
+	output := report{DurationSeconds: elapsed, SetupSeconds: setupSeconds, DrainSeconds: drainSeconds, Precreated: *precreate, Workers: *workers, Streams: *streams, BatchRecords: *batch, PayloadBytes: *payloadBytes, Requests: requests.Load(), Records: records.Load(), Bytes: bytesWritten.Load(), Errors: failures.Load(), DeadlineExits: deadlineExits.Load(), UncertainResults: uncertainResults.Load(), DataDirectory: dataPath, Mode: *mode, StandbyDirectory: standbyPath}
 	output.RequestsPerSec = float64(output.Requests) / elapsed
 	output.RecordsPerSec = float64(output.Records) / elapsed
 	output.MiBPerSec = float64(output.Bytes) / elapsed / (1 << 20)
+	output.GroupCommit = buildCommitReport(commitStats, groupOptions, elapsed+drainSeconds)
 	if *verify {
 		if _, _, err = store.Checkpoint(); err != nil {
 			fatal(err)
@@ -247,6 +324,64 @@ func main() {
 	if err = encoder.Encode(output); err != nil {
 		fatal(err)
 	}
+}
+
+func precreateStreams(store *engine.Store, streams int) error {
+	for stream := 0; stream < streams; stream++ {
+		requestID := make([]byte, 16)
+		binary.LittleEndian.PutUint64(requestID[:8], uint64(stream))
+		copy(requestID[8:], "setup")
+		_, err := store.Append(context.Background(), engine.AppendRequest{
+			Namespace: "benchmark", Stream: fmt.Sprintf("stream-%08d", stream), RequestID: requestID,
+			Producer: "streamd-bench/setup", Records: []engine.InputRecord{{}},
+		})
+		if err != nil {
+			return fmt.Errorf("precreate Stream %d: %w", stream, err)
+		}
+	}
+	return nil
+}
+
+func subtractCommitStats(after, before commit.Stats) commit.Stats {
+	return commit.Stats{
+		Groups: after.Groups - before.Groups, Requests: after.Requests - before.Requests,
+		Entries: after.Entries - before.Entries, Bytes: after.Bytes - before.Bytes,
+		LocalSyncs: after.LocalSyncs - before.LocalSyncs, ReplicatedGroups: after.ReplicatedGroups - before.ReplicatedGroups,
+		MaxGroupRequests: after.MaxGroupRequests, MaxGroupBytes: after.MaxGroupBytes,
+		QueueWaitNanos: after.QueueWaitNanos - before.QueueWaitNanos, CollectNanos: after.CollectNanos - before.CollectNanos,
+		AppendNanos: after.AppendNanos - before.AppendNanos, LocalSyncNanos: after.LocalSyncNanos - before.LocalSyncNanos,
+		ReplicateNanos: after.ReplicateNanos - before.ReplicateNanos, ApplyNanos: after.ApplyNanos - before.ApplyNanos,
+		ProcessNanos: after.ProcessNanos - before.ProcessNanos, QueueDepth: after.QueueDepth, QueueCapacity: after.QueueCapacity,
+	}
+}
+
+func buildCommitReport(stats commit.Stats, configured engine.GroupCommitOptions, elapsedSeconds float64) commitReport {
+	report := commitReport{
+		ConfiguredDelayMicros: float64(configured.MaxDelay) / float64(time.Microsecond), ConfiguredMaxRequests: configured.MaxRequests,
+		ConfiguredMaxBytes: configured.MaxBytes, ConfiguredQueueCapacity: configured.QueueCapacity,
+		Groups: stats.Groups, Requests: stats.Requests, Entries: stats.Entries, Bytes: stats.Bytes, LocalSyncs: stats.LocalSyncs,
+		ReplicatedGroups: stats.ReplicatedGroups, MaxRequestsPerGroup: stats.MaxGroupRequests, MaxBytesPerGroup: stats.MaxGroupBytes,
+		AppendSeconds: float64(stats.AppendNanos) / float64(time.Second), LocalSyncSeconds: float64(stats.LocalSyncNanos) / float64(time.Second),
+		ReplicateSeconds: float64(stats.ReplicateNanos) / float64(time.Second), ApplySeconds: float64(stats.ApplyNanos) / float64(time.Second),
+		ProcessSeconds: float64(stats.ProcessNanos) / float64(time.Second), FinalQueueDepth: stats.QueueDepth, QueueCapacity: stats.QueueCapacity,
+	}
+	if stats.Groups > 0 {
+		report.AverageRequestsPerGroup = float64(stats.Requests) / float64(stats.Groups)
+		report.AverageEntriesPerGroup = float64(stats.Entries) / float64(stats.Groups)
+		report.AverageCollectMicros = float64(stats.CollectNanos) / float64(stats.Groups) / float64(time.Microsecond)
+	}
+	if stats.Requests > 0 {
+		report.AverageQueueWaitMicros = float64(stats.QueueWaitNanos) / float64(stats.Requests) / float64(time.Microsecond)
+	}
+	if stats.ProcessNanos > 0 {
+		report.LocalSyncProcessRatio = float64(stats.LocalSyncNanos) / float64(stats.ProcessNanos)
+		report.ReplicateProcessRatio = float64(stats.ReplicateNanos) / float64(stats.ProcessNanos)
+	}
+	if elapsedSeconds > 0 {
+		report.LocalSyncWallRatio = report.LocalSyncSeconds / elapsedSeconds
+		report.ProcessWallRatio = report.ProcessSeconds / elapsedSeconds
+	}
+	return report
 }
 
 func requireEmpty(path string) error {
