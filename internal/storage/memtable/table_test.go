@@ -66,3 +66,22 @@ func TestBatchValidationAndFreeze(t *testing.T) {
 		t.Fatal("frozen Table accepted Apply")
 	}
 }
+
+func TestPruneSeededRetainsActiveStreams(t *testing.T) {
+	table := New(0)
+	if err := table.SeedTail(2, Tail{NextSequence: 7, RecordCount: 7}); err != nil {
+		t.Fatal(err)
+	}
+	if err := table.ApplyBatch(batch(t, 0, 0, 0, 1)); err != nil {
+		t.Fatal(err)
+	}
+	if removed := table.PruneSeeded(); removed != 1 {
+		t.Fatalf("removed = %d, want 1", removed)
+	}
+	if _, ok := table.Tail(2); ok {
+		t.Fatal("seed-only Stream remained active")
+	}
+	if tail, ok := table.Tail(1); !ok || tail.NextSequence != 1 {
+		t.Fatalf("active Stream Tail = %+v, ok = %v", tail, ok)
+	}
+}

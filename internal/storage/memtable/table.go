@@ -35,6 +35,10 @@ type StreamSnapshot struct {
 	Tail     Tail
 	Frames   [][]byte
 }
+type TailSnapshot struct {
+	StreamID uint64
+	Tail     Tail
+}
 type Table struct {
 	mu        sync.RWMutex
 	chunkSize int
@@ -207,6 +211,32 @@ func (t *Table) Snapshot() []StreamSnapshot {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	return t.snapshotLocked()
+}
+func (t *Table) Tails() []TailSnapshot {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	ids := make([]uint64, 0, len(t.streams))
+	for id := range t.streams {
+		ids = append(ids, id)
+	}
+	slices.Sort(ids)
+	out := make([]TailSnapshot, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, TailSnapshot{StreamID: id, Tail: t.streams[id].tail})
+	}
+	return out
+}
+func (t *Table) PruneSeeded() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	removed := 0
+	for streamID, stream := range t.streams {
+		if len(stream.records) == 0 {
+			delete(t.streams, streamID)
+			removed++
+		}
+	}
+	return removed
 }
 func (t *Table) snapshotLocked() []StreamSnapshot {
 	ids := make([]uint64, 0, len(t.streams))

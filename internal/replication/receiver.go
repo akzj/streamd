@@ -116,6 +116,35 @@ func (r *Receiver) State() (ReceiverState, error) {
 	return r.state, r.fatal
 }
 
+func (r *Receiver) maintain(operation func(ReceiverState) error) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.fatal != nil {
+		return r.fatal
+	}
+	if operation == nil {
+		return protocolError(ErrInvalidState, "Receiver maintenance operation is required")
+	}
+	if err := operation(r.state); err != nil {
+		r.fatal = fmt.Errorf("Standby maintenance failed: %w", err)
+		return r.fatal
+	}
+	return nil
+}
+
+func (r *Receiver) fail(err error) error {
+	if err == nil {
+		return nil
+	}
+	r.mu.Lock()
+	if r.fatal == nil {
+		r.fatal = fmt.Errorf("Standby maintenance failed: %w", err)
+	}
+	fatal := r.fatal
+	r.mu.Unlock()
+	return fatal
+}
+
 func (r *Receiver) Append(message AppendEntries) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()

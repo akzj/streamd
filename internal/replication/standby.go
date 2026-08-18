@@ -10,22 +10,29 @@ import (
 	"github.com/akzj/streamd/internal/storage/format"
 	"github.com/akzj/streamd/internal/storage/fsutil"
 	"github.com/akzj/streamd/internal/storage/identity"
+	"github.com/akzj/streamd/internal/storage/lifecycle"
+	locatorstore "github.com/akzj/streamd/internal/storage/locator"
+	"github.com/akzj/streamd/internal/storage/memtable"
+	"github.com/akzj/streamd/internal/storage/projection"
 	"github.com/akzj/streamd/internal/storage/recovery"
 	"github.com/akzj/streamd/internal/storage/registry"
 	"github.com/akzj/streamd/internal/storage/replicationstate"
+	"github.com/akzj/streamd/internal/storage/segment"
+	tailstore "github.com/akzj/streamd/internal/storage/tail"
 	"github.com/akzj/streamd/internal/storage/wal"
 )
 
 type StandbyStore struct {
-	mu       sync.Mutex
-	root     *fsutil.Root
-	identity format.NodeIdentity
-	state    *recovery.Result
-	states   *replicationstate.Store
-	history  *wal.History
-	receiver *Receiver
-	now      func() time.Time
-	closed   bool
+	mu        sync.Mutex
+	root      *fsutil.Root
+	identity  format.NodeIdentity
+	state     *recovery.Result
+	states    *replicationstate.Store
+	history   *wal.History
+	lifecycle *lifecycle.Manager
+	receiver  *Receiver
+	now       func() time.Time
+	closed    bool
 }
 
 type standbyLog struct {
@@ -84,7 +91,7 @@ func OpenStandby(path string, node format.NodeIdentity, term uint64, leaderID fo
 		recovered.Close()
 		return fail(err)
 	}
-	store := &StandbyStore{root: root, identity: node, state: recovered, states: states, history: history, now: time.Now}
+	store := &StandbyStore{root: root, identity: node, state: recovered, states: states, history: history, lifecycle: lifecycle.New(root.Path(), recovered.Manifest), now: time.Now}
 	last := Position{}
 	if _, next, present := history.Bounds(); present {
 		_, entry, lookupErr := history.EntryAt(next - 1)
@@ -147,11 +154,152 @@ func (s *StandbyStore) Hello() (ReplicaHello, error) {
 }
 
 func (s *StandbyStore) Checkpoint() error {
-	state, err := s.receiver.State()
-	if err != nil {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return fmt.Errorf("Standby Store is closed")
+	}
+	return s.checkpointLocked()
+}
+
+func (s *StandbyStore) checkpointLocked() error {
+	type frozenCheckpoint struct {
+		table       *memtable.Table
+		position    Position
+		previous    format.Manifest
+		descriptors []segment.Descriptor
+	}
+	var frozen *frozenCheckpoint
+	err := s.receiver.maintain(func(state ReceiverState) error {
+		if err := s.checkpointState(state); err != nil {
+			return err
+		}
+		records, _ := s.state.MemTable.Stats()
+		if records == 0 {
+			return nil
+		}
+		if !state.Applied.Valid || state.Applied != state.Committed {
+			return fmt.Errorf("Standby applied watermark is not a committed checkpoint")
+		}
+		oldTable := s.state.MemTable
+		oldTable.Freeze()
+		active := memtable.New(0)
+		for _, snapshot := range oldTable.Tails() {
+			if err := active.SeedTail(snapshot.StreamID, snapshot.Tail); err != nil {
+				return err
+			}
+		}
+		previous, _ := s.state.Manifest.Current()
+		frozen = &frozenCheckpoint{table: oldTable, position: state.Applied, previous: previous, descriptors: append([]segment.Descriptor(nil), s.state.Segments...)}
+		s.state.MemTable = active
+		s.state.TailResolver = tailstore.NewResolver(active, s.state.TailCatalog, s.root.Path(), s.state.Segments, 1024)
+		if err := s.state.WAL.Rotate(state.Term, s.now()); err != nil {
+			return err
+		}
+		return s.history.Refresh()
+	})
+	if err != nil || frozen == nil {
 		return err
 	}
-	_, err = s.states.Update(s.now(), func(header *format.ReplicationStateHeader) error {
+
+	snapshots := frozen.table.Snapshot()
+	flush := make([]memtable.StreamSnapshot, 0, len(snapshots))
+	for _, snapshot := range snapshots {
+		if len(snapshot.Frames) > 0 {
+			flush = append(flush, snapshot)
+		}
+	}
+	if len(flush) == 0 {
+		return s.receiver.fail(fmt.Errorf("Standby checkpoint froze no committed Records"))
+	}
+	existing := make(map[format.UUID]segment.Descriptor, len(frozen.descriptors))
+	for _, descriptor := range frozen.descriptors {
+		existing[descriptor.Reference.SegmentID] = descriptor
+	}
+	var descriptors []segment.Descriptor
+	var projections projection.Build
+	published, err := s.lifecycle.PublishFlushWithArtifacts(flush, frozen.position.EntryID, frozen.position.CRC32C, func(generation uint64, references []format.SegmentReference, coveredEntryID uint64) ([]format.ArtifactReference, error) {
+		descriptors = append([]segment.Descriptor(nil), frozen.descriptors...)
+		for _, reference := range references {
+			if _, found := existing[reference.SegmentID]; found {
+				continue
+			}
+			descriptor, describeErr := segment.DescribeReference(s.root.Path(), reference)
+			if describeErr != nil {
+				return nil, describeErr
+			}
+			descriptors = append(descriptors, descriptor)
+		}
+		var buildErr error
+		projections, buildErr = projection.BuildReferences(s.root.Path(), generation, coveredEntryID, s.now().UnixNano(), descriptors)
+		if buildErr != nil {
+			return nil, buildErr
+		}
+		return []format.ArtifactReference{projections.TailReference, projections.Locator.Reference, projections.RegistryReference}, nil
+	})
+	if err != nil {
+		return s.receiver.fail(err)
+	}
+	nextTailCatalog, err := tailstore.OpenCheckpoint(s.root.Path(), projections.TailReference, published.Header.Generation, published.Header.LastEntryID)
+	if err != nil {
+		return s.receiver.fail(err)
+	}
+	nextLocator, err := locatorstore.Open(s.root.Path(), published, 256)
+	if err != nil {
+		nextTailCatalog.Close()
+		return s.receiver.fail(err)
+	}
+	nextRegistryStore, err := registry.OpenCheckpoint(s.root.Path(), projections.RegistryReference, published.Header.LastEntryID, 64)
+	if err != nil {
+		nextTailCatalog.Close()
+		nextLocator.Close()
+		return s.receiver.fail(err)
+	}
+	nextRegistry := registry.NewWithSnapshot(nextRegistryStore)
+	fallbackDescriptors := segment.LightDescriptors(descriptors)
+	nextRegistry.SetFallback(func() ([]registry.Mapping, error) {
+		return registry.RebuildMappings(s.root.Path(), fallbackDescriptors)
+	})
+	retiredArtifacts := projection.ReplacedArtifacts(frozen.previous.ArtifactReferences, s.state.Locator, projections)
+	var oldTailCatalog *tailstore.Catalog
+	var oldLocator *locatorstore.Store
+	err = s.receiver.maintain(func(state ReceiverState) error {
+		for _, mapping := range s.state.Registry.MappingsAfter(published.Header.LastEntryID) {
+			if err := nextRegistry.ApplyMapping(mapping); err != nil {
+				return err
+			}
+		}
+		oldTailCatalog, oldLocator = s.state.TailCatalog, s.state.Locator
+		s.state.Segments = segment.LightDescriptors(descriptors)
+		s.state.TailCatalog = nextTailCatalog
+		s.state.TailResolver = tailstore.NewResolver(s.state.MemTable, nextTailCatalog, s.root.Path(), s.state.Segments, 1024)
+		s.state.Locator = nextLocator
+		s.state.Registry = nextRegistry
+		s.state.MemTable.PruneSeeded()
+		return nil
+	})
+	if err != nil {
+		nextTailCatalog.Close()
+		nextLocator.Close()
+		return err
+	}
+	if oldTailCatalog != nil {
+		err = oldTailCatalog.Close()
+	}
+	if oldLocator != nil {
+		err = errors.Join(err, oldLocator.Close())
+	}
+	if err != nil {
+		return s.receiver.fail(err)
+	}
+	if err = s.lifecycle.RetireArtifacts(retiredArtifacts); err != nil {
+		return s.receiver.fail(err)
+	}
+	return nil
+}
+
+func (s *StandbyStore) checkpointState(state ReceiverState) error {
+	_, err := s.states.Update(s.now(), func(header *format.ReplicationStateHeader) error {
 		header.Term = state.Term
 		header.Role = format.ReplicationRoleStandby
 		header.Durability = format.ReplicationDurabilityStrict
@@ -180,8 +328,8 @@ func (s *StandbyStore) Close() error {
 	if s.closed {
 		return nil
 	}
+	checkpointErr := s.checkpointLocked()
 	s.closed = true
-	checkpointErr := s.Checkpoint()
 	return errors.Join(checkpointErr, s.state.Close(), s.root.Close())
 }
 
