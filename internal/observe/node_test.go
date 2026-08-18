@@ -122,6 +122,24 @@ func assertMetric(t *testing.T, families []*dto.MetricFamily, name string, label
 	t.Fatalf("metric %s labels %v is missing", name, labels)
 }
 
+func assertCounter(t *testing.T, families []*dto.MetricFamily, name string, labels map[string]string, want float64) {
+	t.Helper()
+	family := metricFamily(families, name)
+	if family == nil {
+		t.Fatalf("metric family %s is missing", name)
+	}
+	for _, metric := range family.Metric {
+		if labelsMatch(metric.Label, labels) {
+			value := metric.GetCounter().GetValue()
+			if value != want {
+				t.Fatalf("metric %s labels %v = %v, want %v", name, labels, value, want)
+			}
+			return
+		}
+	}
+	t.Fatalf("metric %s labels %v is missing", name, labels)
+}
+
 func metricFamily(families []*dto.MetricFamily, name string) *dto.MetricFamily {
 	for _, family := range families {
 		if family.GetName() == name {

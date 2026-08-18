@@ -180,6 +180,11 @@ func runPrimary(ctx context.Context, config Config, nodeIdentity format.NodeIden
 	if err != nil {
 		return err
 	}
+	commitMetrics, err := observe.NewCommitMetrics(store)
+	if err != nil {
+		return err
+	}
+	admin.registry.MustRegister(commitMetrics)
 	closed := false
 	defer func() {
 		if !closed {

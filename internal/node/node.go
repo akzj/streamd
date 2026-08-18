@@ -68,6 +68,11 @@ func Run(ctx context.Context, config Config, logger *slog.Logger) error {
 		return err
 	}
 	registry.MustRegister(nodeMetrics)
+	commitMetrics, err := observe.NewCommitMetrics(store)
+	if err != nil {
+		return err
+	}
+	registry.MustRegister(commitMetrics)
 	rpcMetrics := observe.NewRPCMetrics(registry)
 	grpcServer := grpc.NewServer(
 		grpc.Creds(credentials),

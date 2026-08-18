@@ -133,6 +133,7 @@ type Store struct {
 	durability     format.ReplicationDurability
 	guard          commit.Guard
 	commitOptions  commit.Options
+	commitStatsMu  sync.Mutex
 	commitStats    commit.Stats
 	commitArchived bool
 }
@@ -182,8 +183,8 @@ func (s *Store) Health() Health {
 }
 
 func (s *Store) CommitStats() commit.Stats {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.commitStatsMu.Lock()
+	defer s.commitStatsMu.Unlock()
 	if s.commitArchived {
 		return s.commitStats
 	}
@@ -206,6 +207,8 @@ func (s *Store) CommitBarrier(ctx context.Context) error {
 }
 
 func (s *Store) archiveCommitterLocked() {
+	s.commitStatsMu.Lock()
+	defer s.commitStatsMu.Unlock()
 	if s.commitArchived {
 		return
 	}
@@ -708,8 +711,10 @@ func (s *Store) checkpointLocked(states *replicationstate.Store) (format.Manifes
 	s.state.TailResolver = tailstore.NewResolver(newTable, nextTailCatalog, s.root.Path(), s.state.Segments, defaultStreamCacheCapacity)
 	s.state.Locator = nextLocator
 	s.state.Registry = nextRegistry
+	s.commitStatsMu.Lock()
 	s.committer = commit.NewWithOptions(s.state.WAL, newTable, s.commitOptions)
 	s.commitArchived = false
+	s.commitStatsMu.Unlock()
 	s.reader = readstore.New(newTable, s.state.TailResolver, s.root.Path(), published.Header.Generation, s.state.Segments, nextLocator, defaultStreamCacheCapacity, defaultSegmentHandleCapacity)
 	closeErr := oldReader.Close()
 	if oldTailCatalog != nil {
