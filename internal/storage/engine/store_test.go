@@ -369,6 +369,56 @@ func TestCheckpointPublishesSegmentRotatesWALAndRestarts(t *testing.T) {
 	}
 }
 
+func TestReplicatedCheckpointPersistsCommittedStateBeforeManifest(t *testing.T) {
+	dir := t.TempDir()
+	node := format.NodeIdentity{ClusterID: engineID(1), GroupID: engineID(2), NodeID: engineID(3), CreatedAt: 1}
+	if err := os.MkdirAll(filepath.Join(dir, "meta"), 0750); err != nil {
+		t.Fatal(err)
+	}
+	states, err := replicationstate.Open(dir, node)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = states.Update(time.Unix(1, 0), func(header *format.ReplicationStateHeader) error {
+		header.Term = 7
+		header.Role = format.ReplicationRolePrimary
+		header.Durability = format.ReplicationDurabilityStrict
+		header.HasLeader = true
+		header.LeaderID = node.NodeID
+		header.HasLease = true
+		header.LeaseExpiresAt = time.Unix(60, 0).UnixNano()
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	store, err := OpenReplicated(dir, node, ReplicationOptions{Term: 7, Role: format.ReplicationRolePrimary, Durability: format.ReplicationDurabilityStrict, Replica: &engineReplica{}, Guard: &engineGuard{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.Append(context.Background(), AppendRequest{Namespace: "ha", Stream: "events", RequestID: []byte("one"), Producer: "test", Records: []InputRecord{{Payload: []byte("one")}}}); err != nil {
+		t.Fatal(err)
+	}
+	injected := errors.New("injected crash after Manifest publish")
+	store.checkpointHook = func(point string) error {
+		if point == "after_manifest_publish" {
+			return injected
+		}
+		return nil
+	}
+	if _, _, err = store.CheckpointReplicated(states); !errors.Is(err, injected) {
+		t.Fatalf("CheckpointReplicated error = %v", err)
+	}
+	manifest, ok := store.state.Manifest.Current()
+	if !ok {
+		t.Fatal("Manifest was not published before injected crash")
+	}
+	state, ok := states.Current()
+	if !ok || !state.Header.Committed.Present || state.Header.Committed.EntryID < manifest.Header.LastEntryID || !state.Header.Applied.Present || state.Header.Applied.EntryID < manifest.Header.LastEntryID {
+		t.Fatalf("Replication State does not cover Manifest checkpoint: state=%+v manifest=%+v", state.Header, manifest.Header)
+	}
+	_ = store.Close()
+}
+
 func TestCompactSwitchesGenerationBeforeRetiringInputs(t *testing.T) {
 	dir := t.TempDir()
 	store, err := Open(dir)

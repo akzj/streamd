@@ -467,7 +467,20 @@ func (s *Store) Append(ctx context.Context, request AppendRequest) (AppendResult
 func (s *Store) Checkpoint() (format.Manifest, bool, error) {
 	s.maintenanceMu.Lock()
 	defer s.maintenanceMu.Unlock()
-	return s.checkpointLocked()
+	return s.checkpointLocked(nil)
+}
+
+// CheckpointReplicated persists an exact committed recovery floor before it
+// publishes a Manifest that may cover the same entries. Both publications run
+// under the Engine lock, so a crash cannot leave the Manifest ahead of the
+// durable Replication State used to reopen a Standby or former Primary.
+func (s *Store) CheckpointReplicated(states *replicationstate.Store) (format.Manifest, bool, error) {
+	if states == nil {
+		return format.Manifest{}, false, fmt.Errorf("replicated State store is required")
+	}
+	s.maintenanceMu.Lock()
+	defer s.maintenanceMu.Unlock()
+	return s.checkpointLocked(states)
 }
 
 // CheckpointAndPin publishes a checkpoint and pins every Segment referenced by
@@ -476,7 +489,7 @@ func (s *Store) Checkpoint() (format.Manifest, bool, error) {
 func (s *Store) CheckpointAndPin() (format.Manifest, bool, func(), error) {
 	s.maintenanceMu.Lock()
 	defer s.maintenanceMu.Unlock()
-	manifest, created, err := s.checkpointLocked()
+	manifest, created, err := s.checkpointLocked(nil)
 	if err != nil {
 		return format.Manifest{}, false, nil, err
 	}
@@ -503,7 +516,7 @@ func (s *Store) CheckpointAndPin() (format.Manifest, bool, func(), error) {
 	return manifest, created, release, nil
 }
 
-func (s *Store) checkpointLocked() (format.Manifest, bool, error) {
+func (s *Store) checkpointLocked(states *replicationstate.Store) (format.Manifest, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.shutdown {
@@ -515,6 +528,11 @@ func (s *Store) checkpointLocked() (format.Manifest, bool, error) {
 	if err := s.committer.Barrier(context.Background()); err != nil {
 		s.setFatal(err)
 		return format.Manifest{}, false, err
+	}
+	if states != nil {
+		if _, err := s.checkpointReplicationStateLocked(states); err != nil {
+			return format.Manifest{}, false, err
+		}
 	}
 	records, _ := s.state.MemTable.Stats()
 	if records == 0 {
@@ -925,6 +943,10 @@ func (s *Store) CheckpointReplicationState(states *replicationstate.Store) (form
 	if err := s.committer.Barrier(context.Background()); err != nil {
 		return format.ReplicationState{}, err
 	}
+	return s.checkpointReplicationStateLocked(states)
+}
+
+func (s *Store) checkpointReplicationStateLocked(states *replicationstate.Store) (format.ReplicationState, error) {
 	history, err := wal.OpenHistory(s.root.Path())
 	if err != nil {
 		return format.ReplicationState{}, err
