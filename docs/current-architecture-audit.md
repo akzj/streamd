@@ -3,9 +3,9 @@
 | 属性 | 内容 |
 | --- | --- |
 | 审计性质 | 代码现实版整体架构审计，不是目标架构复述 |
-| 审计基线 | `4cb0f11`（`main`，2026-08-18） |
+| 审计基线 | `7f88e13`（`main`，2026-08-18） |
 | 审计日期 | 2026-08-18 |
-| 相对上次审计新增 | 有界 Recovery 元数据；Tail Resolver；轻量 Segment Descriptor；历史 Directory/Tail 延迟加载 |
+| 相对上次审计新增 | 有界 Recovery 元数据；Tail Resolver；轻量 Segment Descriptor；历史 Directory/Tail 延迟加载；Standby/Promotion 延迟 Tail Apply |
 | 覆盖范围 | API、存储、索引、Checkpoint、Compaction、恢复、Snapshot、WAL GC、Strict HA、并发与运维入口 |
 | 验证边界 | 代码、单元/race/vet、Compose HA；不等同于性能、长稳、磁盘故障或生产部署验收 |
 
