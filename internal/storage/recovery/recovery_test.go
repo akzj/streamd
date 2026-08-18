@@ -103,9 +103,12 @@ func TestRecoveryAcceptsWALOverlappingManifestCheckpoint(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer recovered.Close()
-	tail, ok := recovered.MemTable.Tail(2)
-	if !ok || tail.NextSequence != 1 {
-		t.Fatalf("tail %+v %v", tail, ok)
+	if _, ok := recovered.MemTable.Tail(2); ok {
+		t.Fatal("checkpoint-only Stream was loaded into active MemTable")
+	}
+	tail, ok, err := recovered.TailResolver.Lookup(2)
+	if err != nil || !ok || tail.NextSequence != 1 {
+		t.Fatalf("resolved tail %+v %v %v", tail, ok, err)
 	}
 }
 

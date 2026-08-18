@@ -264,7 +264,7 @@ func open(path string, node *format.NodeIdentity, replication *ReplicationOption
 			return nil, fmt.Errorf("rotate WAL for Term %d: %w", replication.Term, err)
 		}
 	}
-	var lastRecordedAt int64
+	lastRecordedAt := state.LastRecordedAt
 	for _, snapshot := range state.MemTable.Snapshot() {
 		if snapshot.Tail.RecordCount > 0 && snapshot.Tail.LastRecordedAt > lastRecordedAt {
 			lastRecordedAt = snapshot.Tail.LastRecordedAt
@@ -285,7 +285,7 @@ func open(path string, node *format.NodeIdentity, replication *ReplicationOption
 	if current, ok := state.Manifest.Current(); ok {
 		generation = current.Header.Generation
 	}
-	return &Store{root: root, state: state, lifecycle: lifecycle.New(root.Path(), state.Manifest), committer: commit.NewWithOptions(state.WAL, state.MemTable, commitOptions), reader: readstore.New(state.MemTable, root.Path(), generation, state.Segments, state.Locator, defaultStreamCacheCapacity, defaultSegmentHandleCapacity), now: time.Now, notifications: make(map[streamKey]chan struct{}), appendGates: make(map[streamKey]chan struct{}), nextEntryID: state.WAL.NextEntryID(), previousCRC32C: state.WAL.PreviousEntryCRC32C(), lastRecordedAt: lastRecordedAt, term: term, role: role, durability: durability, guard: guard, commitOptions: commitOptions}, nil
+	return &Store{root: root, state: state, lifecycle: lifecycle.New(root.Path(), state.Manifest), committer: commit.NewWithOptions(state.WAL, state.MemTable, commitOptions), reader: readstore.New(state.MemTable, state.TailResolver, root.Path(), generation, state.Segments, state.Locator, defaultStreamCacheCapacity, defaultSegmentHandleCapacity), now: time.Now, notifications: make(map[streamKey]chan struct{}), appendGates: make(map[streamKey]chan struct{}), nextEntryID: state.WAL.NextEntryID(), previousCRC32C: state.WAL.PreviousEntryCRC32C(), lastRecordedAt: lastRecordedAt, term: term, role: role, durability: durability, guard: guard, commitOptions: commitOptions}, nil
 }
 
 func watermarksFromState(header format.ReplicationStateHeader) commit.Watermarks {
@@ -382,7 +382,11 @@ func (s *Store) Append(ctx context.Context, request AppendRequest) (AppendResult
 		s.mu.Unlock()
 		return AppendResult{}, err
 	}
-	tail, ok := s.state.MemTable.Tail(mapping.StreamID)
+	tail, ok, err := s.state.TailResolver.EnsureActive(mapping.StreamID)
+	if err != nil {
+		s.mu.Unlock()
+		return AppendResult{}, err
+	}
 	if !ok {
 		tail = zeroTail()
 	}
@@ -564,6 +568,10 @@ func (s *Store) checkpointLocked() (format.Manifest, bool, error) {
 			return nil, fmt.Errorf("published Manifest Segment set is inconsistent")
 		}
 		var buildErr error
+		descriptors, buildErr = segment.MaterializeDescriptors(s.root.Path(), descriptors)
+		if buildErr != nil {
+			return nil, buildErr
+		}
 		projections, buildErr = s.buildProjectionReferences(generation, coveredEntryID, descriptors)
 		if buildErr != nil {
 			return nil, buildErr
@@ -598,29 +606,24 @@ func (s *Store) checkpointLocked() (format.Manifest, bool, error) {
 		return format.Manifest{}, false, err
 	}
 	nextRegistry := registry.NewWithSnapshot(nextRegistryStore)
-	fallbackDescriptors := append([]segment.Descriptor(nil), descriptors...)
+	fallbackDescriptors := segment.LightDescriptors(descriptors)
 	nextRegistry.SetFallback(func() ([]registry.Mapping, error) {
 		return registry.RebuildMappings(s.root.Path(), fallbackDescriptors)
 	})
 	retiredArtifacts := replacedProjectionArtifacts(previous.ArtifactReferences, s.state.Locator, projections)
 	newTable := memtable.New(0)
-	for _, snapshot := range snapshots {
-		if err = newTable.SeedTail(snapshot.StreamID, snapshot.Tail); err != nil {
-			s.setFatal(err)
-			return format.Manifest{}, false, err
-		}
-	}
 	s.viewMu.Lock()
 	oldTable := s.state.MemTable
 	oldReader := s.reader
 	oldTailCatalog := s.state.TailCatalog
 	s.state.MemTable = newTable
-	s.state.Segments = descriptors
+	s.state.Segments = segment.LightDescriptors(descriptors)
 	s.state.TailCatalog = nextTailCatalog
+	s.state.TailResolver = tailstore.NewResolver(newTable, nextTailCatalog, s.root.Path(), s.state.Segments, defaultStreamCacheCapacity)
 	s.state.Locator = nextLocator
 	s.state.Registry = nextRegistry
 	s.committer = commit.NewWithOptions(s.state.WAL, newTable, s.commitOptions)
-	s.reader = readstore.New(newTable, s.root.Path(), published.Header.Generation, s.state.Segments, nextLocator, defaultStreamCacheCapacity, defaultSegmentHandleCapacity)
+	s.reader = readstore.New(newTable, s.state.TailResolver, s.root.Path(), published.Header.Generation, s.state.Segments, nextLocator, defaultStreamCacheCapacity, defaultSegmentHandleCapacity)
 	closeErr := oldReader.Close()
 	if oldTailCatalog != nil {
 		closeErr = errors.Join(closeErr, oldTailCatalog.Close())
@@ -699,6 +702,10 @@ func (s *Store) Compact(options CompactionOptions) (CompactionResult, error) {
 			descriptors = append(descriptors, descriptor)
 		}
 		var buildErr error
+		descriptors, buildErr = segment.MaterializeDescriptors(s.root.Path(), descriptors)
+		if buildErr != nil {
+			return nil, buildErr
+		}
 		projections, buildErr = s.buildProjectionReferences(generation, coveredEntryID, descriptors)
 		if buildErr != nil {
 			return nil, buildErr
@@ -727,7 +734,7 @@ func (s *Store) Compact(options CompactionOptions) (CompactionResult, error) {
 		return CompactionResult{}, err
 	}
 	nextRegistry := registry.NewWithSnapshot(nextRegistryStore)
-	fallbackDescriptors := append([]segment.Descriptor(nil), descriptors...)
+	fallbackDescriptors := segment.LightDescriptors(descriptors)
 	nextRegistry.SetFallback(func() ([]registry.Mapping, error) {
 		return registry.RebuildMappings(s.root.Path(), fallbackDescriptors)
 	})
@@ -741,12 +748,15 @@ func (s *Store) Compact(options CompactionOptions) (CompactionResult, error) {
 		}
 	}
 	retiredArtifacts := replacedProjectionArtifacts(previous.ArtifactReferences, s.state.Locator, projections)
-	nextReader := readstore.New(table, s.root.Path(), published.Header.Generation, descriptors, nextLocator, defaultStreamCacheCapacity, defaultSegmentHandleCapacity)
+	lightDescriptors := segment.LightDescriptors(descriptors)
+	nextTailResolver := tailstore.NewResolver(table, nextTailCatalog, s.root.Path(), lightDescriptors, defaultStreamCacheCapacity)
+	nextReader := readstore.New(table, nextTailResolver, s.root.Path(), published.Header.Generation, lightDescriptors, nextLocator, defaultStreamCacheCapacity, defaultSegmentHandleCapacity)
 	s.viewMu.Lock()
 	oldReader := s.reader
 	oldTailCatalog := s.state.TailCatalog
-	s.state.Segments = descriptors
+	s.state.Segments = lightDescriptors
 	s.state.TailCatalog = nextTailCatalog
+	s.state.TailResolver = nextTailResolver
 	s.state.Locator = nextLocator
 	s.state.Registry = nextRegistry
 	s.reader = nextReader
@@ -1049,7 +1059,10 @@ func (s *Store) closeNotifications() {
 	s.notifyMu.Unlock()
 }
 func (s *Store) commitRegistry(proposal format.RegistryRecord, payload []byte) error {
-	tail, ok := s.state.MemTable.Tail(registry.RegistryStreamID)
+	tail, ok, err := s.state.TailResolver.EnsureActive(registry.RegistryStreamID)
+	if err != nil {
+		return err
+	}
 	if !ok {
 		tail = zeroTail()
 	}

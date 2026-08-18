@@ -1,16 +1,15 @@
 package read
 
 import (
-	"container/list"
 	"fmt"
 	"sort"
-	"sync"
 
 	"github.com/akzj/streamd/internal/storage/errdefs"
 	"github.com/akzj/streamd/internal/storage/format"
 	locatorstore "github.com/akzj/streamd/internal/storage/locator"
 	"github.com/akzj/streamd/internal/storage/memtable"
 	"github.com/akzj/streamd/internal/storage/segment"
+	tailstore "github.com/akzj/streamd/internal/storage/tail"
 )
 
 type TimeMode uint8
@@ -36,61 +35,27 @@ type extent struct {
 	reference format.SegmentReference
 	directory format.StreamDirectoryEntry
 }
-type cacheEntry struct {
-	streamID   uint64
-	generation uint64
-	extents    []extent
-}
 type Store struct {
 	table      *memtable.Table
+	tails      *tailstore.Resolver
+	root       string
 	generation uint64
 	segments   []segment.Descriptor
 	handles    *segment.HandleCache
 	locator    *locatorstore.Store
-	capacity   int
-	mu         sync.Mutex
-	cache      map[uint64]*list.Element
-	lru        *list.List
 }
 
-func New(table *memtable.Table, root string, generation uint64, segments []segment.Descriptor, locator *locatorstore.Store, streamCacheCapacity, handleCapacity int) *Store {
-	if streamCacheCapacity <= 0 {
-		streamCacheCapacity = 1024
+func New(table *memtable.Table, tails *tailstore.Resolver, root string, generation uint64, segments []segment.Descriptor, locator *locatorstore.Store, streamCacheCapacity, handleCapacity int) *Store {
+	if tails == nil {
+		tails = tailstore.NewResolver(table, nil, root, segments, streamCacheCapacity)
 	}
-	return &Store{table: table, generation: generation, segments: append([]segment.Descriptor(nil), segments...), handles: segment.NewHandleCache(root, handleCapacity), locator: locator, capacity: streamCacheCapacity, cache: make(map[uint64]*list.Element), lru: list.New()}
-}
-func (s *Store) extents(streamID uint64) []extent {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if element := s.cache[streamID]; element != nil {
-		if element.Value.(cacheEntry).generation == s.generation {
-			s.lru.MoveToFront(element)
-			return element.Value.(cacheEntry).extents
-		}
-		delete(s.cache, streamID)
-		s.lru.Remove(element)
-	}
-	var found []extent
-	for _, descriptor := range s.segments {
-		for _, d := range descriptor.Directories {
-			if d.StreamID == streamID {
-				found = append(found, extent{descriptor.Reference, d})
-				break
-			}
-		}
-	}
-	sort.Slice(found, func(i, j int) bool { return found[i].directory.FirstSequence < found[j].directory.FirstSequence })
-	element := s.lru.PushFront(cacheEntry{streamID: streamID, generation: s.generation, extents: found})
-	s.cache[streamID] = element
-	if s.lru.Len() > s.capacity {
-		old := s.lru.Back()
-		delete(s.cache, old.Value.(cacheEntry).streamID)
-		s.lru.Remove(old)
-	}
-	return found
+	return &Store{table: table, tails: tails, root: root, generation: generation, segments: append([]segment.Descriptor(nil), segments...), handles: segment.NewHandleCache(root, handleCapacity), locator: locator}
 }
 func (s *Store) Read(streamID, from uint64, maxRecords int, maxBytes uint64) (Result, error) {
-	tail, ok := s.table.Tail(streamID)
+	tail, ok, err := s.tails.Lookup(streamID)
+	if err != nil {
+		return Result{}, err
+	}
 	if !ok {
 		return Result{}, fmt.Errorf("Stream %d: %w", streamID, errdefs.ErrStreamNotFound)
 	}
@@ -101,11 +66,11 @@ func (s *Store) Read(streamID, from uint64, maxRecords int, maxBytes uint64) (Re
 	if maxRecords <= 0 || from == tail.NextSequence {
 		return result, nil
 	}
-	base, _, _ := s.table.ActiveRange(streamID)
+	base, _, active := s.table.ActiveRange(streamID)
 	for sequence := from; sequence < tail.NextSequence && len(result.Records) < maxRecords; sequence++ {
 		var record format.RecordFrame
 		var err error
-		if sequence >= base {
+		if active && sequence >= base {
 			records, _, e := s.table.Read(streamID, sequence, 1)
 			err = e
 			if e == nil && len(records) == 1 {
@@ -149,26 +114,25 @@ func (s *Store) readSegment(streamID, sequence uint64) (format.RecordFrame, erro
 		// Locator files are reconstructible projections. A missing or corrupt
 		// page must not make immutable Segment data unreadable.
 	}
-	extents := s.extents(streamID)
-	i := sort.Search(len(extents), func(i int) bool {
-		return extents[i].directory.FirstSequence+extents[i].directory.RecordCount > sequence
-	})
-	if i < len(extents) {
-		e := extents[i]
-		d := e.directory
-		if sequence >= d.FirstSequence {
-			reader, release, err := s.handles.Acquire(e.reference)
-			if err != nil {
-				return format.RecordFrame{}, err
-			}
-			defer release()
-			return reader.Read(streamID, sequence)
+	e, found, err := s.findExtent(streamID, sequence)
+	if err != nil {
+		return format.RecordFrame{}, err
+	}
+	if found {
+		reader, release, err := s.handles.Acquire(e.reference)
+		if err != nil {
+			return format.RecordFrame{}, err
 		}
+		defer release()
+		return reader.Read(streamID, sequence)
 	}
 	return format.RecordFrame{}, fmt.Errorf("Sequence %d is not covered by a Segment", sequence)
 }
 func (s *Store) Inspect(streamID uint64) (StreamInfo, error) {
-	tail, ok := s.table.Tail(streamID)
+	tail, ok, err := s.tails.Lookup(streamID)
+	if err != nil {
+		return StreamInfo{}, err
+	}
 	if !ok {
 		return StreamInfo{}, nil
 	}
@@ -180,9 +144,10 @@ func (s *Store) Inspect(streamID uint64) (StreamInfo, error) {
 			return info, nil
 		}
 	}
-	extents := s.extents(streamID)
-	if len(extents) > 0 {
-		info.FirstRecordedAt = extents[0].directory.FirstRecordedAt
+	if first, found, findErr := s.firstExtent(streamID); findErr != nil {
+		return StreamInfo{}, findErr
+	} else if found {
+		info.FirstRecordedAt = first.directory.FirstRecordedAt
 	} else if tail.NextSequence > 0 {
 		base, _, _ := s.table.ActiveRange(streamID)
 		records, _, err := s.table.Read(streamID, base, 1)
@@ -196,7 +161,10 @@ func (s *Store) Inspect(streamID uint64) (StreamInfo, error) {
 	return info, nil
 }
 func (s *Store) ResolveTime(streamID uint64, target int64, mode TimeMode) (uint64, int64, bool, error) {
-	tail, ok := s.table.Tail(streamID)
+	tail, ok, err := s.tails.Lookup(streamID)
+	if err != nil {
+		return 0, 0, false, err
+	}
 	if !ok || tail.NextSequence == 0 {
 		return 0, 0, false, nil
 	}
@@ -256,13 +224,61 @@ func (s *Store) record(streamID, sequence uint64) (format.RecordFrame, error) {
 	return s.readSegment(streamID, sequence)
 }
 func (s *Store) ClearCache() {
-	s.mu.Lock()
-	s.cache = make(map[uint64]*list.Element)
-	s.lru.Init()
-	s.mu.Unlock()
 	if s.locator != nil {
 		s.locator.ClearCache()
 	}
+}
+
+func (s *Store) findExtent(streamID, sequence uint64) (extent, bool, error) {
+	for _, descriptor := range s.segments {
+		directories, closeReader, err := s.directories(descriptor)
+		if err != nil {
+			return extent{}, false, err
+		}
+		i := sort.Search(len(directories), func(i int) bool { return directories[i].StreamID >= streamID })
+		if i < len(directories) && directories[i].StreamID == streamID {
+			directory := directories[i]
+			if sequence >= directory.FirstSequence && sequence-directory.FirstSequence < directory.RecordCount {
+				closeErr := closeReader()
+				return extent{reference: descriptor.Reference, directory: directory}, true, closeErr
+			}
+		}
+		if err = closeReader(); err != nil {
+			return extent{}, false, err
+		}
+	}
+	return extent{}, false, nil
+}
+
+func (s *Store) firstExtent(streamID uint64) (extent, bool, error) {
+	var first extent
+	found := false
+	for _, descriptor := range s.segments {
+		directories, closeReader, err := s.directories(descriptor)
+		if err != nil {
+			return extent{}, false, err
+		}
+		i := sort.Search(len(directories), func(i int) bool { return directories[i].StreamID >= streamID })
+		if i < len(directories) && directories[i].StreamID == streamID && (!found || directories[i].FirstSequence < first.directory.FirstSequence) {
+			first = extent{reference: descriptor.Reference, directory: directories[i]}
+			found = true
+		}
+		if err = closeReader(); err != nil {
+			return extent{}, false, err
+		}
+	}
+	return first, found, nil
+}
+
+func (s *Store) directories(descriptor segment.Descriptor) ([]format.StreamDirectoryEntry, func() error, error) {
+	if descriptor.Directories != nil {
+		return descriptor.Directories, func() error { return nil }, nil
+	}
+	reader, err := segment.OpenReference(s.root, descriptor.Reference)
+	if err != nil {
+		return nil, nil, err
+	}
+	return reader.Directories, reader.Close, nil
 }
 
 func (s *Store) Generation() uint64 { return s.generation }

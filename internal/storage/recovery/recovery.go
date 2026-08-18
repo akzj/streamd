@@ -24,15 +24,12 @@ type Result struct {
 	Registry       *registry.Registry
 	Segments       []segment.Descriptor
 	TailCatalog    *tailstore.Catalog
+	TailResolver   *tailstore.Resolver
 	Locator        *locatorstore.Store
+	LastRecordedAt int64
 	AppliedEntryID uint64
 	HasApplied     bool
 }
-type extent struct {
-	descriptor segment.Descriptor
-	directory  format.StreamDirectoryEntry
-}
-
 type Options struct {
 	ApplyThrough *uint64
 }
@@ -53,7 +50,6 @@ func OpenWithOptions(root string, options Options) (*Result, error) {
 	checkpointID := uint64(0)
 	checkpointCRC := uint32(0)
 	hasCheckpoint := false
-	byStream := make(map[uint64][]extent)
 	if hasManifest {
 		if reference, found, findErr := registry.FindReference(current); findErr == nil && found {
 			if snapshot, openErr := registry.OpenCheckpoint(root, reference, current.Header.LastEntryID, 64); openErr == nil {
@@ -70,15 +66,17 @@ func OpenWithOptions(root string, options Options) (*Result, error) {
 			if ref.Flags&format.SegmentRefHasLocal == 0 {
 				return nil, fmt.Errorf("Segment %x has no local copy", ref.SegmentID)
 			}
-			descriptor, e := segment.DescribeReference(root, ref)
+			descriptor, e := segment.DescribeReferenceLight(root, ref)
 			if e != nil {
 				result.Close()
 				return nil, e
 			}
 			result.Segments = append(result.Segments, descriptor)
-			for _, d := range descriptor.Directories {
-				byStream[d.StreamID] = append(byStream[d.StreamID], extent{descriptor: descriptor, directory: d})
-			}
+		}
+		result.LastRecordedAt, err = segment.LatestRecordedAt(root, result.Segments)
+		if err != nil {
+			result.Close()
+			return nil, err
 		}
 		if reference, found, findErr := tailstore.FindReference(current); findErr == nil && found {
 			// Tail Catalog is a reconstructible projection. Missing, stale, or
@@ -94,74 +92,20 @@ func OpenWithOptions(root string, options Options) (*Result, error) {
 	if reg.HasSnapshot() {
 		descriptors := append([]segment.Descriptor(nil), result.Segments...)
 		reg.SetFallback(func() ([]registry.Mapping, error) { return registry.RebuildMappings(root, descriptors) })
-	}
-	for streamID, extents := range byStream {
-		slices.SortFunc(extents, func(a, b extent) int {
-			if a.directory.FirstSequence < b.directory.FirstSequence {
-				return -1
-			}
-			if a.directory.FirstSequence > b.directory.FirstSequence {
-				return 1
-			}
-			return 0
-		})
-		var tail memtable.Tail
-		var latestSegmentID format.UUID
-		for i, e := range extents {
-			d := e.directory
-			if i > 0 && (d.FirstSequence != tail.NextSequence || d.FirstByteOffset != tail.NextByteOffset || d.FirstRecordedAt < tail.LastRecordedAt) {
-				result.Close()
-				return nil, fmt.Errorf("Stream %d Segment extents are not continuous", streamID)
-			}
-			tail = memtable.Tail{NextSequence: d.FirstSequence + d.RecordCount, NextByteOffset: d.NextByteOffset, LastRecordedAt: d.LastRecordedAt, LastEntryID: d.LastEntryID, RecordCount: tail.RecordCount + d.RecordCount}
-			latestSegmentID = e.descriptor.Reference.SegmentID
-			if streamID == registry.RegistryStreamID && !reg.HasSnapshot() {
-				reader, openErr := segment.OpenReference(root, e.descriptor.Reference)
-				if openErr != nil {
-					result.Close()
-					return nil, openErr
-				}
-				for sequence := d.FirstSequence; sequence < d.FirstSequence+d.RecordCount; sequence++ {
-					record, readErr := reader.Read(streamID, sequence)
-					if readErr != nil {
-						reader.Close()
-						result.Close()
-						return nil, readErr
-					}
-					if readErr = reg.ApplyRecord(record.EntryID, record.Payload); readErr != nil {
-						reader.Close()
-						result.Close()
-						return nil, readErr
-					}
-				}
-				if closeErr := reader.Close(); closeErr != nil {
-					result.Close()
-					return nil, closeErr
-				}
-			}
-		}
-		if result.TailCatalog != nil {
-			slot, found, lookupErr := result.TailCatalog.Lookup(streamID)
-			if lookupErr != nil || !found || slot.NextSequence != tail.NextSequence || slot.NextByteOffset != tail.NextByteOffset || slot.LastRecordedAt != tail.LastRecordedAt || slot.LastEntryID != tail.LastEntryID || slot.AppliedEntryID != checkpointID || slot.LatestSegmentID != latestSegmentID {
-				_ = result.TailCatalog.Close()
-				result.TailCatalog = nil
-			}
-		}
-		if streamID == registry.RegistryStreamID && reg.HasSnapshot() && uint64(reg.Count()) != tail.RecordCount {
-			if err = reg.RebuildFromFacts(); err != nil {
-				result.Close()
-				return nil, fmt.Errorf("Registry Snapshot fact rebuild failed: %w", err)
-			}
-			if uint64(reg.Count()) != tail.RecordCount {
-				result.Close()
-				return nil, fmt.Errorf("Registry facts do not match Registry Stream count")
-			}
-		}
-		if err = table.SeedTail(streamID, tail); err != nil {
+	} else if len(result.Segments) > 0 {
+		mappings, rebuildErr := registry.RebuildMappings(root, result.Segments)
+		if rebuildErr != nil {
 			result.Close()
-			return nil, err
+			return nil, rebuildErr
+		}
+		for _, mapping := range mappings {
+			if err = reg.ApplyMapping(mapping); err != nil {
+				result.Close()
+				return nil, err
+			}
 		}
 	}
+	result.TailResolver = tailstore.NewResolver(table, result.TailCatalog, root, result.Segments, 1024)
 	first := uint64(0)
 	if hasCheckpoint {
 		first = checkpointID + 1
@@ -186,6 +130,11 @@ func OpenWithOptions(root string, options Options) (*Result, error) {
 		}
 		if uint32(len(pending)) != entry.BatchCount {
 			return fmt.Errorf("WAL Batch length is invalid")
+		}
+		if _, found, e := result.TailResolver.EnsureActive(entry.StreamID); e != nil {
+			return e
+		} else if !found && (pending[0].Sequence != 0 || pending[0].ByteOffset != 0) {
+			return fmt.Errorf("WAL Stream %d has no checkpoint Tail", entry.StreamID)
 		}
 		if e := table.ApplyBatch(pending); e != nil {
 			return e

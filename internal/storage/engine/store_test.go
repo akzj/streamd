@@ -521,12 +521,131 @@ func TestRecoveryRebuildsWhenTailCatalogIsCorrupt(t *testing.T) {
 		t.Fatalf("recovery rejected reconstructible Tail corruption: %v", err)
 	}
 	defer store.Close()
-	if store.state.TailCatalog != nil {
-		t.Fatal("corrupt Tail Catalog was installed")
+	if store.state.TailCatalog == nil {
+		t.Fatal("Tail Catalog fixed metadata was not installed lazily")
 	}
 	result, err := store.Read("agent", "events", 0, 10, 0)
 	if err != nil || len(result.Records) != 1 {
 		t.Fatalf("rebuilt Read = %+v, %v", result, err)
+	}
+}
+
+func TestRecoveryKeepsHistoricalTailsAndDirectoriesOutOfMemTable(t *testing.T) {
+	dir := t.TempDir()
+	store, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const streamCount = 32
+	for i := 0; i < streamCount; i++ {
+		name := fmt.Sprintf("events-%d", i)
+		if _, err = store.Append(context.Background(), AppendRequest{Namespace: "agent", Stream: name, RequestID: []byte("one"), Producer: "test", Records: []InputRecord{{Payload: []byte(name)}}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, created, checkpointErr := store.Checkpoint(); checkpointErr != nil || !created {
+		t.Fatalf("Checkpoint created=%v error=%v", created, checkpointErr)
+	}
+	if err = store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err = Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if snapshots := store.state.MemTable.Snapshot(); len(snapshots) != 0 {
+		t.Fatalf("recovery loaded %d checkpoint-only Stream tails", len(snapshots))
+	}
+	for _, descriptor := range store.state.Segments {
+		if descriptor.Directories != nil {
+			t.Fatal("recovery retained a Segment Directory")
+		}
+	}
+	result, err := store.Append(context.Background(), AppendRequest{Namespace: "agent", Stream: "events-17", ExpectedSequence: 1, RequestID: []byte("two"), Producer: "test", Records: []InputRecord{{Payload: []byte("two")}}})
+	if err != nil || result.FirstSequence != 1 || result.NextSequence != 2 {
+		t.Fatalf("Append after lazy Tail resolution = %+v, %v", result, err)
+	}
+	if snapshots := store.state.MemTable.Snapshot(); len(snapshots) != 1 || snapshots[0].StreamID == 0 {
+		t.Fatalf("active MemTable contains unexpected Streams: %+v", snapshots)
+	}
+}
+
+func TestRecoveryDoesNotTouchSegmentDirectoryWithValidProjections(t *testing.T) {
+	dir := t.TempDir()
+	store, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.Append(context.Background(), AppendRequest{Namespace: "agent", Stream: "events", RequestID: []byte("one"), Producer: "test", Records: []InputRecord{{Payload: []byte("one")}}}); err != nil {
+		t.Fatal(err)
+	}
+	firstManifest, created, err := store.Checkpoint()
+	if err != nil || !created {
+		t.Fatalf("Checkpoint created=%v error=%v", created, err)
+	}
+	if _, err = store.Append(context.Background(), AppendRequest{Namespace: "agent", Stream: "events", ExpectedSequence: 1, RequestID: []byte("two"), Producer: "test", Records: []InputRecord{{Payload: []byte("two")}}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, created, err = store.Checkpoint(); err != nil || !created {
+		t.Fatalf("second Checkpoint created=%v error=%v", created, err)
+	}
+	if err = store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	segmentPath := filepath.Join(dir, filepath.FromSlash(firstManifest.SegmentReferences[0].LocalPath))
+	file, err := os.OpenFile(segmentPath, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = file.WriteAt([]byte{0xff}, int64(format.SegmentSectionAlignment)); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if err = file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err = Open(dir)
+	if err != nil {
+		t.Fatalf("startup touched a historical Segment Directory: %v", err)
+	}
+	defer store.Close()
+	info, err := store.Inspect("agent", "events")
+	if err != nil || !info.Exists || info.NextSequence != 2 {
+		t.Fatalf("Inspect from projections = %+v, %v", info, err)
+	}
+	if _, err = store.Append(context.Background(), AppendRequest{Namespace: "agent", Stream: "events", ExpectedSequence: 2, RequestID: []byte("three"), Producer: "test", Records: []InputRecord{{Payload: []byte("three")}}}); err != nil {
+		t.Fatalf("Append from projected Tail: %v", err)
+	}
+}
+
+func TestRecoveryPreservesRecordedAtClampFromLatestSegment(t *testing.T) {
+	dir := t.TempDir()
+	store, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.now = func() time.Time { return time.Unix(0, 1000) }
+	if _, err = store.Append(context.Background(), AppendRequest{Namespace: "agent", Stream: "events", RequestID: []byte("one"), Producer: "test", Records: []InputRecord{{Payload: []byte("one")}}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, created, checkpointErr := store.Checkpoint(); checkpointErr != nil || !created {
+		t.Fatalf("Checkpoint created=%v error=%v", created, checkpointErr)
+	}
+	if err = store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	store.now = func() time.Time { return time.Unix(0, 1) }
+	result, err := store.Append(context.Background(), AppendRequest{Namespace: "agent", Stream: "events", ExpectedSequence: 1, RequestID: []byte("two"), Producer: "test", Records: []InputRecord{{Payload: []byte("two")}}})
+	if err != nil || result.LastRecordedAt != 1000 {
+		t.Fatalf("Append after clock rollback = %+v, %v", result, err)
 	}
 }
 

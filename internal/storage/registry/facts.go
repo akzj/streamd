@@ -18,7 +18,18 @@ type registryExtent struct {
 func RebuildMappings(root string, descriptors []segment.Descriptor) ([]Mapping, error) {
 	var extents []registryExtent
 	for _, descriptor := range descriptors {
-		for _, directory := range descriptor.Directories {
+		directories := descriptor.Directories
+		if directories == nil {
+			reader, err := segment.OpenReference(root, descriptor.Reference)
+			if err != nil {
+				return nil, err
+			}
+			directories = append([]format.StreamDirectoryEntry(nil), reader.Directories...)
+			if err = reader.Close(); err != nil {
+				return nil, err
+			}
+		}
+		for _, directory := range directories {
 			if directory.StreamID == RegistryStreamID {
 				extents = append(extents, registryExtent{descriptor: descriptor, directory: directory})
 			}
