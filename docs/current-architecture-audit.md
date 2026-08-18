@@ -3,9 +3,9 @@
 | 属性 | 内容 |
 | --- | --- |
 | 审计性质 | 代码现实版整体架构审计，不是目标架构复述 |
-| 审计基线 | `d0c09cf`（`main`，2026-08-18） |
+| 审计基线 | `4cb0f11`（`main`，2026-08-18） |
 | 审计日期 | 2026-08-18 |
-| 相对上次审计新增 | Replicated Startup Admin 生命周期；Coordinator 内部重试；`leadership_pending`/`replica_catchup_pending` 真实验收 |
+| 相对上次审计新增 | 有界 Recovery 元数据；Tail Resolver；轻量 Segment Descriptor；历史 Directory/Tail 延迟加载 |
 | 覆盖范围 | API、存储、索引、Checkpoint、Compaction、恢复、Snapshot、WAL GC、Strict HA、并发与运维入口 |
 | 验证边界 | 代码、单元/race/vet、Compose HA；不等同于性能、长稳、磁盘故障或生产部署验收 |
 
@@ -31,8 +31,8 @@ recovery-blocked 状态，输出确定性 Recovery Task。
 3. WAL 已回收且本地 Installed Snapshot Package 不存在时，独立 Compose 场景已经验证节点进入
    `NO_RECOVERY_SOURCE`、不开放公共 gRPC，并在人工创建 replacement Snapshot 后恢复；该路径同样不是
    自动恢复状态机。
-4. 启动仍加载全部 Segment Descriptor、Stream Directory 和 Stream Tail；Locator/Registry 的正常查询
-   已有界，但百万 Stream 的启动 RSS/时延目标尚未实现。
+4. 历史 Stream Directory、Extent 与 Tail 已不再在启动时全量加载或常驻；启动仍全量保留 Manifest
+   Segment Reference、Locator Root 与 Registry Sparse Block Index，百万 Stream 的 RSS/时延目标尚未验收。
 5. 没有生产级 Snapshot/GC 调度、对象存储、容量故障策略、长稳和规模验收。
 
 结论：**可以继续开发，当前代码适合作为正确性优先的 V1 工程基线；尚不能宣称生产就绪。后续应按
@@ -196,13 +196,13 @@ Leader 或收到 shutdown。非法 coordinator state 仍立即失败，不会被
 | --- | --- | --- | --- |
 | Record Frame | 逻辑 Record 的规范编码 | 否 | WAL/MemTable/Segment 中读取 |
 | WAL | 尚未进入 Manifest Checkpoint 的顺序事实和复制日志 | 被 Segment+Snapshot 覆盖后可回收 | Active WAL 打开；History 扫描文件元数据 |
-| Segment | 已 Checkpoint 的不可变 Record 事实 | 无其他副本时不可重建 | 启动读取全部 Descriptor/Directory，Payload 按需打开 |
+| Segment | 已 Checkpoint 的不可变 Record 事实 | 无其他副本时不可重建 | 启动验证轻量 Header/Footer；仅最新 Directory 恢复时间水位，历史 Directory 按需打开 |
 | Registry Stream | 名称到 StreamID 分配事实 | 否 | Segment/WAL；Snapshot 只加速查询 |
 | Manifest + CURRENT | 当前不可变 Segment/Artifact 集合的原子发布边界 | 不能从 Cache 推断 | 当前 Generation 常驻内存 |
 | Tail Catalog | Stream Tail 投影 | 是 | Header/Footer 启动校验，Slot 按需读取 |
 | Locator Snapshot/Pack | 冷 Extent 投影 | 是 | Root 常驻，Page 使用容量 256 的 LRU |
 | Registry Snapshot | Registry Stream 的排序投影 | 是 | Sparse Block Index 常驻，Block 使用容量 64 的 LRU |
-| Read stream cache | StreamID 到 Descriptor Extent 的回退缓存 | 是 | 容量 1024 LRU |
+| Tail Resolver cache | StreamID 到历史 Tail 的回退缓存 | 是 | 容量 1024 LRU；MemTable/WAL Overlay 优先 |
 | Segment handle cache | 打开的 Segment Reader | 是 | 容量 64、引用计数、LRU |
 | Replication State | Term、Role 和恢复水位的持久边界 | 不能用内存状态替代 | 双 Generation 指针式更新 |
 | Snapshot | 某个 committed checkpoint 的可安装 Artifact 集合 | 否；它本身是恢复副本 | 离线工具生成/安装；在线创建仅有库入口 |
@@ -289,12 +289,12 @@ Manifest 后，Compaction 在 Engine `mu` 下把 Registry Snapshot checkpoint �
 
 ```text
 CURRENT -> current Manifest
--> verify every referenced Segment
--> load every Segment Descriptor and Stream Directory
+-> verify every referenced Segment Header/Footer/Manifest Reference
+-> read only the newest Segment Directory for global RecordedAt watermark
 -> optionally open Tail/Locator/Registry projections
--> seed every Stream Tail into MemTable
+-> keep checkpoint-only Tail in Tail Catalog + bounded Resolver cache
 -> recover Registry from Snapshot or Registry Stream
--> replay sealed WAL chain
+-> replay sealed WAL chain; seed only WAL-active Streams on demand
 -> replay and truncate Active WAL to last valid complete Batch
 ```
 
@@ -476,7 +476,7 @@ Catch-up 的跨进程竞争；同一 `wal.History` 内部的 Pin/Collect 由 mut
 | Standby Read | Not implemented | Standby 只注册 ReplicationService |
 | HTTP Gateway | Not implemented | 只有 loopback Admin HTTP |
 | 对象存储/归档 | Not implemented | 没有实现和故障语义 |
-| 有界启动元数据 | Not implemented | Descriptor、Directory、Tail 仍随 Segment/Stream 规模常驻 |
+| 有界启动元数据 | Bounded | 历史 Directory/Extent/Tail 已延迟加载；Segment Reference、Locator Root、Registry Sparse Index 仍随规模增长 |
 | 百万 Stream/长稳/磁盘压力验收 | Not implemented | 现有 benchmark 不是生产容量证明 |
 | Dashboard | Deferred | 当前只有 Prometheus 指标和诊断 JSON |
 
@@ -528,24 +528,20 @@ Catch-up 的跨进程竞争；同一 `wal.History` 内部的 Pin/Collect 由 mut
 任务没有持久记录、claim/ack、重试状态或自动执行器。相同事实通过 hash 得到稳定 ID，但进程重启获得
 新 Term 后会形成新任务。当前 Runbook 必须重新读取诊断并核对事实，不能把旧 `task_id` 当授权令牌。
 
-#### P1-2 全量 Descriptor/Directory/Tail 常驻
+#### P1-2 Locator Root 与投影构建仍未完全有界
 
-Recovery 构造全部 `[]segment.Descriptor`、每 Stream Extent 列表和 MemTable Tail，Read Store 又持有
-Descriptor 副本。Locator 只优化正常冷读定位，不降低启动扫描和常驻元数据。该问题会线性放大启动时间
-与 RSS，是百万 Stream 目标的核心阻塞。
+Recovery 全量 Directory/Extent/Tail 常驻已经关闭：运行视图只保留轻量 Descriptor，Tail 使用固定 Slot
+按需读取和容量 1024 的 LRU，WAL/Append 活跃 Stream 才 Seed 到 MemTable。剩余规模阻塞是 Locator
+Snapshot Root 全量反序列化、Registry Sparse Block Index 常驻，以及 Checkpoint/Compaction Builder 临时
+聚合当前 Generation 的全部 Descriptor/Extent。它们仍会线性放大百万 Stream 的启动 RSS 或维护峰值。
 
-#### P1-3 后台 Maintenance 失败策略不完整
-
-周期 Checkpoint、Replication State Checkpoint 和 Compaction 失败主要记录日志。Fatal Commit 会停止写，
-但持续非 fatal 失败没有统一退避、failure budget、readiness 降级或容量预测，可能直到磁盘耗尽才硬失败。
-
-#### P1-4 Node Runtime 生命周期仍未完全统一
+#### P1-3 Node Runtime 生命周期仍未完全统一
 
 Primary、Standby 和 recovery-blocked 已共享 Replicated Admin Runtime 与诊断 Provider 切换，但 Single
 仍独立管理 Admin，三种角色也分别管理 gRPC、后台 ticker 和 storage shutdown。后续抽取必须基于实际
 重复继续收敛，不能为了形式统一移动角色、Durability 和恢复判断的强类型边界。
 
-#### P1-5 Replication State 是持久下界而非实时真值
+#### P1-4 Replication State 是持久下界而非实时真值
 
 State 周期落盘是避免每次 Group Commit 增加 metadata fsync 的有意取舍。Promotion、Snapshot、WAL GC
 和诊断必须结合物理 WAL；任何新模块都不能把 State watermark 当作每次提交后的精确实时值。
@@ -554,9 +550,11 @@ State 周期落盘是避免每次 Group Commit 增加 metadata fsync 的有意�
 
 - Compaction 峰值内存仍与一次输入的记录量相关；
 - ResolveTime 是 Sequence 二分加随机 Record 读取，不是专用时间索引；
-- Locator 损坏会回退全 Descriptor 扫描，故障时延没有 SLO；
+- Locator 损坏会逐 Segment 按需扫描 Directory，故障时延没有 SLO，但不会常驻全部 Extent；
 - Registry 的反向 `LookupID` 可能跨 Block 顺序读取，当前不在业务热路径；
 - 没有 Snapshot/GC 自动调度、传输限速、持久 Pin Lease 或对象存储；
+- Maintenance failure policy 属于可维护性战略预警：持续非 fatal Checkpoint/Compaction/State 失败尚无
+  统一退避、failure budget、readiness 降级或容量预测，但它不是当前功能完整性的首要阻塞；
 - 已有磁盘容量/可用空间和按类型文件字节指标，但 Snapshot、GC、Compaction、Cache、Pin 的事件指标、
   告警阈值和容量耗尽预测尚不足以形成完整 SLO；
 - 文档多数仍是 `Draft / V1 实现基线`，格式冻结、实现状态和提案没有统一版本发布机制。
@@ -576,7 +574,7 @@ State 周期落盘是避免每次 Group Commit 增加 metadata fsync 的有意�
 
 1. Recovery Task 是否只作为诊断契约，还是要发展为持久、可 claim/ack 的控制面资源；
 2. 在线 Snapshot 的触发者是独立运维控制面、受认证 Admin RPC，还是仅保留停机工具；
-3. 有界启动实现是否允许在投影损坏时牺牲启动速度进行全扫描，或要求独立修复工具；
+3. 当前已选择投影损坏时允许逐 Segment 慢速扫描事实数据；是否增加独立修复工具和故障时延 SLO；
 4. 文档如何发布 `Implemented / Accepted Design / Proposal` 状态以及格式兼容版本。
 
 ## 11. 后续开发门禁与建议顺序
@@ -585,14 +583,14 @@ State 周期落盘是避免每次 Group Commit 增加 metadata fsync 的有意�
 
 恢复证据与 Replicated 启动可观测性阶段已经完成。下一轮从以下顺序继续：
 
-1. **定义 Maintenance failure policy**：把连续 Checkpoint/Compaction/State 失败映射到稳定诊断、告警
-   和退避，补磁盘压力测试。
-2. **实现有界启动元数据**：按 Segment/Stream 规模设计 Descriptor/Directory/Tail 的分页或分层索引，
-   保留投影损坏时的明确恢复路径。
+1. **完成有界索引根与投影构建**：分页 Locator Root，评估 Registry Sparse Index 上限，并把
+   Checkpoint/Compaction Builder 改为流式或外部排序，关闭剩余规模线性内存。
+2. **执行规模与故障验收**：百万 Stream 启动、长稳、磁盘满/短写/fsync 故障、etcd member replacement、
+   升级/回滚和 Restore Drill。
 3. **接入受控 Snapshot/GC 自动化**：只有在所有权、认证、幂等任务和 Pin 生命周期冻结后，才接入
    online Snapshot、归档和 GC 调度。
-4. **执行生产候选验收**：规模 benchmark、长稳、磁盘故障、etcd member replacement、升级/回滚和
-   Restore Drill；证据达标后再讨论生产部署和 Dashboard。
+4. **补 Maintenance failure policy**：作为可维护性和容量战略预警，把连续失败映射到稳定诊断、告警
+   和退避；它不早于上述功能完整性与规模验收。
 
 每个阶段完成条件：
 
@@ -611,9 +609,9 @@ State 周期落盘是避免每次 Group Commit 增加 metadata fsync 的有意�
 | API 与限流/RBAC | `internal/service/server.go`, `internal/access/` |
 | Engine 与锁 | `internal/storage/engine/store.go` |
 | Group Commit | `internal/storage/commit/commit.go` |
-| Recovery | `internal/storage/recovery/recovery.go` |
+| Recovery/Tail | `internal/storage/recovery/recovery.go`, `internal/storage/tail/resolver.go`, `internal/storage/segment/descriptor.go` |
 | Manifest/Segment 生命周期 | `internal/storage/manifest/store.go`, `internal/storage/lifecycle/manager.go` |
-| Read/Cache | `internal/storage/read/store.go`, `internal/storage/locator/`, `internal/storage/registry/` |
+| Read/Cache | `internal/storage/read/store.go`, `internal/storage/tail/`, `internal/storage/locator/`, `internal/storage/registry/` |
 | WAL History/GC Pin | `internal/storage/wal/history.go` |
 | Snapshot | `internal/storage/snapshot/` |
 | WAL Retention | `internal/storage/retention/manager.go` |

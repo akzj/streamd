@@ -27,12 +27,21 @@
   `ReadAt`，默认使用容量 64 的 LRU Block Cache；
 - Checkpoint 内映射保留在磁盘 Snapshot，新提交映射只进入 WAL Overlay；Compaction 切换时合并
   Checkpoint 之后的 Overlay，Registry Block 损坏时从内部 Registry Stream 惰性重建。
+- Recovery 常驻轻量 Segment Descriptor，只验证每个 Segment 的 Header/Footer/Manifest Reference；除最新
+  Segment 为恢复全局 `RecordedAt` 水位外，不在启动时读取历史 Stream Directory；
+- 历史 Stream Tail 不再 Seed 到 MemTable。Tail Resolver 按 `Active MemTable -> 容量 1024 的 Tail LRU
+  -> Tail Catalog Slot -> Segment Fact Scan` 查询；只有 WAL Replay 或 Append 实际写入的 Stream 才进入
+  Active MemTable；
+- Locator 损坏回退不再缓存某个 Stream 的全部历史 Extent；它逐 Segment 打开 Directory 查找目标 Extent，
+  故障路径可能较慢，但常驻内存不再与全部历史 Extent 数量线性增长；
+- Checkpoint/Compaction 构建投影时显式 Materialize Directory，发布后立即切回轻量 Descriptor。
 
-当前仍是过渡实现：启动时仍读取全部 Segment Directory，并在内存中保留全部 Descriptor，投影损坏
-回退路径也会扫描 Descriptor。真正有界的 Segment 启动加载、TinyLFU Admission、Segmented LRU、
-Cache Shard 和 Skip Pointer 生成尚未接入运行时；当前 Builder 只生成 Previous Pointer。因此
-名称与冷 Sequence Cache Miss 主路径已经有界，但尚未达到百万 Stream 启动和全部 Extent 内存有界
-的最终验收目标。
+当前仍是过渡实现：历史 Directory、Extent 和 Tail 的启动常驻问题已经关闭，但 Manifest Segment
+Reference、Locator Root 和 Registry Sparse Block Index 仍分别随 Segment、Stream 和 Registry Block
+数量增长；Checkpoint/Compaction 的投影 Builder 也会临时聚合当前 Generation 的全部 Descriptor 与
+Extent。TinyLFU Admission、Segmented LRU、Cache Shard 和 Skip Pointer 生成尚未接入运行时；当前
+Builder 只生成 Previous Pointer。因此已经满足“历史 Extent 不常驻”的结构性要求，但尚未完成百万
+Stream 启动 RSS/时延及投影构建峰值内存验收。
 
 ## 1. 查询问题
 
@@ -395,5 +404,6 @@ Cache Entry 必须实现 `estimated_bytes`，包括 Slice Capacity、Map Overhea
 
 当前已通过任意 Sequence 定位、Page CRC、Previous Page 多页回溯、Registry 多 Block 查找、容量
 1 淘汰、Cache Clear、Generation 切换、Compaction Overlay 保留、Snapshot Pin 和投影损坏回退
-测试。常驻 Extent 内存与百万 Stream 启动两项仍未验收，因为恢复阶段仍加载所有 Segment
-Descriptor/Directory。
+测试。新增测试证明 checkpoint-only Stream 不进入 MemTable、历史 Segment Directory 不在启动时读取、
+首次 Append 能按需恢复准确 Tail，以及 Tail Cache 保持配置容量。百万 Stream 启动仍未验收，因为
+Locator Root 与 Registry Sparse Block Index 尚未分页，Manifest Segment Reference 也仍全量常驻。
