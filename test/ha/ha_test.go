@@ -35,6 +35,12 @@ const (
 
 func TestComposeStrictHA(t *testing.T) {
 	switch os.Getenv("HA_SCENARIO") {
+	case "standby-starting":
+		testStartingDiagnostics(t, "http://streamd-standby:19090/diagnostics", "streamd-standby:7443", "standby", diagnostics.ReasonLeadershipPending, false)
+		return
+	case "primary-starting":
+		testStartingDiagnostics(t, "http://streamd-primary:19090/diagnostics", primaryAddress, "primary", diagnostics.ReasonReplicaCatchUpPending, true)
+		return
 	case "needs-snapshot":
 		testNeedsSnapshotDiagnostics(t)
 		return
@@ -148,6 +154,36 @@ func TestComposeStrictHA(t *testing.T) {
 		}
 	})
 
+}
+
+func testStartingDiagnostics(t *testing.T, diagnosticsURL, publicAddress, role string, reason diagnostics.ReasonCode, requireTerm bool) {
+	connection, err := net.DialTimeout("tcp", publicAddress, time.Second)
+	if err == nil {
+		_ = connection.Close()
+		t.Fatalf("starting %s public gRPC listener is open", role)
+	}
+	deadline := time.Now().Add(30 * time.Second)
+	var snapshot diagnostics.Snapshot
+	for {
+		snapshot, err = fetchDiagnostics(diagnosticsURL)
+		if err == nil && snapshot.Status == diagnostics.StatusStarting && snapshot.Role == role && hasReason(snapshot, reason) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("starting %s diagnostics did not become available: snapshot=%+v error=%v", role, snapshot, err)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if snapshot.Ready || snapshot.WriteReady || snapshot.Durability != "replicated_strict" || snapshot.Recovery != nil || (snapshot.Term > 0) != requireTerm {
+		t.Fatalf("starting %s diagnostics = %+v", role, snapshot)
+	}
+	if role == "primary" && snapshot.LeaseExpiresAt == nil {
+		t.Fatalf("starting Primary has no Lease deadline: %+v", snapshot)
+	}
+	repeated, repeatErr := fetchDiagnostics(diagnosticsURL)
+	if repeatErr != nil || repeated.Status != diagnostics.StatusStarting || !hasReason(repeated, reason) {
+		t.Fatalf("repeated starting %s diagnostics = %+v, error = %v", role, repeated, repeatErr)
+	}
 }
 
 func testLogDivergedDiagnostics(t *testing.T) {

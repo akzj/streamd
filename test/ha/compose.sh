@@ -96,7 +96,17 @@ case "$command" in
     trap finish_all EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
-    compose up -d --build --wait --wait-timeout 120 etcd-1 etcd-2 etcd-3 toxiproxy proxy-init streamd-primary streamd-standby
+    compose up -d --build --wait --wait-timeout 120 etcd-1 etcd-2 etcd-3 toxiproxy
+    compose up -d --build proxy-init
+    compose wait proxy-init
+    compose up -d --build --no-deps streamd-standby
+    compose --profile test up -d --build --no-deps standby-admin-proxy
+    compose --profile test run --rm --build --no-deps -e HA_SCENARIO=standby-starting test-runner
+    compose stop -t 10 standby-admin-proxy streamd-standby
+    compose up -d --build --no-deps streamd-primary
+    compose --profile test up -d --no-deps primary-admin-proxy
+    compose --profile test run --rm --no-deps -e HA_SCENARIO=primary-starting test-runner
+    compose up -d --wait --wait-timeout 120 streamd-primary streamd-standby
     compose --profile test run --rm --build test-runner
     compose stop -t 1 etcd-3
     compose --profile test run --rm --no-deps -e HA_SCENARIO=single-member-loss test-runner

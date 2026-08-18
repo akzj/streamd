@@ -28,7 +28,6 @@ import (
 	"github.com/akzj/streamd/internal/storage/replicationstate"
 	"github.com/akzj/streamd/internal/storage/snapshot"
 	"github.com/akzj/streamd/internal/storage/wal"
-	"github.com/prometheus/client_golang/prometheus"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"google.golang.org/grpc"
@@ -64,22 +63,38 @@ func runReplicated(ctx context.Context, config Config, logger *slog.Logger) erro
 	}
 	defer etcdClient.Close()
 	identityValue, _ := config.nodeIdentity()
-	if config.Replication.Role == "standby" {
-		return runStandby(ctx, config, identityValue, serverCredentials, coordinator, logger)
+	role := config.Replication.Role
+	admin, err := startAdminRuntime(config, diagnostics.ProviderFunc(func() diagnostics.Snapshot {
+		return diagnostics.StartingSnapshot(role, 0, time.Time{}, diagnostics.ReasonLeadershipPending)
+	}))
+	if err != nil {
+		return fmt.Errorf("start Admin runtime: %w", err)
 	}
-	return runPrimary(ctx, config, identityValue, serverCredentials, coordinator, logger)
+	logger.Info("streamd startup diagnostics started", "role", role, "admin_address", admin.listener.Addr().String())
+	roleCtx, cancelRole := context.WithCancel(ctx)
+	adminResult := admin.monitor(roleCtx, cancelRole)
+	var roleErr error
+	if config.Replication.Role == "standby" {
+		roleErr = runStandby(roleCtx, config, identityValue, serverCredentials, coordinator, admin, logger)
+	} else {
+		roleErr = runPrimary(roleCtx, config, identityValue, serverCredentials, coordinator, admin, logger)
+	}
+	cancelRole()
+	adminErr := <-adminResult
+	shutdownErr := admin.shutdown(config)
+	return errors.Join(roleErr, adminErr, shutdownErr)
 }
 
-func runPrimary(ctx context.Context, config Config, nodeIdentity format.NodeIdentity, serverCredentials credentials.TransportCredentials, coordinator currentCoordinator, logger *slog.Logger) error {
+func runPrimary(ctx context.Context, config Config, nodeIdentity format.NodeIdentity, serverCredentials credentials.TransportCredentials, coordinator currentCoordinator, admin *adminRuntime, logger *slog.Logger) error {
 	if err := ensureRecoveringState(config.DataDirectory, nodeIdentity); err != nil {
 		return err
 	}
-	grant, err := coordinator.Acquire(ctx, nodeIdentity.GroupID, nodeIdentity.NodeID)
+	_, _, renewInterval, _ := config.Replication.durations()
+	grant, err := awaitPrimaryGrant(ctx, renewInterval, coordinator, nodeIdentity.GroupID, nodeIdentity.NodeID)
 	if err != nil {
 		return fmt.Errorf("acquire Primary Lease: %w", err)
 	}
-	ttl, safety, renewInterval, _ := config.Replication.durations()
-	_ = ttl
+	_, safety, _, _ := config.Replication.durations()
 	releaseNeeded := true
 	defer func() {
 		if releaseNeeded {
@@ -112,6 +127,12 @@ func runPrimary(ctx context.Context, config Config, nodeIdentity format.NodeIden
 			<-renewalDone
 		}
 	}()
+	if err = admin.setProvider(diagnostics.ProviderFunc(func() diagnostics.Snapshot {
+		state := controller.Snapshot()
+		return diagnostics.StartingSnapshot("primary", state.Term, state.ExpiresAt, diagnostics.ReasonReplicaCatchUpPending)
+	})); err != nil {
+		return err
+	}
 	peerCredentials, err := replicationClientCredentials(config)
 	if err != nil {
 		return err
@@ -138,7 +159,7 @@ func runPrimary(ctx context.Context, config Config, nodeIdentity format.NodeIden
 		var recovery *standbyRecoveryRequired
 		if errors.As(err, &recovery) {
 			logger.Warn("Primary blocked for Snapshot recovery", "task_id", recovery.task.TaskID, "action", recovery.task.Action, "reason", recovery.task.Reason, "target_node_id", recovery.task.TargetNodeID)
-			serveErr := serveRecoveryBlocked(ctx, config, controller, states, recovery.task, logger)
+			serveErr := serveRecoveryBlocked(ctx, admin, controller, states, recovery.task, logger)
 			stopRenewal()
 			<-renewalDone
 			renewalStopped = true
@@ -186,23 +207,18 @@ func runPrimary(ctx context.Context, config Config, nodeIdentity format.NodeIden
 	if err != nil {
 		return err
 	}
-	registry := prometheus.NewRegistry()
-	registry.MustRegister(prometheus.NewGoCollector(), prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}))
-	nodeMetrics, err := observe.NewNodeMetrics(config.DataDirectory, streamService)
-	if err != nil {
-		return err
-	}
-	registry.MustRegister(nodeMetrics)
-	rpcMetrics := observe.NewRPCMetrics(registry)
+	rpcMetrics := observe.NewRPCMetrics(admin.registry)
 	grpcServer := grpc.NewServer(grpc.Creds(serverCredentials), grpc.MaxRecvMsgSize(int(replicationMessageLimit(config.Replication))), grpc.MaxSendMsgSize(int(replicationMessageLimit(config.Replication))), grpc.StatsHandler(otelgrpc.NewServerHandler()), grpc.ChainUnaryInterceptor(rpcMetrics.UnaryInterceptor()), grpc.ChainStreamInterceptor(rpcMetrics.StreamInterceptor()))
 	streamdv1.RegisterStreamServiceServer(grpcServer, streamService)
 	streamdv1.RegisterReplicationServiceServer(grpcServer, protocolServer)
-	grpcListener, adminListener, admin, serveErrors, err := serveHA(config, grpcServer, streamService, registry)
+	grpcListener, serveErrors, err := serveHA(config, grpcServer)
 	if err != nil {
 		return err
 	}
 	defer grpcListener.Close()
-	defer adminListener.Close()
+	if err = admin.setProvider(streamService); err != nil {
+		return err
+	}
 	backgroundCtx, stopBackground := context.WithCancel(context.Background())
 	backgroundDone := make(chan struct{})
 	go func() {
@@ -233,7 +249,7 @@ func runPrimary(ctx context.Context, config Config, nodeIdentity format.NodeIden
 	<-renewalDone
 	renewalStopped = true
 	streamService.BeginDrain()
-	shutdownServers(config, grpcServer, admin)
+	shutdownGRPC(config, grpcServer)
 	_, checkpointErr := store.CheckpointReplicationState(states)
 	releaseCtx, cancelRelease := context.WithTimeout(context.Background(), 5*time.Second)
 	releaseErr := controller.Release(releaseCtx)
@@ -269,8 +285,58 @@ func startLeaseRenewal(controller *leadership.Controller, interval time.Duration
 	return cancel, done
 }
 
-func runStandby(ctx context.Context, config Config, nodeIdentity format.NodeIdentity, serverCredentials credentials.TransportCredentials, coordinator currentCoordinator, logger *slog.Logger) error {
-	grant, err := coordinator.Current(ctx, nodeIdentity.GroupID)
+func awaitPrimaryGrant(ctx context.Context, attemptTimeout time.Duration, coordinator currentCoordinator, groupID, nodeID format.UUID) (leadership.LeaseGrant, error) {
+	return awaitCoordinatorGrant(ctx, attemptTimeout, func(attemptCtx context.Context) (leadership.LeaseGrant, error) {
+		return coordinator.Acquire(attemptCtx, groupID, nodeID)
+	}, func(err error) bool {
+		return errors.Is(err, etcdcoordinator.ErrLeaderExists) || transientCoordinatorError(err)
+	})
+}
+
+func awaitCurrentPrimary(ctx context.Context, attemptTimeout time.Duration, coordinator currentCoordinator, groupID format.UUID) (leadership.LeaseGrant, error) {
+	return awaitCoordinatorGrant(ctx, attemptTimeout, func(attemptCtx context.Context) (leadership.LeaseGrant, error) {
+		return coordinator.Current(attemptCtx, groupID)
+	}, func(err error) bool {
+		return errors.Is(err, etcdcoordinator.ErrNotLeader) || transientCoordinatorError(err)
+	})
+}
+
+func awaitCoordinatorGrant(ctx context.Context, attemptTimeout time.Duration, operation func(context.Context) (leadership.LeaseGrant, error), retryable func(error) bool) (leadership.LeaseGrant, error) {
+	if attemptTimeout <= 0 {
+		attemptTimeout = 3 * time.Second
+	}
+	for {
+		attemptCtx, cancel := context.WithTimeout(ctx, attemptTimeout)
+		grant, err := operation(attemptCtx)
+		cancel()
+		if err == nil {
+			return grant, nil
+		}
+		if ctx.Err() != nil {
+			return leadership.LeaseGrant{}, ctx.Err()
+		}
+		if !retryable(err) {
+			return leadership.LeaseGrant{}, err
+		}
+		retry := time.NewTimer(min(attemptTimeout, time.Second))
+		select {
+		case <-ctx.Done():
+			if !retry.Stop() {
+				<-retry.C
+			}
+			return leadership.LeaseGrant{}, ctx.Err()
+		case <-retry.C:
+		}
+	}
+}
+
+func transientCoordinatorError(err error) bool {
+	return errors.Is(err, context.DeadlineExceeded) || status.Code(err) == codes.Unavailable || status.Code(err) == codes.DeadlineExceeded
+}
+
+func runStandby(ctx context.Context, config Config, nodeIdentity format.NodeIdentity, serverCredentials credentials.TransportCredentials, coordinator currentCoordinator, admin *adminRuntime, logger *slog.Logger) error {
+	_, _, retryInterval, _ := config.Replication.durations()
+	grant, err := awaitCurrentPrimary(ctx, retryInterval, coordinator, nodeIdentity.GroupID)
 	if err != nil {
 		return fmt.Errorf("discover Primary: %w", err)
 	}
@@ -290,22 +356,17 @@ func runStandby(ctx context.Context, config Config, nodeIdentity format.NodeIden
 	if err != nil {
 		return err
 	}
-	registry := prometheus.NewRegistry()
-	registry.MustRegister(prometheus.NewGoCollector(), prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}))
-	nodeMetrics, err := observe.NewNodeMetrics(config.DataDirectory, diagnosticProvider)
-	if err != nil {
-		return err
-	}
-	registry.MustRegister(nodeMetrics)
-	rpcMetrics := observe.NewRPCMetrics(registry)
+	rpcMetrics := observe.NewRPCMetrics(admin.registry)
 	grpcServer := grpc.NewServer(grpc.Creds(serverCredentials), grpc.MaxRecvMsgSize(int(replicationMessageLimit(config.Replication))), grpc.MaxSendMsgSize(int(replicationMessageLimit(config.Replication))), grpc.StatsHandler(otelgrpc.NewServerHandler()), grpc.ChainUnaryInterceptor(rpcMetrics.UnaryInterceptor()), grpc.ChainStreamInterceptor(rpcMetrics.StreamInterceptor()))
 	streamdv1.RegisterReplicationServiceServer(grpcServer, protocolServer)
-	grpcListener, adminListener, admin, serveErrors, err := serveHA(config, grpcServer, diagnosticProvider, registry)
+	grpcListener, serveErrors, err := serveHA(config, grpcServer)
 	if err != nil {
 		return err
 	}
 	defer grpcListener.Close()
-	defer adminListener.Close()
+	if err = admin.setProvider(diagnosticProvider); err != nil {
+		return err
+	}
 	checkpointCtx, stopCheckpoint := context.WithCancel(context.Background())
 	checkpointDone := make(chan struct{})
 	go func() {
@@ -328,7 +389,7 @@ func runStandby(ctx context.Context, config Config, nodeIdentity format.NodeIden
 	serveErr := waitServe(ctx, serveErrors)
 	stopCheckpoint()
 	<-checkpointDone
-	shutdownServers(config, grpcServer, admin)
+	shutdownGRPC(config, grpcServer)
 	return errors.Join(serveErr, store.Close())
 }
 
@@ -632,24 +693,17 @@ func newAuthorizer(config Config) access.Controller {
 	return access.Controller{Authenticator: access.MTLSAuthenticator{PrincipalsByURI: config.PrincipalsByURI}, Policy: access.StaticPolicy{Rules: config.Authorization}}
 }
 
-func serveHA(config Config, grpcServer *grpc.Server, provider diagnostics.Provider, registry *prometheus.Registry) (net.Listener, net.Listener, *http.Server, <-chan error, error) {
+func serveHA(config Config, grpcServer *grpc.Server) (net.Listener, <-chan error, error) {
 	grpcListener, err := net.Listen("tcp", config.ListenAddress)
 	if err != nil {
-		return nil, nil, nil, nil, err
+		return nil, nil, err
 	}
-	adminListener, err := net.Listen("tcp", config.AdminAddress)
-	if err != nil {
-		grpcListener.Close()
-		return nil, nil, nil, nil, err
-	}
-	admin := adminServer(provider, registry)
-	serveErrors := make(chan error, 2)
+	serveErrors := make(chan error, 1)
 	go func() { serveErrors <- grpcServer.Serve(grpcListener) }()
-	go func() { serveErrors <- admin.Serve(adminListener) }()
-	return grpcListener, adminListener, admin, serveErrors, nil
+	return grpcListener, serveErrors, nil
 }
 
-func serveRecoveryBlocked(ctx context.Context, config Config, controller *leadership.Controller, states *replicationstate.Store, task diagnostics.RecoveryTask, logger *slog.Logger) error {
+func serveRecoveryBlocked(ctx context.Context, admin *adminRuntime, controller *leadership.Controller, states *replicationstate.Store, task diagnostics.RecoveryTask, logger *slog.Logger) error {
 	provider := diagnostics.ProviderFunc(func() diagnostics.Snapshot {
 		current, ok := states.Current()
 		if !ok {
@@ -659,28 +713,12 @@ func serveRecoveryBlocked(ctx context.Context, config Config, controller *leader
 		lease := diagnostics.LeaseState{Term: state.Term, ExpiresAt: state.ExpiresAt, Unsafe: state.Role != leadership.RolePrimary || !state.Fenced || state.LastReason != ""}
 		return diagnostics.RecoveryBlockedSnapshot(current.Header, task, lease)
 	})
-	registry := prometheus.NewRegistry()
-	registry.MustRegister(prometheus.NewGoCollector(), prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}))
-	metrics, err := observe.NewNodeMetrics(config.DataDirectory, provider)
-	if err != nil {
+	if err := admin.setProvider(provider); err != nil {
 		return err
 	}
-	registry.MustRegister(metrics)
-	listener, err := net.Listen("tcp", config.AdminAddress)
-	if err != nil {
-		return err
-	}
-	defer listener.Close()
-	admin := adminServer(provider, registry)
-	serveErrors := make(chan error, 1)
-	go func() { serveErrors <- admin.Serve(listener) }()
-	logger.Warn("streamd recovery diagnostics started", "admin_address", listener.Addr().String(), "task_id", task.TaskID)
-	serveErr := waitServe(ctx, serveErrors)
-	timeout, _ := config.shutdownDuration()
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-	shutdownErr := admin.Shutdown(shutdownCtx)
-	return errors.Join(serveErr, shutdownErr)
+	logger.Warn("streamd recovery diagnostics started", "admin_address", admin.listener.Addr().String(), "task_id", task.TaskID)
+	<-ctx.Done()
+	return nil
 }
 
 func waitServe(ctx context.Context, serveErrors <-chan error) error {
@@ -695,11 +733,10 @@ func waitServe(ctx context.Context, serveErrors <-chan error) error {
 	}
 }
 
-func shutdownServers(config Config, grpcServer *grpc.Server, admin *http.Server) {
+func shutdownGRPC(config Config, grpcServer *grpc.Server) {
 	timeout, _ := config.shutdownDuration()
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	_ = admin.Shutdown(ctx)
 	done := make(chan struct{})
 	go func() { grpcServer.GracefulStop(); close(done) }()
 	select {

@@ -36,6 +36,13 @@ Primary-to-Standby Toxiproxy link to prove that a new Strict append is not
 acknowledged. It deliberately runs serially because the partition is a
 cluster-wide fault.
 
+Before opening the normal data path, the suite starts the Standby without a
+Leader and then the Primary without a Standby. In both cases it proves the
+process remains alive, `/readyz` stays false, diagnostics expose respectively
+`leadership_pending` and `replica_catchup_pending`, and public gRPC remains
+closed. Starting the missing peer must transition the same Admin lifecycle to
+ready without relying on a process restart.
+
 Each streamd node reaches all three etcd members through independent
 Toxiproxy client links. The complete run also stops one etcd member to prove
 continued writes, then removes quorum and waits for the Primary Lease safety

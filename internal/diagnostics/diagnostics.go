@@ -3,6 +3,7 @@ package diagnostics
 import (
 	"encoding/hex"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/akzj/streamd/internal/replication"
@@ -27,6 +28,8 @@ const (
 	ReasonReplicationStateUnavailable ReasonCode = "replication_state_unavailable"
 	ReasonSnapshotRequired            ReasonCode = "snapshot_required"
 	ReasonStateInconsistent           ReasonCode = "state_inconsistent"
+	ReasonLeadershipPending           ReasonCode = "leadership_pending"
+	ReasonReplicaCatchUpPending       ReasonCode = "replica_catchup_pending"
 )
 
 type RecoveryAction string
@@ -94,6 +97,43 @@ type ProviderFunc func() Snapshot
 
 func (f ProviderFunc) Snapshot() Snapshot { return f() }
 
+// SwitchableProvider keeps one Admin and metrics lifecycle while a node moves
+// from startup diagnostics to its role-specific runtime Provider.
+type SwitchableProvider struct {
+	mu       sync.RWMutex
+	provider Provider
+}
+
+func NewSwitchableProvider(initial Provider) (*SwitchableProvider, error) {
+	if initial == nil {
+		return nil, fmt.Errorf("initial diagnostics Provider is required")
+	}
+	if err := Validate(initial.Snapshot()); err != nil {
+		return nil, fmt.Errorf("initial diagnostics Snapshot: %w", err)
+	}
+	return &SwitchableProvider{provider: initial}, nil
+}
+
+func (p *SwitchableProvider) Set(next Provider) error {
+	if next == nil {
+		return fmt.Errorf("diagnostics Provider is required")
+	}
+	if err := Validate(next.Snapshot()); err != nil {
+		return fmt.Errorf("diagnostics Snapshot: %w", err)
+	}
+	p.mu.Lock()
+	p.provider = next
+	p.mu.Unlock()
+	return nil
+}
+
+func (p *SwitchableProvider) Snapshot() Snapshot {
+	p.mu.RLock()
+	provider := p.provider
+	p.mu.RUnlock()
+	return provider.Snapshot()
+}
+
 type LeaseState struct {
 	Term      uint64
 	ExpiresAt time.Time
@@ -101,6 +141,22 @@ type LeaseState struct {
 }
 
 type LeaseProvider func() LeaseState
+
+// StartingSnapshot exposes a stable not-ready state before a replicated role
+// has enough coordinator and peer state to open its public gRPC listener.
+func StartingSnapshot(role string, term uint64, leaseExpiresAt time.Time, code ReasonCode) Snapshot {
+	snapshot := Snapshot{
+		SchemaVersion: "v1", Status: StatusStarting, Ready: false, WriteReady: false,
+		Role: role, Durability: "replicated_strict", Term: term, Reasons: []Reason{reason(code)},
+	}
+	if role == "primary" {
+		snapshot.LeaseExpiresAt = timePtr(leaseExpiresAt)
+	}
+	if Validate(snapshot) != nil {
+		fail(&snapshot, ReasonStateInconsistent)
+	}
+	return snapshot
+}
 
 func EngineSnapshot(health engine.Health, draining bool, lease LeaseProvider) Snapshot {
 	role, roleOK := roleName(health.Role)
@@ -225,7 +281,7 @@ func Validate(snapshot Snapshot) error {
 	if snapshot.Role == "single" && (snapshot.Term != 0 || snapshot.Durability != "single_sync" || snapshot.LeaseExpiresAt != nil) {
 		return fmt.Errorf("Single state has HA fields")
 	}
-	if (snapshot.Role == "primary" || snapshot.Role == "standby") && (snapshot.Term == 0 || snapshot.Durability != "replicated_strict") {
+	if (snapshot.Role == "primary" || snapshot.Role == "standby") && (snapshot.Term == 0 && snapshot.Status != StatusStarting || snapshot.Durability != "replicated_strict") {
 		return fmt.Errorf("HA state has invalid Term or durability")
 	}
 	if snapshot.Role != "primary" && snapshot.LeaseExpiresAt != nil {
@@ -387,6 +443,8 @@ func reason(code ReasonCode) Reason {
 		ReasonReplicationStateUnavailable: "replication state is unavailable",
 		ReasonSnapshotRequired:            "standby requires Snapshot recovery",
 		ReasonStateInconsistent:           "runtime state is internally inconsistent",
+		ReasonLeadershipPending:           "waiting for a coordinator leadership decision",
+		ReasonReplicaCatchUpPending:       "waiting for the configured replica to catch up",
 	}
 	return Reason{Code: code, Message: messages[code]}
 }

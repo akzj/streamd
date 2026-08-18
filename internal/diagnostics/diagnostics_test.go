@@ -99,6 +99,31 @@ func TestRecoveryBlockedSnapshotIsStructuredAndNotReady(t *testing.T) {
 	}
 }
 
+func TestStartingSnapshotAndProviderTransition(t *testing.T) {
+	starting := StartingSnapshot("standby", 0, time.Time{}, ReasonLeadershipPending)
+	if starting.Status != StatusStarting || starting.Ready || starting.WriteReady || starting.Role != "standby" || starting.Term != 0 || len(starting.Reasons) != 1 || starting.Reasons[0].Code != ReasonLeadershipPending {
+		t.Fatalf("starting Standby = %+v", starting)
+	}
+	provider, err := NewSwitchableProvider(ProviderFunc(func() Snapshot { return starting }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	expires := time.Unix(200, 0)
+	waiting := StartingSnapshot("primary", 9, expires, ReasonReplicaCatchUpPending)
+	if err = provider.Set(ProviderFunc(func() Snapshot { return waiting })); err != nil {
+		t.Fatal(err)
+	}
+	current := provider.Snapshot()
+	if current.Role != "primary" || current.Term != 9 || current.LeaseExpiresAt == nil || !current.LeaseExpiresAt.Equal(expires) || current.Reasons[0].Code != ReasonReplicaCatchUpPending {
+		t.Fatalf("waiting Primary = %+v", current)
+	}
+	invalid := current
+	invalid.Status = StatusReadyWrite
+	if err = provider.Set(ProviderFunc(func() Snapshot { return invalid })); err == nil {
+		t.Fatal("invalid diagnostics transition was accepted")
+	}
+}
+
 type noopStandbyLog struct{}
 
 func (noopStandbyLog) Append(...[]byte) error { return nil }
