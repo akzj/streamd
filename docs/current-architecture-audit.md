@@ -3,11 +3,11 @@
 | 属性 | 内容 |
 | --- | --- |
 | 审计性质 | 代码现实版整体架构审计，不是目标架构复述 |
-| 审计基线 | `83562f5`（`main`，2026-08-18） |
+| 审计基线 | `a68ab45`（`main`，2026-08-18） |
 | 审计日期 | 2026-08-18 |
-| 相对上次审计新增 | WAL Group Commit 分阶段累计统计、跨 Checkpoint 连续性、Commit Barrier、创建/稳态分离基准与生产指标 |
+| 相对上次审计新增 | Standby Active WAL History 增量推进、committed MemTable Checkpoint、WAL Rotate 与完整投影发布 |
 | 覆盖范围 | API、存储、索引、Checkpoint、Compaction、恢复、Snapshot、WAL GC、Strict HA、并发与运维入口 |
-| 验证边界 | 代码、单元/race/vet、Compose HA；不等同于性能、长稳、磁盘故障或生产部署验收 |
+| 验证边界 | 本轮代码、单元/race/vet；既有 Compose HA 未在本轮重跑，不等同于性能、长稳、磁盘故障或生产部署验收 |
 
 ## 1. 审计结论
 
@@ -35,6 +35,11 @@ recovery-blocked 状态，输出确定性 Recovery Task。
    保留 Manifest Segment Reference 与 Registry Sparse Block Index；Locator/Tail/Registry 构建中的
    全量 Stream 投影常驻峰值已关闭，但百万 Stream 的 RSS/时延目标尚未验收。
 5. 没有生产级 Snapshot/GC 调度、对象存储、容量故障策略、长稳和规模验收。
+
+此前 Standby 每次 Append 后全量重扫 Active WAL、且 committed MemTable 永不 Flush 的持续运行短板已经关闭：
+History 现在从已验证 Log 状态 O(1) 增量推进；周期 Checkpoint 会在 committed/applied 边界冻结并切换
+MemTable、Rotate WAL，在锁外发布 Segment、Tail、Locator、Registry 与 Manifest。未提交但已 durable 的 WAL
+后缀不进入 Manifest，并在重启后保留。WAL 在线 GC、Standby Segment Compaction 和容量水位仍未闭环。
 
 结论：**可以继续开发，当前代码适合作为正确性优先的 V1 工程基线；尚不能宣称生产就绪。后续应按
 跨模块风险推进，而不是继续增加彼此孤立的存储功能。**
@@ -184,19 +189,21 @@ ResumeInstall
 -> recover only through durable committed watermark
 -> open WAL History
 -> expose ReplicationService only
--> periodic replication-state checkpoint
+-> periodic committed storage + replication-state checkpoint
 ```
 
-Standby 不注册 `StreamService`，因此当前不能承担读流量。它在内存中维护 replicated committed 数据，
-但这些数据只用于恢复和 Promotion。没有当前 Leader 时进程不再退出；它保持 not-ready Admin，直到发现
-Leader 或收到 shutdown。非法 coordinator state 仍立即失败，不会被无限重试隐藏。
+Standby 不注册 `StreamService`，因此当前不能承担读流量。新 committed Record 先应用到 Active MemTable；
+Checkpoint 在 Receiver 排他边界持久化水位、冻结旧表、切换新表并 Rotate WAL，然后在锁外将旧表发布为
+独立 Segment 与完整投影。投影发布期间复制可以继续写入新表；最终切换时合并 checkpoint 之后的 Registry
+Overlay，并删除只用于切换的 seed-only Tail。没有当前 Leader 时进程不再退出；它保持 not-ready Admin，
+直到发现 Leader 或收到 shutdown。非法 coordinator state 仍立即失败。
 
 ## 4. 数据事实、发布边界与投影
 
 | 对象 | 当前角色 | 是否可重建 | 当前加载方式 |
 | --- | --- | --- | --- |
 | Record Frame | 逻辑 Record 的规范编码 | 否 | WAL/MemTable/Segment 中读取 |
-| WAL | 尚未进入 Manifest Checkpoint 的顺序事实和复制日志 | 被 Segment+Snapshot 覆盖后可回收 | Active WAL 打开；History 扫描文件元数据 |
+| WAL | 尚未进入 Manifest Checkpoint 的顺序事实和复制日志 | 被 Segment+Snapshot 覆盖后可回收 | Active WAL 打开；Append 后 O(1) 推进 History，Rotate/启动时重建文件链 |
 | Segment | 已 Checkpoint 的不可变 Record 事实 | 无其他副本时不可重建 | 启动验证轻量 Header/Footer；仅最新 Directory 恢复时间水位，历史 Directory 按需打开 |
 | Registry Stream | 名称到 StreamID 分配事实 | 否 | Segment/WAL；Snapshot 只加速查询 |
 | Manifest + CURRENT | 当前不可变 Segment/Artifact 集合的原子发布边界 | 不能从 Cache 推断 | 当前 Generation 常驻内存 |
@@ -265,7 +272,7 @@ locator failure -> Descriptor/Directory fallback -> Segment Handle
 ResolveTime 当前对 Sequence 范围做二分，每个探测点再走上述 Record 读取路径。它不是独立的全局时间
 索引。Subscribe 是“有界 Read + 等待 Stream 通知”的循环，不拥有独立消息队列或消费位点。
 
-### 5.3 Checkpoint
+### 5.3 Primary/Single Checkpoint
 
 ```text
 maintenanceMu
@@ -297,7 +304,15 @@ fan-in 32 多轮归并；最终 Run 分别顺序扫描以计算布局、写 Spar
 字节格式一致，不再构造完整 `[]Mapping`、`[]RegistryEntry` 或编码缓冲；`RebuildMappings` 仅保留为
 Snapshot 损坏时的事实回退。
 
-### 5.4 Compaction
+### 5.4 Standby Checkpoint
+
+Standby Checkpoint 只把 `applied == committed` 的连续前缀发布进 Manifest。Receiver 排他区内先持久化
+Replication State，再冻结旧 MemTable、按 Tail seed 新 Active MemTable 并 Rotate WAL；Segment 和完整投影
+在排他区外构建，因此期间新的复制 Append 可以继续。最终切换在 Receiver 排他区合并 checkpoint 之后的
+Registry Overlay，并让活跃表从新 Tail Catalog 回退。`local_durable > committed` 的后缀只保留在 WAL，
+不会被错误提升为 Segment checkpoint。构建或切换失败使 Receiver fatal，必须重启按磁盘事实恢复。
+
+### 5.5 Compaction
 
 Compaction 由 `maintenanceMu` 与 Checkpoint 串行化。构建合并 Segment 时 Append 可以继续；发布新
 Manifest 后，Compaction 在 Engine `mu` 下把 Registry Snapshot checkpoint 之后的 Overlay 合并到
@@ -306,7 +321,7 @@ Manifest 后，Compaction 在 Engine `mu` 下把 Registry Snapshot checkpoint �
 当前 Merge 会读取选中 Segment 的全部 Frame 并在内存按 Stream 聚合。输入数量和字节受配置限制，
 但峰值内存仍与一次 Compaction 的输入记录量相关。
 
-### 5.5 Recovery
+### 5.6 Recovery
 
 ```text
 CURRENT -> current Manifest
@@ -322,7 +337,7 @@ CURRENT -> current Manifest
 HA 恢复通过 `ApplyThrough=committed` 限制可见数据。Primary 若在 durable WAL 中仍有超过 durable
 committed state 的后缀，必须先经过 `Promote` 处理，不能直接 `engine.OpenReplicated`。
 
-### 5.6 Snapshot 与 WAL GC
+### 5.7 Snapshot 与 WAL GC
 
 Snapshot 模块已经实现：精确 Manifest Generation Checkpoint、内存 Pin、Artifact 逐个校验和复制、
 Snapshot Manifest、安装 Journal、崩溃续装以及三组 CURRENT 指针切换。
@@ -547,12 +562,24 @@ Catch-up 的跨进程竞争；同一 `wal.History` 内部的 Pin/Collect 由 mut
 
 ### 9.3 P1：下一阶段架构风险
 
-#### P1-1 Recovery Task 不是恢复状态机
+#### P1-1 Primary Checkpoint 仍会全局暂停 Append
+
+Primary/Single 仍在 Engine `mu` 内完成 MemTable Frame 复制、Segment 写入、完整投影构建和 Manifest
+发布，停顿随一个周期写入量和历史投影规模增长。下一步应像 Standby 一样把 Freeze/Switch 与锁外 Flush
+分离，但必须保留 Committer Barrier、Result Uncertain 和 Replication State 先于 Manifest 的顺序。
+
+#### P1-2 容量与回收没有运行闭环
+
+Checkpoint 只有时间触发，没有 MemTable/WAL 字节阈值、Immutable backlog、磁盘 High/Critical Admission
+或 Flush 预留空间；Snapshot 创建和 WAL GC 仍是离线运维入口。Standby 已能 Rotate/Flush，但 Sealed WAL
+与 Segment 仍会持续占用磁盘，且尚未执行有界 Compaction。
+
+#### P1-3 Recovery Task 不是恢复状态机
 
 任务没有持久记录、claim/ack、重试状态或自动执行器。相同事实通过 hash 得到稳定 ID，但进程重启获得
 新 Term 后会形成新任务。当前 Runbook 必须重新读取诊断并核对事实，不能把旧 `task_id` 当授权令牌。
 
-#### P1-2 剩余稀疏元数据仍未完全有界
+#### P1-4 剩余稀疏元数据与 Stream 状态仍未完全有界
 
 Recovery 全量 Directory/Extent/Tail/Locator Root 常驻已经关闭：运行视图只保留轻量 Descriptor，Tail
 使用固定 Slot 按需读取和容量 1024 的 LRU，Locator Root 使用固定 Entry 的 `ReadAt` 二分与容量 1024
@@ -560,15 +587,16 @@ Recovery 全量 Directory/Extent/Tail/Locator Root 常驻已经关闭：运行�
 不再同时保留全部 Directory/Extent/Root/Tail；Registry Builder 也已使用有界分块、外部 Run 和流式
 Snapshot Writer。剩余规模阻塞是 Registry Sparse Block Index 与 Manifest Segment Reference 常驻，
 它们仍会随 Registry Block 或 Segment 数量线性放大启动 RSS。Compaction Frame 合并受输入字节上限
-约束，但内部仍会物化一次选定输入。
+约束，但内部仍会物化一次选定输入。Engine 的 `appendGates` 和 `notifications` 还会按曾访问 Stream 常驻，
+新 Stream 分配也仍在全局 Engine 锁内同步提交 Registry Stream 0。
 
-#### P1-3 Node Runtime 生命周期仍未完全统一
+#### P1-5 Node Runtime 生命周期仍未完全统一
 
 Primary、Standby 和 recovery-blocked 已共享 Replicated Admin Runtime 与诊断 Provider 切换，但 Single
 仍独立管理 Admin，三种角色也分别管理 gRPC、后台 ticker 和 storage shutdown。后续抽取必须基于实际
 重复继续收敛，不能为了形式统一移动角色、Durability 和恢复判断的强类型边界。
 
-#### P1-4 Replication State 是持久下界而非实时真值
+#### P1-6 Replication State 是持久下界而非实时真值
 
 State 周期落盘是避免每次 Group Commit 增加 metadata fsync 的有意取舍；但 Strict storage checkpoint
 必须在同一 Engine 临界区先发布覆盖该 Manifest 的 committed/applied State 下界。Promotion、Snapshot、
