@@ -3,9 +3,9 @@
 | 属性 | 内容 |
 | --- | --- |
 | 审计性质 | 代码现实版整体架构审计，不是目标架构复述 |
-| 审计基线 | `291fdea`（`main`，2026-08-18） |
+| 审计基线 | `83562f5`（`main`，2026-08-18） |
 | 审计日期 | 2026-08-18 |
-| 相对上次审计新增 | WAL Group Commit 分阶段累计统计、跨 Checkpoint 统计连续性、Commit Barrier、创建/稳态分离基准 |
+| 相对上次审计新增 | WAL Group Commit 分阶段累计统计、跨 Checkpoint 连续性、Commit Barrier、创建/稳态分离基准与生产指标 |
 | 覆盖范围 | API、存储、索引、Checkpoint、Compaction、恢复、Snapshot、WAL GC、Strict HA、并发与运维入口 |
 | 验证边界 | 代码、单元/race/vet、Compose HA；不等同于性能、长稳、磁盘故障或生产部署验收 |
 
@@ -476,7 +476,7 @@ Catch-up 的跨进程竞争；同一 `wal.History` 内部的 Pin/Collect 由 mut
 | gRPC Record Stream API | Implemented | Append、AppendBatch、Read、ResolveTime、Inspect、Subscribe |
 | mTLS + namespace RBAC | Implemented | 业务 Client 和复制 Peer 均验证身份；Admin 仅允许 loopback |
 | WAL/Batch/Expected Sequence/幂等 | Implemented | Request ID + Request Hash；不确定结果可用原请求重试 |
-| Group Commit | Implemented | 有界 channel + 单 writer；多 Stream 合并；分阶段累计统计跨 Checkpoint 连续；Prometheus 接入待完成 |
+| Group Commit | Implemented | 有界 channel + 单 writer；多 Stream 合并；分阶段累计统计跨 Checkpoint 连续；Primary/Single 已接 Prometheus |
 | Segment/Manifest/Checkpoint | Implemented | 不可变文件、校验 Footer、原子 CURRENT、Crash Test |
 | Tail/Locator/Registry 投影 | Implemented | 损坏可回退事实数据；正常查询使用有界 Cache |
 | Segment Handle/Locator Root/Locator Page/Registry Block Cache | Implemented | 默认容量 64/1024/256/64；引用计数或 LRU |

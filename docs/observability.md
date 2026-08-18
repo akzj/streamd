@@ -2,7 +2,7 @@
 
 | 属性 | 内容 |
 | --- | --- |
-| 状态 | V1 节点/RPC指标已实现；Group Commit Engine 统计已实现，Prometheus 接入待完成 |
+| 状态 | V1 节点、RPC 与 Primary/Single Group Commit 指标已实现 |
 | 范围 | Prometheus 指标、标签基数、Readiness 与告警输入 |
 | 目标 | 仅依赖节点自身状态即可判断角色、写安全性、复制进度和存储压力 |
 
@@ -70,8 +70,8 @@
 
 ### 5.1 Group Commit 指标
 
-Engine 已在真实 Committer 边界累计以下数据，Checkpoint 更换 WAL/Committer 后继续累计且不重复；当前
-`streamd-bench` 已消费这些数据，生产 Prometheus Collector 尚未接入：
+Engine 在真实 Committer 边界累计以下数据，Checkpoint 更换 WAL/Committer 后继续累计且不重复；
+`streamd-bench` 和 Primary/Single 的生产 Prometheus Collector 消费同一快照：
 
 | 指标 | 类型 | 标签 | 语义 |
 | --- | --- | --- | --- |
@@ -89,6 +89,8 @@ Engine 已在真实 Committer 边界累计以下数据，Checkpoint 更换 WAL/C
 `stage` 只允许 `collect`、`append`、`local_sync`、`replicate`、`apply`、`process`。Group size、每请求等待和
 各阶段占比由 Counter 的 `rate()` 计算，不发布进程内计算的 ratio 指标。当前累计最大 Group Size 只用于
 benchmark 报告；生产监控需要分布时应增加有界 Histogram，而不是使用不可合并的进程 lifetime max。
+Standby Receiver 拥有独立的 Append/Barrier/fsync 路径，不注册上述 Committer Collector；它的阶段指标
+必须在 Receiver 边界单独实现，不能把 Primary 的 replicate 时间冒充成 Standby local fsync 时间。
 Segment Flush、Snapshot 和 Cache 仍需在各模块拥有明确事件边界后新增，不得通过定时扫描伪造累计次数或延迟。
 
 ## 6. Readiness 对应关系
