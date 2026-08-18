@@ -3,6 +3,7 @@ package locator
 import (
 	"crypto/sha256"
 	"encoding/binary"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -127,6 +128,133 @@ func TestLookupRejectsCorruptPageAndUnknownSegment(t *testing.T) {
 	if _, _, err = store.LookupSequence(1, 0); err == nil {
 		t.Fatal("Locator accepted a corrupt Page")
 	}
+}
+
+func TestOpenKeepsRootsOnDiskAndBinarySearchesBoundedCache(t *testing.T) {
+	root := t.TempDir()
+	const rootCount = 4097
+	manifest, rootsOffset := writeRootOnlySnapshot(t, root, rootCount)
+	store, err := Open(root, manifest, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if store.header.RootCount != rootCount || store.rootsOffset != rootsOffset || store.RootCacheLen() != 0 {
+		t.Fatalf("opened Locator roots=%d offset=%d cache=%d", store.header.RootCount, store.rootsOffset, store.RootCacheLen())
+	}
+	for _, streamID := range []uint64{1, rootCount / 2, rootCount, rootCount + 1} {
+		entry, found, lookupErr := store.lookupRoot(streamID)
+		wantFound := streamID <= rootCount
+		if lookupErr != nil || found != wantFound || (found && entry.StreamID != streamID) {
+			t.Fatalf("lookupRoot(%d) entry=%+v found=%v error=%v", streamID, entry, found, lookupErr)
+		}
+	}
+	for streamID := uint64(1); streamID <= rootCount; streamID++ {
+		if _, _, err = store.lookupRoot(streamID); err != nil {
+			t.Fatalf("lookupRoot(%d): %v", streamID, err)
+		}
+	}
+	if store.RootCacheLen() != defaultRootCacheCapacity {
+		t.Fatalf("Root Cache length = %d, want %d", store.RootCacheLen(), defaultRootCacheCapacity)
+	}
+}
+
+func TestRootCorruptionIsDetectedByLookupNotOpen(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(t *testing.T, path string, offset int64)
+	}{
+		{name: "crc", mutate: func(t *testing.T, path string, offset int64) {
+			file, err := os.OpenFile(path, os.O_RDWR, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer file.Close()
+			if _, err = file.WriteAt([]byte{0xff}, offset+8); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "order", mutate: func(t *testing.T, path string, offset int64) {
+			encoded, err := format.MarshalLocatorRootEntry(format.LocatorRootEntry{StreamID: 2, PackID: locatorID(9)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			file, err := os.OpenFile(path, os.O_RDWR, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer file.Close()
+			if _, err = file.WriteAt(encoded, offset); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			manifest, rootsOffset := writeRootOnlySnapshot(t, root, 7)
+			path := filepath.Join(root, filepath.FromSlash(manifest.ArtifactReferences[1].Path))
+			test.mutate(t, path, rootsOffset+3*format.LocatorRootEntryLength)
+			store, err := Open(root, manifest, 1)
+			if err != nil {
+				t.Fatalf("Open eagerly rejected Root corruption: %v", err)
+			}
+			defer store.Close()
+			if _, _, err = store.lookupRoot(4); err == nil {
+				t.Fatal("Root lookup accepted corrupt entry")
+			}
+		})
+	}
+}
+
+func TestCloseReleasesSnapshotReader(t *testing.T) {
+	root := t.TempDir()
+	manifest, _ := writeRootOnlySnapshot(t, root, 1)
+	store, err := Open(root, manifest, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err = store.lookupRoot(1); !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("lookup after Close error = %v", err)
+	}
+	if err = store.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+}
+
+func writeRootOnlySnapshot(t *testing.T, root string, count uint32) (format.Manifest, int64) {
+	t.Helper()
+	digest := sha256.Sum256([]byte("pack"))
+	pack := format.LocatorPackReference{PackID: locatorID(9), FileSize: format.SegmentSectionAlignment + format.LocatorPageLength + format.ArtifactFooterLength, PageCount: 1, ContentSHA256: digest, Path: "locator/pack.loc"}
+	roots := make([]format.LocatorRootEntry, count)
+	for i := range roots {
+		roots[i] = format.LocatorRootEntry{StreamID: uint64(i + 1), PackID: pack.PackID}
+	}
+	snapshot := format.LocatorSnapshot{Header: format.LocatorSnapshotHeader{ArtifactID: locatorID(3), ManifestGeneration: 7, CoveredEntryID: 9, TailCatalogArtifactID: locatorID(5)}, Packs: []format.LocatorPackReference{pack}, Roots: roots}
+	encoded, err := format.MarshalLocatorSnapshot(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verified, err := format.UnmarshalLocatorSnapshot(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, "locator", "snapshot.loc")
+	if err = os.MkdirAll(filepath.Dir(path), 0750); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(path, encoded, 0640); err != nil {
+		t.Fatal(err)
+	}
+	packBytes, err := format.MarshalLocatorPackReference(pack)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reference := format.ArtifactReference{ArtifactType: format.ArtifactLocatorSnapshot, FormatVersion: format.VersionV1, ArtifactID: snapshot.Header.ArtifactID, FileSize: uint64(len(encoded)), CoveredEntryID: 9, Path: "locator/snapshot.loc", ContentSHA256: verified.Footer.ContentSHA256}
+	manifest := format.Manifest{Header: format.ManifestHeader{Generation: 7, LastEntryID: 9}, ArtifactReferences: []format.ArtifactReference{{ArtifactType: format.ArtifactTailCatalog, FormatVersion: format.VersionV1, ArtifactID: locatorID(5), FileSize: 1, Path: "catalog/tail", ContentSHA256: sha256.Sum256([]byte("tail"))}, reference}}
+	return manifest, int64(format.LocatorSnapshotHeaderLength + len(packBytes))
 }
 
 func locatorManifest(result BuildResult, descriptors []segment.Descriptor, coveredEntryID uint64) format.Manifest {

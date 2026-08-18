@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"os"
@@ -388,7 +389,11 @@ func TestCompactSwitchesGenerationBeforeRetiringInputs(t *testing.T) {
 		return manifest
 	}
 	appendAndCheckpoint(0, "first", "one")
+	firstLocator := store.state.Locator
 	before := appendAndCheckpoint(1, "second", "two")
+	if _, _, lookupErr := firstLocator.LookupSequence(^uint64(0), 0); !errors.Is(lookupErr, os.ErrClosed) {
+		t.Fatalf("replaced checkpoint Locator remains open: %v", lookupErr)
+	}
 	if len(before.SegmentReferences) != 2 {
 		t.Fatalf("Segment count before Compact = %d", len(before.SegmentReferences))
 	}
@@ -410,6 +415,7 @@ func TestCompactSwitchesGenerationBeforeRetiringInputs(t *testing.T) {
 			}
 		}
 	}()
+	previousLocator := store.state.Locator
 	compacted, err := store.Compact(CompactionOptions{MinSegments: 2, MaxInputSegments: 4, MaxInputBytes: 64 << 20})
 	close(stopReads)
 	if readErr := <-readErrors; readErr != nil {
@@ -420,6 +426,9 @@ func TestCompactSwitchesGenerationBeforeRetiringInputs(t *testing.T) {
 	}
 	if !compacted.Created || compacted.InputSegments != 2 || compacted.Manifest.Header.Generation != before.Header.Generation+1 || len(compacted.Manifest.SegmentReferences) != 1 {
 		t.Fatalf("Compaction = %+v", compacted)
+	}
+	if _, _, lookupErr := previousLocator.LookupSequence(^uint64(0), 0); !errors.Is(lookupErr, os.ErrClosed) {
+		t.Fatalf("replaced compaction Locator remains open: %v", lookupErr)
 	}
 	result, err := store.Read("agent", "events", 0, 10, 0)
 	if err != nil || len(result.Records) != 2 || string(result.Records[1].Payload) != "two" {
@@ -730,6 +739,60 @@ func TestRecoveryRebuildsWhenLocatorSnapshotIsCorrupt(t *testing.T) {
 	}
 	result, err := store.Read("agent", "events", 0, 10, 0)
 	if err != nil || len(result.Records) != 1 {
+		t.Fatalf("fallback Read = %+v, %v", result, err)
+	}
+}
+
+func TestReadFallsBackWhenLocatorRootIsCorrupt(t *testing.T) {
+	dir := t.TempDir()
+	store, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.Append(context.Background(), AppendRequest{Namespace: "agent", Stream: "events", RequestID: []byte("one"), Producer: "test", Records: []InputRecord{{Payload: []byte("one")}}}); err != nil {
+		t.Fatal(err)
+	}
+	manifest, created, err := store.Checkpoint()
+	if err != nil || !created {
+		t.Fatalf("Checkpoint created=%v error=%v", created, err)
+	}
+	if err = store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var reference format.ArtifactReference
+	for _, artifact := range manifest.ArtifactReferences {
+		if artifact.ArtifactType == format.ArtifactLocatorSnapshot {
+			reference = artifact
+		}
+	}
+	path := filepath.Join(dir, filepath.FromSlash(reference.Path))
+	encoded, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	packLength := binary.LittleEndian.Uint32(encoded[format.LocatorSnapshotHeaderLength : format.LocatorSnapshotHeaderLength+4])
+	rootOffset := int64(format.LocatorSnapshotHeaderLength) + int64(packLength)
+	file, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = file.WriteAt([]byte{0xff}, rootOffset+8); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if err = file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = Open(dir)
+	if err != nil {
+		t.Fatalf("recovery rejected lazily validated Locator Root: %v", err)
+	}
+	defer store.Close()
+	if store.state.Locator == nil {
+		t.Fatal("Locator with intact metadata was not installed")
+	}
+	result, err := store.Read("agent", "events", 0, 10, 0)
+	if err != nil || len(result.Records) != 1 || string(result.Records[0].Payload) != "one" {
 		t.Fatalf("fallback Read = %+v, %v", result, err)
 	}
 }

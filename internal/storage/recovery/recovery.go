@@ -291,6 +291,10 @@ func (r *Result) Close() error {
 		errs = append(errs, r.TailCatalog.Close())
 		r.TailCatalog = nil
 	}
+	if r.Locator != nil {
+		errs = append(errs, r.Locator.Close())
+		r.Locator = nil
+	}
 	r.Segments = nil
 	return errors.Join(errs...)
 }

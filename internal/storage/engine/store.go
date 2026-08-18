@@ -602,6 +602,7 @@ func (s *Store) checkpointLocked() (format.Manifest, bool, error) {
 	nextRegistryStore, err := registry.OpenCheckpoint(s.root.Path(), projections.registryReference, published.Header.LastEntryID, 64)
 	if err != nil {
 		nextTailCatalog.Close()
+		nextLocator.Close()
 		s.setFatal(err)
 		return format.Manifest{}, false, err
 	}
@@ -616,6 +617,7 @@ func (s *Store) checkpointLocked() (format.Manifest, bool, error) {
 	oldTable := s.state.MemTable
 	oldReader := s.reader
 	oldTailCatalog := s.state.TailCatalog
+	oldLocator := s.state.Locator
 	s.state.MemTable = newTable
 	s.state.Segments = segment.LightDescriptors(descriptors)
 	s.state.TailCatalog = nextTailCatalog
@@ -627,6 +629,9 @@ func (s *Store) checkpointLocked() (format.Manifest, bool, error) {
 	closeErr := oldReader.Close()
 	if oldTailCatalog != nil {
 		closeErr = errors.Join(closeErr, oldTailCatalog.Close())
+	}
+	if oldLocator != nil {
+		closeErr = errors.Join(closeErr, oldLocator.Close())
 	}
 	s.viewMu.Unlock()
 	if closeErr != nil {
@@ -730,6 +735,7 @@ func (s *Store) Compact(options CompactionOptions) (CompactionResult, error) {
 	nextRegistryStore, err := registry.OpenCheckpoint(s.root.Path(), projections.registryReference, published.Header.LastEntryID, 64)
 	if err != nil {
 		nextTailCatalog.Close()
+		nextLocator.Close()
 		s.setFatal(err)
 		return CompactionResult{}, err
 	}
@@ -743,6 +749,7 @@ func (s *Store) Compact(options CompactionOptions) (CompactionResult, error) {
 		if err = nextRegistry.ApplyMapping(mapping); err != nil {
 			s.mu.Unlock()
 			nextTailCatalog.Close()
+			nextLocator.Close()
 			s.setFatal(err)
 			return CompactionResult{}, err
 		}
@@ -754,6 +761,7 @@ func (s *Store) Compact(options CompactionOptions) (CompactionResult, error) {
 	s.viewMu.Lock()
 	oldReader := s.reader
 	oldTailCatalog := s.state.TailCatalog
+	oldLocator := s.state.Locator
 	s.state.Segments = lightDescriptors
 	s.state.TailCatalog = nextTailCatalog
 	s.state.TailResolver = nextTailResolver
@@ -765,6 +773,9 @@ func (s *Store) Compact(options CompactionOptions) (CompactionResult, error) {
 	err = oldReader.Close()
 	if oldTailCatalog != nil {
 		err = errors.Join(err, oldTailCatalog.Close())
+	}
+	if oldLocator != nil {
+		err = errors.Join(err, oldLocator.Close())
 	}
 	if err != nil {
 		s.setFatal(err)
