@@ -73,6 +73,15 @@ the Standby volume, restarts both nodes, verifies the committed prefix, and
 performs another Strict append. This also guards Snapshot installation against
 retaining a replaced active WAL as if it were a sealed history file.
 
+The final recovery drill creates a new Primary Snapshot, collects the WAL prefix,
+and then uses a network-isolated fault injector to remove that verified Package
+while preserving its Installed Snapshot metadata. After resetting the disposable
+Standby, the suite proves the Primary reports `no_recovery_source`, does not offer
+the missing Snapshot ID or checkpoint, and keeps public gRPC closed. It then creates
+and installs a replacement Snapshot under the recovery task's current Term, verifies
+the historical records, and completes another Strict append. This distinguishes a
+local recovery checkpoint from a transferable Snapshot Package.
+
 On failure the harness still removes containers, networks, and volumes, but
 first preserves service logs below `.tmp/ha-artifacts/`. CI uploads that
 directory as a short-lived diagnostic artifact. The nightly workflow runs ten

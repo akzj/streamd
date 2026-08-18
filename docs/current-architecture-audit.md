@@ -3,9 +3,9 @@
 | 属性 | 内容 |
 | --- | --- |
 | 审计性质 | 代码现实版整体架构审计，不是目标架构复述 |
-| 审计基线 | `f0b7411`（`main`，2026-08-17） |
-| 审计日期 | 2026-08-17 |
-| 相对上次审计新增 | Snapshot/WAL GC Safety；Role/Install Recovery；结构化 Recovery Task；三成员 etcd HA；`LOG_DIVERGED` 恢复验收 |
+| 审计基线 | `e4feffe`（`main`，2026-08-18） |
+| 审计日期 | 2026-08-18 |
+| 相对上次审计新增 | `NO_RECOVERY_SOURCE` 真实恢复验收；Installed Snapshot 与可传输 Package 分离；WAL Pin/GC 并发门禁 |
 | 覆盖范围 | API、存储、索引、Checkpoint、Compaction、恢复、Snapshot、WAL GC、Strict HA、并发与运维入口 |
 | 验证边界 | 代码、单元/race/vet、Compose HA；不等同于性能、长稳、磁盘故障或生产部署验收 |
 
@@ -16,9 +16,10 @@
 Failover/Failback、Snapshot 安装、WAL GC、空盘 Standby 恢复和恢复阻塞期间 Lease 失效。WAL、
 Segment、Manifest、投影索引、mTLS/RBAC、复制水位和诊断不是设计占位。
 
-上次审计列出的三项数据安全风险已经关闭：HA Snapshot 不再走 Single 恢复语义；WAL GC 持有数据根
-独占锁；所有角色都会在恢复和监听前续做 Snapshot Install。`PlanSnapshot` 也不再只返回进程错误，而是
-进入只开放 loopback Admin 的 recovery-blocked 状态，输出确定性 Recovery Task。
+历史审计列出的数据安全风险已作为回归门禁关闭：HA Snapshot 不再走 Single 恢复语义；WAL GC 持有
+数据根独占锁；所有角色都会在恢复和监听前续做 Snapshot Install；Installed Snapshot 元数据也不会被
+误当作可传输 Package。`PlanSnapshot` 不再只返回进程错误，而是进入只开放 loopback Admin 的
+recovery-blocked 状态，输出确定性 Recovery Task。
 
 当前仍不能按“生产级完整 HA Stream Store”验收，原因已经从局部数据正确性转向运行闭环和规模边界：
 
@@ -27,11 +28,14 @@ Segment、Manifest、投影索引、mTLS/RBAC、复制水位和诊断不是设�
 2. `ResolveRejoin` 没有生产调用者；V1 明确不自动截断 divergent suffix。独立 Compose 场景已经验证
    `LOG_DIVERGED` 进入恢复阻塞、准确报告冲突水位，并通过 Snapshot 覆盖旧后缀后重新加入；该路径仍是
    显式运维恢复，不是自动 Rejoin。
-3. Primary 等待暂时不可达的 Standby 时尚未开放 Admin 监听；Standby 找不到当前 Leader 时直接退出，
+3. WAL 已回收且本地 Installed Snapshot Package 不存在时，独立 Compose 场景已经验证节点进入
+   `NO_RECOVERY_SOURCE`、不开放公共 gRPC，并在人工创建 replacement Snapshot 后恢复；该路径同样不是
+   自动恢复状态机。
+4. Primary 等待暂时不可达的 Standby 时尚未开放 Admin 监听；Standby 找不到当前 Leader 时直接退出，
    启动阶段的可观测性和重试所有权仍依赖外部编排器。
-4. 启动仍加载全部 Segment Descriptor、Stream Directory 和 Stream Tail；Locator/Registry 的正常查询
+5. 启动仍加载全部 Segment Descriptor、Stream Directory 和 Stream Tail；Locator/Registry 的正常查询
    已有界，但百万 Stream 的启动 RSS/时延目标尚未实现。
-5. 没有生产级 Snapshot/GC 调度、对象存储、容量故障策略、长稳和规模验收。
+6. 没有生产级 Snapshot/GC 调度、对象存储、容量故障策略、长稳和规模验收。
 
 结论：**可以继续开发，当前代码适合作为正确性优先的 V1 工程基线；尚不能宣称生产就绪。后续应按
 跨模块风险推进，而不是继续增加彼此孤立的存储功能。**
@@ -307,6 +311,11 @@ committed 证据。它只删除被 Segment 和 Snapshot 同时覆盖的连续 se
 阻止删除正在传输的文件。Retention Manager 从读取证据到删除和 State 发布全程持有数据根独占锁，
 在线进程存在时离线命令立即失败。
 
+Replication State 中的 Installed Snapshot 只证明本地数据从哪个 checkpoint 恢复，不证明对应 Package
+仍可供其他副本安装。复制规划先按 WAL 事实尝试增量；只有遇到 `NO_RECOVERY_SOURCE` 或
+`LOG_DIVERGED` 时才扫描 `data/snapshots/`，并且只有 Snapshot ID、Group、checkpoint 和 checksum
+全部匹配且完整 `Verify` 通过的 Package 才进入 `PlanSnapshot`。正常增量协商不会为此读取大型 Artifact。
+
 ## 6. Strict HA 协议现实
 
 ### 6.1 复制水位
@@ -346,6 +355,7 @@ durable 之后，Committer 进入 fatal，结果标记 uncertain。
 - Pin 所需 WAL 文件；
 - 分批复制到 Primary 当前 local durable；
 - 推进 Standby committed；
+- Installed Snapshot metadata 与可传输 Package 分离；只有恢复确实需要时才发现并完整验证 Package；
 - 获得安全 Lease 后，Promotion 校验并提交本地完整 durable Batch 后缀。
 - `NO_RECOVERY_SOURCE`、`LOG_DIVERGED`、`NEEDS_SNAPSHOT` 和 `PlanSnapshot` 转为 Recovery Task；
 - Recovery Task 由 action/reason、Term、Group、source/target、Snapshot、earliest WAL 和目标 durable
@@ -372,6 +382,8 @@ Compose 使用真实进程、mTLS、三成员 etcd、Toxiproxy 和一次性 Volu
 - Snapshot 恢复任务、公共 gRPC 关闭、`readyz=503`，以及恢复阻塞期间再次失去 quorum；
 - 合法但未提交的 Standby WAL 冲突后缀触发 `LOG_DIVERGED`，Recovery Task 精确绑定目标 Entry/CRC，
   Snapshot 安装替换全部旧 WAL 后恢复 Strict Append；
+- GC 后删除唯一可传输 Snapshot Package、清空 Standby，验证 `NO_RECOVERY_SOURCE` 失败关闭；再创建并
+  安装 replacement Snapshot，验证历史数据和新 Strict Append；
 - Standby 链路分区时 Strict Append 不能成功确认。
 
 这些测试不覆盖磁盘满/只读、I/O 延迟或损坏、etcd member replacement、跨版本滚动升级、长时间网络
@@ -417,7 +429,9 @@ rename 到 `trash/`。Segment Reader Handle 有引用计数，在线 Snapshot �
 Catch-up 使用独立的 WAL file Pin。
 
 这些 Pin 都是进程内短期 Pin。持久 Snapshot 通过复制出独立 Artifact 集合获得生命周期独立性；当前
-没有通用的持久 Pin Registry 或传输 Lease。
+没有通用的持久 Pin Registry 或传输 Lease。当前 WAL GC 是离线命令，数据根独占锁排除了它与在线
+Catch-up 的跨进程竞争；同一 `wal.History` 内部的 Pin/Collect 由 mutex 和文件 pin 计数保护，并有并发
+回归测试证明持有 Pin 时 Collect 可完成但不会删除被 Pin 文件。
 
 ## 8. 当前能力矩阵
 
@@ -437,7 +451,7 @@ Catch-up 使用独立的 WAL file Pin。
 | Strict 双 WAL Append | Implemented | 两端 durable 后成功；不自动降级 |
 | 数据副本拓扑 | Bounded | 固定 1 Primary + 1 Standby；静态 Peer；不支持多 Standby/数据 quorum |
 | etcd Term/Lease/Fencing | Implemented | Revision Term、Lease value/ModRevision/LeaseID 校验、Safety Margin |
-| 增量 WAL Catch-up/Pin | Implemented | Primary 开放业务监听前追赶；传输期文件 Pin |
+| 增量 WAL Catch-up/Pin | Implemented | Primary 开放业务监听前追赶；传输期文件 Pin；离线 GC 由数据根锁互斥 |
 | Promotion | Implemented | 新 Term 下验证并提交本地完整 durable Batch suffix |
 | Snapshot 格式/校验/原子安装 | Implemented | 安装 Journal、Crash Resume、角色与 committed boundary 校验；新 WAL 发布后清除被替换历史 |
 | Recovery Task | Bounded | 结构化且确定性；只存在于运行时诊断，不执行、不确认、不授权 |
@@ -470,6 +484,11 @@ Catch-up 使用独立的 WAL file Pin。
 5. **Snapshot 覆盖非空副本后遗留旧 active WAL**：安装 Journal 下先发布新的 `WAL-CURRENT`，再删除并
    fsync 全部被替换 WAL；续装可重复执行同一替换。单元测试直接重开完整 WAL History，Compose 使用
    含冲突后缀的 Standby 验证进程重启。
+6. **Installed Snapshot 被误当作恢复源**：复制规划不再从 Replication State 直接发布 Snapshot；仅在
+   恢复需要时发现并验证真实 Package。Compose 删除唯一 Package 后验证 `NO_RECOVERY_SOURCE`，并通过
+   replacement Snapshot 完成恢复。
+7. **Catch-up Pin 与 WAL GC 竞争**：离线 GC 与在线节点由数据根锁互斥；同一 History 内 Pin/Collect
+   并发测试验证被 Pin 文件不会删除且操作不死锁。
 
 这些边界不得为了自动化或缩短 RTO 而放宽。
 
@@ -554,17 +573,18 @@ State 周期落盘是避免每次 Group Commit 增加 metadata fsync 的有意�
 
 建议按以下顺序推进，每项单独提交并重新做整体审计：
 
-1. **补齐剩余恢复证据**：`LOG_DIVERGED` 已有独立端到端门禁；下一步增加
-   `NO_RECOVERY_SOURCE`/WAL race 场景，证明无 Snapshot 来源和 catch-up Pin/GC 竞争时仍然失败关闭。
-2. **统一启动可观测性**：先定义 starting/recovery-blocked Admin 生命周期，再抽取最小 Node Runtime
+恢复证据阶段已经完成 `LOG_DIVERGED`、`NO_RECOVERY_SOURCE` 和 WAL Pin/GC 边界门禁。下一轮从以下
+顺序继续：
+
+1. **统一启动可观测性**：先定义 starting/recovery-blocked Admin 生命周期，再抽取最小 Node Runtime
    骨架；不改变角色和提交语义。
-3. **定义 Maintenance failure policy**：把连续 Checkpoint/Compaction/State 失败映射到稳定诊断、告警
+2. **定义 Maintenance failure policy**：把连续 Checkpoint/Compaction/State 失败映射到稳定诊断、告警
    和退避，补磁盘压力测试。
-4. **实现有界启动元数据**：按 Segment/Stream 规模设计 Descriptor/Directory/Tail 的分页或分层索引，
+3. **实现有界启动元数据**：按 Segment/Stream 规模设计 Descriptor/Directory/Tail 的分页或分层索引，
    保留投影损坏时的明确恢复路径。
-5. **接入受控 Snapshot/GC 自动化**：只有在所有权、认证、幂等任务和 Pin 生命周期冻结后，才接入
+4. **接入受控 Snapshot/GC 自动化**：只有在所有权、认证、幂等任务和 Pin 生命周期冻结后，才接入
    online Snapshot、归档和 GC 调度。
-6. **执行生产候选验收**：规模 benchmark、长稳、磁盘故障、etcd member replacement、升级/回滚和
+5. **执行生产候选验收**：规模 benchmark、长稳、磁盘故障、etcd member replacement、升级/回滚和
    Restore Drill；证据达标后再讨论生产部署和 Dashboard。
 
 每个阶段完成条件：
