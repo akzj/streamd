@@ -3,9 +3,9 @@
 | 属性 | 内容 |
 | --- | --- |
 | 审计性质 | 代码现实版整体架构审计，不是目标架构复述 |
-| 审计基线 | `da6f134`（`main`，2026-08-18） |
+| 审计基线 | `291fdea`（`main`，2026-08-18） |
 | 审计日期 | 2026-08-18 |
-| 相对上次审计新增 | Locator/Tail/Registry 投影外部排序与流式构建；Replicated Checkpoint durable state 顺序保持 |
+| 相对上次审计新增 | WAL Group Commit 分阶段累计统计、跨 Checkpoint 统计连续性、Commit Barrier、创建/稳态分离基准 |
 | 覆盖范围 | API、存储、索引、Checkpoint、Compaction、恢复、Snapshot、WAL GC、Strict HA、并发与运维入口 |
 | 验证边界 | 代码、单元/race/vet、Compose HA；不等同于性能、长稳、磁盘故障或生产部署验收 |
 
@@ -235,6 +235,16 @@ Segment、WAL 未覆盖后缀或唯一 Snapshot 损坏不能按“投影损坏�
 
 Group Commit 可以合并不同 Stream 的请求，不会把同一 Stream 的多个请求放入同一组。每个 Stream 的
 Append Gate 保证 Sequence 检查、分配和完成顺序。
+
+Committer 已累计 queue wait、collect、WAL append、local sync、replicate、apply 与完整 process 时间，
+以及 Group/Request/Entry/Byte/Sync 数量。Engine 在 Checkpoint 替换 Committer 时归档旧 Generation，保证
+累计值不丢失、不重复。只读 `CommitBarrier` 可等待调用前已 admitted 的请求离开 Committer，但不会 Rotate
+WAL、构建 Segment 或发布 Manifest；benchmark 用它闭合 deadline 后后台提交的统计口径。
+
+当前短时开发机测量证明 local fsync 是 Single Committer 的主要成本，且并发下合并显著提高吞吐；同时
+250 µs 配置等待在低压力下可能因调度/Timer 精度实际接近 1.1 ms。该结果只证明测量边界与优化方向，尚未
+构成目标硬件的默认参数或生产容量结论。新 Stream 创建还在 Engine mutex 下同步提交 Registry Stream 0，
+必须与预创建 Stream 的稳态 Append 分开验收。
 
 客户端 Context 超时不取消已 Enqueue 的提交。此时 API 返回 `ResultUncertain`，后台仍等待 Future，
 完成后释放 Stream Gate 并通知 Subscribe。客户端必须使用同一 Expected Sequence 和 Request ID 重试。
@@ -466,7 +476,7 @@ Catch-up 的跨进程竞争；同一 `wal.History` 内部的 Pin/Collect 由 mut
 | gRPC Record Stream API | Implemented | Append、AppendBatch、Read、ResolveTime、Inspect、Subscribe |
 | mTLS + namespace RBAC | Implemented | 业务 Client 和复制 Peer 均验证身份；Admin 仅允许 loopback |
 | WAL/Batch/Expected Sequence/幂等 | Implemented | Request ID + Request Hash；不确定结果可用原请求重试 |
-| Group Commit | Implemented | 多 Stream 合并；本地 fsync 后才进入后续提交阶段 |
+| Group Commit | Implemented | 有界 channel + 单 writer；多 Stream 合并；分阶段累计统计跨 Checkpoint 连续；Prometheus 接入待完成 |
 | Segment/Manifest/Checkpoint | Implemented | 不可变文件、校验 Footer、原子 CURRENT、Crash Test |
 | Tail/Locator/Registry 投影 | Implemented | 损坏可回退事实数据；正常查询使用有界 Cache |
 | Segment Handle/Locator Root/Locator Page/Registry Block Cache | Implemented | 默认容量 64/1024/256/64；引用计数或 LRU |

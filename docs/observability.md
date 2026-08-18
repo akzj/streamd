@@ -2,7 +2,7 @@
 
 | 属性 | 内容 |
 | --- | --- |
-| 状态 | V1 Draft |
+| 状态 | V1 节点/RPC指标已实现；Group Commit Engine 统计已实现，Prometheus 接入待完成 |
 | 范围 | Prometheus 指标、标签基数、Readiness 与告警输入 |
 | 目标 | 仅依赖节点自身状态即可判断角色、写安全性、复制进度和存储压力 |
 
@@ -66,8 +66,30 @@
 | `streamd_rpc_active` | Gauge | `method` | 当前执行中的 RPC 数 |
 
 `method` 只能是静态注册的 gRPC Full Method；`code` 是标准 gRPC Code。V1 不记录 Stream、Principal
-或客户端地址标签。WAL fsync、Segment Flush、Snapshot 和 Cache 的细分指标需要在各模块拥有明确事件边界后新增，
-不得通过定时扫描伪造累计次数或延迟。
+或客户端地址标签。
+
+### 5.1 Group Commit 指标
+
+Engine 已在真实 Committer 边界累计以下数据，Checkpoint 更换 WAL/Committer 后继续累计且不重复；当前
+`streamd-bench` 已消费这些数据，生产 Prometheus Collector 尚未接入：
+
+| 指标 | 类型 | 标签 | 语义 |
+| --- | --- | --- | --- |
+| `streamd_commit_groups_total` | Counter | 无 | 已进入 Committer 处理的 Group |
+| `streamd_commit_requests_total` | Counter | 无 | Group 内请求数；包含内部 Registry 请求 |
+| `streamd_commit_entries_total` | Counter | 无 | Group 内 WAL Entry 数 |
+| `streamd_commit_bytes_total` | Counter | 无 | Group 内编码 WAL 字节 |
+| `streamd_commit_local_sync_total` | Counter | 无 | local sync 调用次数，含失败调用 |
+| `streamd_commit_replicate_total` | Counter | 无 | Strict replicate 调用次数，含失败调用 |
+| `streamd_commit_queue_wait_seconds_total` | Counter | 无 | 每请求从尝试进入有界队列到 Group 开始处理的累计时间 |
+| `streamd_commit_stage_seconds_total` | Counter | `stage` | Group 各阶段累计时间 |
+| `streamd_commit_queue_depth` | Gauge | 无 | scrape 时有界 channel 中等待的请求数 |
+| `streamd_commit_queue_capacity` | Gauge | 无 | channel 固定容量 |
+
+`stage` 只允许 `collect`、`append`、`local_sync`、`replicate`、`apply`、`process`。Group size、每请求等待和
+各阶段占比由 Counter 的 `rate()` 计算，不发布进程内计算的 ratio 指标。当前累计最大 Group Size 只用于
+benchmark 报告；生产监控需要分布时应增加有界 Histogram，而不是使用不可合并的进程 lifetime max。
+Segment Flush、Snapshot 和 Cache 仍需在各模块拥有明确事件边界后新增，不得通过定时扫描伪造累计次数或延迟。
 
 ## 6. Readiness 对应关系
 

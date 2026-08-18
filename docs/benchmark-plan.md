@@ -353,9 +353,49 @@ go test ./internal/replication ./internal/storage/engine ./internal/storage/snap
   -count=100
 ```
 
-`streamd-bench` 只接受一个新目录或空目录，避免覆盖既有数据。默认在计时结束后执行最终 Checkpoint 和完整 Scrub，并以 JSON 输出吞吐、错误数和校验结果。
+`streamd-bench` 只接受一个新目录或空目录，避免覆盖既有数据。默认在计时结束后执行最终 Checkpoint 和完整 Scrub，并以 JSON 输出吞吐、错误数和校验结果。`-precreate-streams` 会在计时前创建全部 Stream，单独报告 `setup_seconds`，用于把 Registry 创建成本与已有 Stream 的稳态 Append 分开。计时结束后工具通过 Commit Barrier 排空此前已经入队的请求，报告 `drain_seconds`、deadline exit 和 uncertain result，不把 Context 超时后仍在提交的请求静默丢失。
 
 `single` 模式是 `SINGLE_SYNC` 基线；`strict` 模式通过两套独立 WAL 执行真实双 `fsync`、Group Commit 和
 Strict 客户端完成条件，并在结束时校验 Primary 数据与 Standby WAL 连续性。CLI Strict 基线不包含真实网络 RTT、
 mTLS 或 Standby Apply 成本；这些必须使用双进程部署基准补充。当前工具也不注入随机 Kill、网络分区、
 HDR Histogram 或读写混合负载，不能从单次结果外推 72 小时门槛已经满足。
+
+## 19. Group Commit 可执行测量
+
+Committer 是单 goroutine WAL writer，有界 channel 默认容量 1024；一组最多合并 64 个不同 Stream、
+4 MiB 编码数据或等待 250 µs，然后执行一次 WAL Append 和一次 local `fsync`。Strict 在同一组 local
+durable 后再等待 Standby durable ack。同一 Stream 的连续请求不会进入同一组，保持现有 Tail 校验与 Apply 顺序。
+
+`streamd-bench` 可扫描：
+
+```bash
+go run ./cmd/streamd-bench \
+  -duration 30s \
+  -workers 32 \
+  -streams 1000 \
+  -precreate-streams \
+  -group-delay 250us \
+  -group-requests 64 \
+  -group-bytes 4194304 \
+  -queue-capacity 1024
+```
+
+JSON 把 queue admission/wait、主动 collect、WAL append、local sync、replicate、apply 和完整 process
+分别累计。`local_sync_process_ratio` 用于判断 Committer 内部是否由 fsync 主导；
+`local_sync_wall_ratio` 使用“计时窗口 + 最终 drain”作分母。Group Commit 请求数可能大于成功业务请求数：
+新 Stream 还包含 Registry Record，deadline 返回不确定的请求也会在后台完成。
+
+2026-08-18 开发机的一秒到两秒探索轮次只用于验证工具和选择后续实验，不是发布基线：
+
+| 场景 | 结果摘要 |
+| --- | --- |
+| Single，32 workers，250 µs，max group 1 | 约 0.47k req/s，queue wait 约 64.6 ms |
+| Single，32 workers，250 µs，max group 64 | 约 8.5k req/s，平均 group 约 27.8，queue wait 约 0.83 ms |
+| Strict 双本地 WAL，32 workers，250 µs | 约 4.46k req/s；local sync/process 约 44.6%，replicate/process 约 51.1% |
+| 新 Stream 持续创建，8 workers | 约 0.26k req/s；Registry Stream 0 串行创建路径主导 |
+| 预创建 1,000 Stream 后稳态，8 workers | 约 2.01k req/s；平均 group 约 8 |
+
+当前机器上 Single 的 local `fsync` 占 Committer process 约 91%–99%，所以合并有明确收益。同时低压力下
+250 µs Go timer 的实际 collect 常接近 1.1 ms；固定 delay 不是通用最优值。正式决策必须在目标 NVMe、
+文件系统和 Strict 网络拓扑上按本计划重复五轮并记录尾延迟。下一步先补 HDR latency、CPU/iostat 和更大
+Stream setup/restart 样本，再决定默认 delay 是否可配置或需要基于压力自适应。
