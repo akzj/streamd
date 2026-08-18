@@ -1,7 +1,9 @@
 package registry
 
 import (
+	"errors"
 	"fmt"
+	"math"
 	"slices"
 
 	"github.com/akzj/streamd/internal/storage/format"
@@ -16,6 +18,26 @@ type registryExtent struct {
 // RebuildMappings reads the authoritative Registry Stream from immutable
 // Segments. It is the correctness fallback for a missing or corrupt Snapshot.
 func RebuildMappings(root string, descriptors []segment.Descriptor) ([]Mapping, error) {
+	rebuilt := New()
+	err := visitFacts(root, descriptors, func(entry format.RegistryEntry) error {
+		return rebuilt.ApplyMapping(Mapping{Key: Key{Namespace: entry.Namespace, StreamName: entry.StreamName}, StreamID: entry.StreamID, CreatedEntryID: entry.CreatedEntryID})
+	})
+	if err != nil {
+		return nil, err
+	}
+	rebuilt.mu.RLock()
+	mappings := make([]Mapping, 0, len(rebuilt.byKey))
+	for _, mapping := range rebuilt.byKey {
+		mappings = append(mappings, mapping)
+	}
+	rebuilt.mu.RUnlock()
+	return mappings, nil
+}
+
+func visitFacts(root string, descriptors []segment.Descriptor, visit func(format.RegistryEntry) error) error {
+	if visit == nil {
+		return fmt.Errorf("Registry fact visitor is required")
+	}
 	var extents []registryExtent
 	for _, descriptor := range descriptors {
 		err := segment.VisitDirectories(root, descriptor, func(directory format.StreamDirectoryEntry) error {
@@ -25,7 +47,7 @@ func RebuildMappings(root string, descriptors []segment.Descriptor) ([]Mapping, 
 			return nil
 		})
 		if err != nil {
-			return nil, err
+			return err
 		}
 	}
 	slices.SortFunc(extents, func(a, b registryExtent) int {
@@ -37,42 +59,39 @@ func RebuildMappings(root string, descriptors []segment.Descriptor) ([]Mapping, 
 		}
 		return 0
 	})
-	rebuilt := New()
 	nextSequence := uint64(0)
 	for _, extent := range extents {
 		if extent.directory.FirstSequence != nextSequence {
-			return nil, fmt.Errorf("Registry Stream extents are not continuous")
+			return fmt.Errorf("Registry Stream extents are not continuous")
+		}
+		if extent.directory.RecordCount > math.MaxUint64-extent.directory.FirstSequence {
+			return fmt.Errorf("Registry Stream extent Sequence overflows")
 		}
 		reader, err := segment.OpenReference(root, extent.descriptor.Reference)
 		if err != nil {
-			return nil, err
+			return err
 		}
-		for sequence := extent.directory.FirstSequence; sequence < extent.directory.FirstSequence+extent.directory.RecordCount; sequence++ {
+		var readErr error
+		for i := uint64(0); i < extent.directory.RecordCount; i++ {
+			sequence := extent.directory.FirstSequence + i
 			record, readErr := reader.Read(RegistryStreamID, sequence)
 			if readErr != nil {
-				reader.Close()
-				return nil, readErr
+				break
 			}
 			registryRecord, decodeErr := format.UnmarshalRegistryRecord(record.Payload)
-			if decodeErr != nil || registryRecord.AssignedStreamID != sequence+1 {
-				reader.Close()
-				return nil, fmt.Errorf("Registry Stream assignment is not contiguous at Sequence %d", sequence)
+			if decodeErr != nil || sequence == math.MaxUint64 || registryRecord.AssignedStreamID != sequence+1 {
+				readErr = fmt.Errorf("Registry Stream assignment is not contiguous at Sequence %d", sequence)
+				break
 			}
-			if readErr = rebuilt.ApplyRecord(record.EntryID, record.Payload); readErr != nil {
-				reader.Close()
-				return nil, readErr
+			readErr = visit(format.RegistryEntry{StreamID: registryRecord.AssignedStreamID, CreatedEntryID: record.EntryID, Namespace: registryRecord.Namespace, StreamName: registryRecord.StreamName})
+			if readErr != nil {
+				break
 			}
 		}
-		if err = reader.Close(); err != nil {
-			return nil, err
+		if err = errors.Join(readErr, reader.Close()); err != nil {
+			return err
 		}
 		nextSequence += extent.directory.RecordCount
 	}
-	rebuilt.mu.RLock()
-	mappings := make([]Mapping, 0, len(rebuilt.byKey))
-	for _, mapping := range rebuilt.byKey {
-		mappings = append(mappings, mapping)
-	}
-	rebuilt.mu.RUnlock()
-	return mappings, nil
+	return nil
 }

@@ -828,12 +828,7 @@ func (s *Store) buildProjectionReferences(generation, coveredEntryID uint64, des
 		return projectionBuild{}, err
 	}
 	tailReference := locatorResult.TailReference
-	registryMappings, err := registry.RebuildMappings(s.root.Path(), descriptors)
-	if err != nil {
-		return projectionBuild{}, err
-	}
-	registrySnapshot := registry.BuildSnapshot(registryID, coveredEntryID, s.now().UnixNano(), registryMappings)
-	registryReference, err := registry.WriteCheckpoint(s.root.Path(), registrySnapshot)
+	registryReference, err := registry.BuildCheckpointFromSegments(s.root.Path(), registryID, coveredEntryID, s.now().UnixNano(), descriptors)
 	if err != nil {
 		return projectionBuild{}, err
 	}
