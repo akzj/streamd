@@ -10,6 +10,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"slices"
 
 	"github.com/akzj/streamd/internal/storage/format"
 	"github.com/akzj/streamd/internal/storage/fsutil"
@@ -32,7 +33,6 @@ func WriteNewCheckpoint(root string, manifestGeneration, coveredEntryID uint64, 
 // WriteCheckpoint writes an immutable Tail Catalog without constructing the
 // full fixed-slot file in memory. Missing Stream IDs are emitted as zero slots.
 func WriteCheckpoint(root string, artifactID format.UUID, manifestGeneration, coveredEntryID uint64, slots []format.TailSlot) (format.ArtifactReference, error) {
-	byStream := make(map[uint64][]byte, len(slots))
 	var slotCount uint64
 	for _, slot := range slots {
 		if !slot.Present {
@@ -41,20 +41,38 @@ func WriteCheckpoint(root string, artifactID format.UUID, manifestGeneration, co
 		if slot.AppliedEntryID != coveredEntryID {
 			return format.ArtifactReference{}, fmt.Errorf("Tail Slot %d applied Entry ID does not match checkpoint", slot.StreamID)
 		}
-		encoded, err := format.MarshalTailSlot(slot)
-		if err != nil {
-			return format.ArtifactReference{}, err
-		}
-		if _, duplicate := byStream[slot.StreamID]; duplicate {
-			return format.ArtifactReference{}, fmt.Errorf("duplicate Tail Slot %d", slot.StreamID)
-		}
-		byStream[slot.StreamID] = encoded
 		if slot.StreamID == ^uint64(0) {
 			return format.ArtifactReference{}, fmt.Errorf("Tail Slot count overflows")
 		}
 		if slot.StreamID+1 > slotCount {
 			slotCount = slot.StreamID + 1
 		}
+	}
+	ordered := slices.Clone(slots)
+	slices.SortFunc(ordered, func(a, b format.TailSlot) int {
+		if a.StreamID < b.StreamID {
+			return -1
+		}
+		if a.StreamID > b.StreamID {
+			return 1
+		}
+		return 0
+	})
+	return WriteCheckpointSorted(root, artifactID, manifestGeneration, coveredEntryID, slotCount, func(emit func(format.TailSlot) error) error {
+		for _, slot := range ordered {
+			if err := emit(slot); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// WriteCheckpointSorted streams strictly ordered present Slots and fills gaps
+// with zero Slots. The visitor must not retain emit beyond the call.
+func WriteCheckpointSorted(root string, artifactID format.UUID, manifestGeneration, coveredEntryID, slotCount uint64, visit func(emit func(format.TailSlot) error) error) (format.ArtifactReference, error) {
+	if visit == nil {
+		return format.ArtifactReference{}, fmt.Errorf("Tail Slot visitor is required")
 	}
 	header := format.TailCatalogHeader{ArtifactID: artifactID, SlotCount: slotCount, CoveredEntryID: coveredEntryID, ManifestGeneration: manifestGeneration}
 	headerBytes, err := format.MarshalTailCatalogHeader(header)
@@ -97,14 +115,35 @@ func WriteCheckpoint(root string, artifactID format.UUID, manifestGeneration, co
 	if _, err = writer.Write(padding); err != nil {
 		return format.ArtifactReference{}, err
 	}
-	for streamID := uint64(0); streamID < slotCount; streamID++ {
-		encoded := byStream[streamID]
-		if encoded == nil {
-			encoded = zeroSlot
+	nextStreamID := uint64(0)
+	err = visit(func(slot format.TailSlot) error {
+		if !slot.Present || slot.AppliedEntryID != coveredEntryID || slot.StreamID < nextStreamID || slot.StreamID >= slotCount {
+			return fmt.Errorf("Tail Slot %d is absent, unordered, or outside checkpoint", slot.StreamID)
 		}
-		if _, err = writer.Write(encoded); err != nil {
+		for nextStreamID < slot.StreamID {
+			if _, writeErr := writer.Write(zeroSlot); writeErr != nil {
+				return writeErr
+			}
+			nextStreamID++
+		}
+		encoded, encodeErr := format.MarshalTailSlot(slot)
+		if encodeErr != nil {
+			return encodeErr
+		}
+		if _, encodeErr = writer.Write(encoded); encodeErr != nil {
+			return encodeErr
+		}
+		nextStreamID++
+		return nil
+	})
+	if err != nil {
+		return format.ArtifactReference{}, err
+	}
+	for nextStreamID < slotCount {
+		if _, err = writer.Write(zeroSlot); err != nil {
 			return format.ArtifactReference{}, err
 		}
+		nextStreamID++
 	}
 	if err = writer.Flush(); err != nil {
 		return format.ArtifactReference{}, err

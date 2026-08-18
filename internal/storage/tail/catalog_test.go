@@ -74,6 +74,47 @@ func TestWriteCheckpointRejectsDuplicateAndWatermarkMismatch(t *testing.T) {
 	}
 }
 
+func TestWriteCheckpointSortedStreamsGapsAndRejectsOrder(t *testing.T) {
+	root := t.TempDir()
+	reference, err := WriteCheckpointSorted(root, tailID(1), 3, 9, 6, func(emit func(format.TailSlot) error) error {
+		for _, streamID := range []uint64{1, 5} {
+			if err := emit(format.TailSlot{Generation: 2, Present: true, StreamID: streamID, NextSequence: 1, NextByteOffset: 1, LastEntryID: 9, AppliedEntryID: 9, LatestSegmentID: tailID(byte(streamID + 1))}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	catalog, err := OpenCheckpoint(root, reference, 3, 9)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer catalog.Close()
+	for _, streamID := range []uint64{0, 2, 3, 4} {
+		if _, found, lookupErr := catalog.Lookup(streamID); lookupErr != nil || found {
+			t.Fatalf("gap Slot %d found=%v error=%v", streamID, found, lookupErr)
+		}
+	}
+	failureRoot := t.TempDir()
+	if _, err = WriteCheckpointSorted(failureRoot, tailID(1), 3, 9, 3, func(emit func(format.TailSlot) error) error {
+		slot := func(streamID uint64) format.TailSlot {
+			return format.TailSlot{Generation: 2, Present: true, StreamID: streamID, NextSequence: 1, NextByteOffset: 1, LastEntryID: 9, AppliedEntryID: 9, LatestSegmentID: tailID(2)}
+		}
+		if err := emit(slot(2)); err != nil {
+			return err
+		}
+		return emit(slot(1))
+	}); err == nil {
+		t.Fatal("sorted Tail writer accepted descending Slots")
+	}
+	staging, globErr := filepath.Glob(filepath.Join(failureRoot, "catalog", ".TAIL-*.tmp"))
+	if globErr != nil || len(staging) != 0 {
+		t.Fatalf("failed Tail staging files = %v, %v", staging, globErr)
+	}
+}
+
 func tailID(value byte) format.UUID {
 	var id format.UUID
 	id[15] = value

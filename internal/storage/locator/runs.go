@@ -15,7 +15,7 @@ import (
 )
 
 const extentRunFanIn = 32
-const extentRunRecordLength = 16 + 9*8
+const extentRunRecordLength = 16 + 10*8
 
 type extentRecord struct {
 	segmentID format.UUID
@@ -83,7 +83,7 @@ func marshalExtentRecord(record extentRecord) ([]byte, error) {
 		record.directory.StreamID, record.directory.FirstSequence, record.directory.RecordCount,
 		record.directory.FirstByteOffset, record.directory.NextByteOffset,
 		uint64(record.directory.FirstRecordedAt), uint64(record.directory.LastRecordedAt),
-		record.directory.RecordIndexOffset, record.directory.StreamDataOffset,
+		record.directory.LastEntryID, record.directory.RecordIndexOffset, record.directory.StreamDataOffset,
 	}
 	for i, value := range values {
 		binary.LittleEndian.PutUint64(encoded[16+i*8:24+i*8], value)
@@ -105,7 +105,7 @@ func unmarshalExtentRecord(encoded []byte) (extentRecord, error) {
 		StreamID: value(0), FirstSequence: value(1), RecordCount: value(2),
 		FirstByteOffset: value(3), NextByteOffset: value(4),
 		FirstRecordedAt: int64(value(5)), LastRecordedAt: int64(value(6)),
-		RecordIndexOffset: value(7), StreamDataOffset: value(8),
+		LastEntryID: value(7), RecordIndexOffset: value(8), StreamDataOffset: value(9),
 	}
 	return record, nil
 }

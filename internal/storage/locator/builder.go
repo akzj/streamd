@@ -14,6 +14,7 @@ import (
 	"github.com/akzj/streamd/internal/storage/format"
 	"github.com/akzj/streamd/internal/storage/fsutil"
 	"github.com/akzj/streamd/internal/storage/segment"
+	tailstore "github.com/akzj/streamd/internal/storage/tail"
 )
 
 const maxExtentsPerPage = (format.LocatorPageLength - 4 - format.ExtentPageHeaderLength) / format.ExtentEntryLength
@@ -24,9 +25,9 @@ type Pointer struct {
 }
 
 type BuildResult struct {
-	Reference format.ArtifactReference
-	Pack      format.LocatorPackReference
-	Roots     map[uint64]Pointer
+	Reference     format.ArtifactReference
+	Pack          format.LocatorPackReference
+	TailReference format.ArtifactReference
 }
 
 func NewID() (format.UUID, error) {
@@ -36,9 +37,9 @@ func NewID() (format.UUID, error) {
 }
 
 // BuildCheckpoint external-sorts Segment Directory entries into bounded
-// fan-in runs, then emits Locator Pages one page at a time. Memory is bounded
-// by one Segment Directory, the merge fan-in, one Page, and the Root map that
-// is still shared with the Tail Catalog builder.
+// fan-in runs, then emits Locator Pages, Roots, and Tail Slots one stream at a
+// time. Memory is bounded by one Segment Directory, the merge fan-in, and one
+// Locator Page.
 func BuildCheckpoint(root string, snapshotID, packID, tailCatalogID format.UUID, manifestGeneration, coveredEntryID uint64, descriptors []segment.Descriptor) (BuildResult, error) {
 	locatorDir := filepath.Join(root, "locator")
 	if err := os.MkdirAll(locatorDir, 0750); err != nil {
@@ -53,14 +54,20 @@ func BuildCheckpoint(root string, snapshotID, packID, tailCatalogID format.UUID,
 	if err != nil {
 		return BuildResult{}, err
 	}
-	pageCount, rootCount, err := countExtentPages(runPath)
+	pageCount, rootCount, slotCount, err := countExtentPages(runPath)
 	if err != nil {
 		return BuildResult{}, err
 	}
 	if pageCount == 0 || pageCount > math.MaxUint32 || rootCount > math.MaxUint32 {
 		return BuildResult{}, fmt.Errorf("Locator Pack counts are invalid")
 	}
-	packReference, rootsPath, roots, err := writeLocatorPack(root, buildDir, packID, coveredEntryID, pageCount, rootCount, runPath)
+	var packReference format.LocatorPackReference
+	var rootsPath string
+	tailReference, err := tailstore.WriteCheckpointSorted(root, tailCatalogID, manifestGeneration, coveredEntryID, slotCount, func(emit func(format.TailSlot) error) error {
+		var buildErr error
+		packReference, rootsPath, buildErr = writeLocatorPack(root, buildDir, packID, coveredEntryID, pageCount, rootCount, runPath, emit)
+		return buildErr
+	})
 	if err != nil {
 		return BuildResult{}, err
 	}
@@ -68,10 +75,10 @@ func BuildCheckpoint(root string, snapshotID, packID, tailCatalogID format.UUID,
 	if err != nil {
 		return BuildResult{}, err
 	}
-	return BuildResult{Reference: reference, Pack: packReference, Roots: roots}, nil
+	return BuildResult{Reference: reference, Pack: packReference, TailReference: tailReference}, nil
 }
 
-func countExtentPages(runPath string) (pageCount, rootCount uint64, resultErr error) {
+func countExtentPages(runPath string) (pageCount, rootCount, slotCount uint64, resultErr error) {
 	var previous *extentRecord
 	var streamExtents uint64
 	finish := func() error {
@@ -106,12 +113,18 @@ func countExtentPages(runPath string) (pageCount, rootCount uint64, resultErr er
 		return nil
 	})
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, 0, err
 	}
 	if err = finish(); err != nil {
-		return 0, 0, err
+		return 0, 0, 0, err
 	}
-	return pageCount, rootCount, nil
+	if previous != nil {
+		if previous.directory.StreamID == math.MaxUint64 {
+			return 0, 0, 0, fmt.Errorf("Tail Slot count overflows")
+		}
+		slotCount = previous.directory.StreamID + 1
+	}
+	return pageCount, rootCount, slotCount, nil
 }
 
 func validateExtentContinuity(previous, next extentRecord) error {
@@ -133,14 +146,17 @@ func extentEntry(record extentRecord) format.ExtentEntry {
 	}
 }
 
-func writeLocatorPack(root, buildDir string, packID format.UUID, coveredEntryID, pageCount, rootCount uint64, runPath string) (reference format.LocatorPackReference, rootsPath string, roots map[uint64]Pointer, resultErr error) {
+func writeLocatorPack(root, buildDir string, packID format.UUID, coveredEntryID, pageCount, rootCount uint64, runPath string, emitTail func(format.TailSlot) error) (reference format.LocatorPackReference, rootsPath string, resultErr error) {
+	if emitTail == nil {
+		return reference, "", fmt.Errorf("Tail Slot emitter is required")
+	}
 	packName := fmt.Sprintf("EXTENTS-%x.loc", packID)
 	locatorDir := filepath.Join(root, "locator")
 	staging := filepath.Join(locatorDir, "."+packName+".tmp")
 	final := filepath.Join(locatorDir, packName)
 	file, err := os.OpenFile(staging, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0640)
 	if err != nil {
-		return reference, "", nil, err
+		return reference, "", err
 	}
 	keep := false
 	fileClosed := false
@@ -154,7 +170,7 @@ func writeLocatorPack(root, buildDir string, packID format.UUID, coveredEntryID,
 	}()
 	headerBytes, err := format.MarshalLocatorPackHeader(format.LocatorPackHeader{ArtifactID: packID, PageCount: pageCount, CreatedAt: 0, CoveredEntryID: coveredEntryID})
 	if err != nil {
-		return reference, "", nil, err
+		return reference, "", err
 	}
 	digest := sha256.New()
 	writer := bufio.NewWriterSize(io.MultiWriter(file, digest), 256*1024)
@@ -162,12 +178,12 @@ func writeLocatorPack(root, buildDir string, packID format.UUID, coveredEntryID,
 		_, err = writer.Write(make([]byte, format.SegmentSectionAlignment-len(headerBytes)))
 	}
 	if err != nil {
-		return reference, "", nil, err
+		return reference, "", err
 	}
 	rootsPath = filepath.Join(buildDir, "roots.bin")
 	rootFile, err := os.OpenFile(rootsPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 	if err != nil {
-		return reference, "", nil, err
+		return reference, "", err
 	}
 	rootWriter := bufio.NewWriterSize(rootFile, 128*1024)
 	rootClosed := false
@@ -176,13 +192,14 @@ func writeLocatorPack(root, buildDir string, packID format.UUID, coveredEntryID,
 			resultErr = errors.Join(resultErr, rootWriter.Flush(), rootFile.Close())
 		}
 	}()
-	roots = make(map[uint64]Pointer, rootCount)
 	pageExtents := make([]format.ExtentEntry, 0, maxExtentsPerPage)
 	var streamID uint64
 	var hasStream bool
 	var previousPage uint32
 	var ordinal uint32
 	var streamPages uint32
+	var writtenRoots uint64
+	var latest extentRecord
 	flushPage := func() error {
 		if len(pageExtents) == 0 {
 			return nil
@@ -218,12 +235,16 @@ func writeLocatorPack(root, buildDir string, packID format.UUID, coveredEntryID,
 			return err
 		}
 		pointer := Pointer{PackID: packID, PageOrdinal: previousPage}
-		roots[streamID] = pointer
 		encoded, err := format.MarshalLocatorRootEntry(format.LocatorRootEntry{StreamID: streamID, PackID: packID, PageOrdinal: previousPage})
 		if err == nil {
 			_, err = rootWriter.Write(encoded)
 		}
-		return err
+		if err != nil {
+			return err
+		}
+		writtenRoots++
+		directory := latest.directory
+		return emitTail(format.TailSlot{Generation: 2, Present: true, StreamID: streamID, NextSequence: directory.FirstSequence + directory.RecordCount, NextByteOffset: directory.NextByteOffset, LastRecordedAt: directory.LastRecordedAt, LastEntryID: directory.LastEntryID, AppliedEntryID: coveredEntryID, LatestSegmentID: latest.segmentID, LatestExtentPackID: pointer.PackID, LatestPageOrdinal: pointer.PageOrdinal})
 	}
 	err = scanExtentRun(runPath, func(record extentRecord) error {
 		if !hasStream || streamID != record.directory.StreamID {
@@ -235,6 +256,7 @@ func writeLocatorPack(root, buildDir string, packID format.UUID, coveredEntryID,
 			streamPages = 0
 		}
 		pageExtents = append(pageExtents, extentEntry(record))
+		latest = record
 		if len(pageExtents) == maxExtentsPerPage {
 			return flushPage()
 		}
@@ -244,24 +266,24 @@ func writeLocatorPack(root, buildDir string, packID format.UUID, coveredEntryID,
 		err = finishStream()
 	}
 	if err != nil {
-		return reference, "", nil, err
+		return reference, "", err
 	}
-	if uint64(ordinal) != pageCount || uint64(len(roots)) != rootCount {
-		return reference, "", nil, fmt.Errorf("Locator counts changed while writing")
+	if uint64(ordinal) != pageCount || writtenRoots != rootCount {
+		return reference, "", fmt.Errorf("Locator counts changed while writing")
 	}
 	if err = rootWriter.Flush(); err != nil {
-		return reference, "", nil, err
+		return reference, "", err
 	}
 	if err = rootFile.Close(); err != nil {
-		return reference, "", nil, err
+		return reference, "", err
 	}
 	rootClosed = true
 	if err = writer.Flush(); err != nil {
-		return reference, "", nil, err
+		return reference, "", err
 	}
 	contentLength, err := format.LocatorPagePosition(ordinal)
 	if err != nil || contentLength > math.MaxUint64-format.ArtifactFooterLength {
-		return reference, "", nil, fmt.Errorf("Locator Pack length overflows")
+		return reference, "", fmt.Errorf("Locator Pack length overflows")
 	}
 	var contentSHA [sha256.Size]byte
 	copy(contentSHA[:], digest.Sum(nil))
@@ -281,14 +303,14 @@ func writeLocatorPack(root, buildDir string, packID format.UUID, coveredEntryID,
 		err = os.Rename(staging, final)
 	}
 	if err != nil {
-		return reference, "", nil, err
+		return reference, "", err
 	}
 	keep = true
 	if err = fsutil.SyncDir(locatorDir); err != nil {
-		return reference, "", nil, err
+		return reference, "", err
 	}
 	reference = format.LocatorPackReference{PackID: packID, FileSize: footer.FileLength, PageCount: pageCount, ContentSHA256: contentSHA, Path: filepath.ToSlash(filepath.Join("locator", packName))}
-	return reference, rootsPath, roots, nil
+	return reference, rootsPath, nil
 }
 
 func writeLocatorSnapshot(root string, snapshotID, tailCatalogID format.UUID, manifestGeneration, coveredEntryID, rootCount uint64, pack format.LocatorPackReference, rootsPath string) (reference format.ArtifactReference, resultErr error) {

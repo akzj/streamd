@@ -11,6 +11,7 @@ import (
 	"github.com/akzj/streamd/internal/storage/format"
 	"github.com/akzj/streamd/internal/storage/memtable"
 	"github.com/akzj/streamd/internal/storage/segment"
+	tailstore "github.com/akzj/streamd/internal/storage/tail"
 )
 
 func TestBuildOpenAndLookupLocator(t *testing.T) {
@@ -36,6 +37,15 @@ func TestBuildOpenAndLookupLocator(t *testing.T) {
 	}
 	if builds, err := filepath.Glob(filepath.Join(root, "locator", ".build-*")); err != nil || len(builds) != 0 {
 		t.Fatalf("temporary Locator builds = %v, %v", builds, err)
+	}
+	catalog, err := tailstore.OpenCheckpoint(root, result.TailReference, 7, 9)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer catalog.Close()
+	slot, found, err := catalog.Lookup(1)
+	if err != nil || !found || slot.NextSequence != 2 || slot.LatestSegmentID != locatorID(2) || slot.LatestExtentPackID != result.Pack.PackID {
+		t.Fatalf("streamed Tail Slot = %+v, found=%v, error=%v", slot, found, err)
 	}
 	manifest := format.Manifest{Header: format.ManifestHeader{Generation: 7, LastEntryID: 9}, ArtifactReferences: []format.ArtifactReference{{ArtifactType: format.ArtifactTailCatalog, FormatVersion: format.VersionV1, ArtifactID: locatorID(5), FileSize: 1, Path: "catalog/tail", ContentSHA256: sha256.Sum256([]byte("tail"))}, result.Reference}}
 	for _, descriptor := range descriptors {

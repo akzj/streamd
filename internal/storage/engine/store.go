@@ -827,10 +827,7 @@ func (s *Store) buildProjectionReferences(generation, coveredEntryID uint64, des
 	if err != nil {
 		return projectionBuild{}, err
 	}
-	tailReference, err := s.buildTailReference(tailID, generation, coveredEntryID, descriptors, locatorResult.Roots)
-	if err != nil {
-		return projectionBuild{}, err
-	}
+	tailReference := locatorResult.TailReference
 	registryMappings, err := registry.RebuildMappings(s.root.Path(), descriptors)
 	if err != nil {
 		return projectionBuild{}, err
@@ -841,38 +838,6 @@ func (s *Store) buildProjectionReferences(generation, coveredEntryID uint64, des
 		return projectionBuild{}, err
 	}
 	return projectionBuild{tailReference: tailReference, registryReference: registryReference, locator: locatorResult}, nil
-}
-
-func (s *Store) buildTailReference(tailID format.UUID, generation, coveredEntryID uint64, descriptors []segment.Descriptor, roots map[uint64]locatorstore.Pointer) (format.ArtifactReference, error) {
-	type latestExtent struct {
-		segmentID format.UUID
-		tail      memtable.Tail
-	}
-	latest := make(map[uint64]latestExtent)
-	for _, descriptor := range descriptors {
-		err := segment.VisitDirectories(s.root.Path(), descriptor, func(directory format.StreamDirectoryEntry) error {
-			if directory.RecordCount > math.MaxUint64-directory.FirstSequence {
-				return fmt.Errorf("Stream %d extent Sequence overflows", directory.StreamID)
-			}
-			next := directory.FirstSequence + directory.RecordCount
-			if current, ok := latest[directory.StreamID]; !ok || next > current.tail.NextSequence {
-				latest[directory.StreamID] = latestExtent{segmentID: descriptor.Reference.SegmentID, tail: memtable.Tail{NextSequence: next, NextByteOffset: directory.NextByteOffset, LastRecordedAt: directory.LastRecordedAt, LastEntryID: directory.LastEntryID}}
-			}
-			return nil
-		})
-		if err != nil {
-			return format.ArtifactReference{}, err
-		}
-	}
-	slots := make([]format.TailSlot, 0, len(latest))
-	for streamID, extent := range latest {
-		root, hasRoot := roots[streamID]
-		if !hasRoot {
-			return format.ArtifactReference{}, fmt.Errorf("Stream %d Tail has no matching latest Segment", streamID)
-		}
-		slots = append(slots, format.TailSlot{Generation: 2, Present: true, StreamID: streamID, NextSequence: extent.tail.NextSequence, NextByteOffset: extent.tail.NextByteOffset, LastRecordedAt: extent.tail.LastRecordedAt, LastEntryID: extent.tail.LastEntryID, AppliedEntryID: coveredEntryID, LatestSegmentID: extent.segmentID, LatestExtentPackID: root.PackID, LatestPageOrdinal: root.PageOrdinal})
-	}
-	return tailstore.WriteCheckpoint(s.root.Path(), tailID, generation, coveredEntryID, slots)
 }
 
 func replacedProjectionArtifacts(previous []format.ArtifactReference, oldLocator *locatorstore.Store, replacement projectionBuild) []format.ArtifactReference {
