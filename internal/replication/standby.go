@@ -37,7 +37,7 @@ func (l standbyLog) Append(entries ...[]byte) error {
 	if err := l.log.Append(entries...); err != nil {
 		return err
 	}
-	return l.history.Refresh()
+	return l.history.ObserveActive(l.log)
 }
 
 func (l standbyLog) Sync() error { return l.log.Sync() }

@@ -173,6 +173,48 @@ func (h *History) Refresh() error {
 	return nil
 }
 
+// ObserveActive advances the in-memory History view from an already validated
+// Log without rescanning the active WAL from its first Entry. The caller must
+// invoke it after Log.Append succeeds and before newly appended Entries need to
+// be visible through History.
+func (h *History) ObserveActive(log *Log) error {
+	if log == nil || log.file == nil {
+		return os.ErrClosed
+	}
+	if filepath.Clean(log.root) != filepath.Clean(h.root) {
+		return fmt.Errorf("active WAL belongs to another data root")
+	}
+	active := historyFile{
+		path:       filepath.Join(h.root, "wal", log.pointer.FileName),
+		name:       log.pointer.FileName,
+		first:      log.scan.Header.FirstEntryID,
+		count:      log.scan.EntryCount,
+		last:       log.scan.LastEntryID,
+		lastCRC:    log.scan.LastEntryCRC32C,
+		firstPrev:  log.scan.FirstEntryPreviousCRC32C,
+		contentEnd: log.scan.LastGoodOffset,
+		size:       log.scan.LastGoodOffset,
+	}
+	if active.first != log.pointer.FirstEntryID || log.scan.Header.FileID != log.pointer.FileID {
+		return fmt.Errorf("WAL-CURRENT does not match active WAL")
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if len(h.files) == 0 || h.files[len(h.files)-1].name != active.name || h.files[len(h.files)-1].sealed {
+		return fmt.Errorf("History active WAL does not match Log")
+	}
+	previous := h.files[len(h.files)-1]
+	if active.count < previous.count || active.contentEnd < previous.contentEnd {
+		return fmt.Errorf("active WAL regressed while updating History")
+	}
+	if previous.count > 0 && (active.first != previous.first || active.firstPrev != previous.firstPrev) {
+		return fmt.Errorf("active WAL prefix changed while updating History")
+	}
+	h.files[len(h.files)-1] = active
+	return nil
+}
+
 func (h *History) Bounds() (earliest, next uint64, present bool) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()

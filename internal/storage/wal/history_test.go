@@ -125,6 +125,35 @@ func TestHistoryPinAndRefresh(t *testing.T) {
 	}
 }
 
+func TestHistoryObserveActiveAdvancesWithoutRefresh(t *testing.T) {
+	root, err := fsutil.OpenRoot(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	log, err := Create(root.Path(), 0, 1, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer log.Close()
+	history, err := OpenHistory(root.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, entries := appendHistoryEntries(t, log, 0, 3, 0, 1)
+	if err = history.ObserveActive(log); err != nil {
+		t.Fatal(err)
+	}
+	earliest, next, present := history.Bounds()
+	if !present || earliest != 0 || next != 3 {
+		t.Fatalf("bounds = %d..%d, present = %v", earliest, next, present)
+	}
+	encoded, entry, err := history.EntryAt(2)
+	if err != nil || entry.EntryID != 2 || len(encoded) != len(entries[2]) {
+		t.Fatalf("EntryAt = %+v, bytes = %d, error = %v", entry, len(encoded), err)
+	}
+}
+
 func TestHistoryBoundsAndCorruptionErrors(t *testing.T) {
 	root, err := fsutil.OpenRoot(t.TempDir())
 	if err != nil {
