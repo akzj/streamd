@@ -3,9 +3,9 @@
 | 属性 | 内容 |
 | --- | --- |
 | 审计性质 | 代码现实版整体架构审计，不是目标架构复述 |
-| 审计基线 | `e4feffe`（`main`，2026-08-18） |
+| 审计基线 | `d0c09cf`（`main`，2026-08-18） |
 | 审计日期 | 2026-08-18 |
-| 相对上次审计新增 | `NO_RECOVERY_SOURCE` 真实恢复验收；Installed Snapshot 与可传输 Package 分离；WAL Pin/GC 并发门禁 |
+| 相对上次审计新增 | Replicated Startup Admin 生命周期；Coordinator 内部重试；`leadership_pending`/`replica_catchup_pending` 真实验收 |
 | 覆盖范围 | API、存储、索引、Checkpoint、Compaction、恢复、Snapshot、WAL GC、Strict HA、并发与运维入口 |
 | 验证边界 | 代码、单元/race/vet、Compose HA；不等同于性能、长稳、磁盘故障或生产部署验收 |
 
@@ -31,11 +31,9 @@ recovery-blocked 状态，输出确定性 Recovery Task。
 3. WAL 已回收且本地 Installed Snapshot Package 不存在时，独立 Compose 场景已经验证节点进入
    `NO_RECOVERY_SOURCE`、不开放公共 gRPC，并在人工创建 replacement Snapshot 后恢复；该路径同样不是
    自动恢复状态机。
-4. Primary 等待暂时不可达的 Standby 时尚未开放 Admin 监听；Standby 找不到当前 Leader 时直接退出，
-   启动阶段的可观测性和重试所有权仍依赖外部编排器。
-5. 启动仍加载全部 Segment Descriptor、Stream Directory 和 Stream Tail；Locator/Registry 的正常查询
+4. 启动仍加载全部 Segment Descriptor、Stream Directory 和 Stream Tail；Locator/Registry 的正常查询
    已有界，但百万 Stream 的启动 RSS/时延目标尚未实现。
-6. 没有生产级 Snapshot/GC 调度、对象存储、容量故障策略、长稳和规模验收。
+5. 没有生产级 Snapshot/GC 调度、对象存储、容量故障策略、长稳和规模验收。
 
 结论：**可以继续开发，当前代码适合作为正确性优先的 V1 工程基线；尚不能宣称生产就绪。后续应按
 跨模块风险推进，而不是继续增加彼此孤立的存储功能。**
@@ -116,6 +114,12 @@ Recovery-blocked Primary
   ├── 保持/监视当前 Lease，不开放公共 gRPC
   ├── loopback Admin: livez / readyz(503) / diagnostics / metrics
   └── deterministic Recovery Task -> 外部运维执行 Snapshot create/install
+
+Replicated node during startup
+  ├── one loopback Admin lifecycle: livez / readyz(503) / diagnostics / metrics
+  ├── leadership_pending: acquire/discover coordinator leadership
+  ├── replica_catchup_pending: Primary waits for configured Standby
+  └── public gRPC remains closed until role-specific readiness
 ```
 
 ## 3. 两种运行模式
@@ -144,11 +148,14 @@ Single 的成功 Append 在本地 WAL `fsync` 后可见。它不承诺节点或�
 
 ```text
 ResumeInstall
+-> open coordinator client
+-> start loopback Admin: starting/leadership_pending
 -> ensure RECOVERING replication state
--> etcd Acquire
+-> retry etcd Acquire for transient unavailability/current Leader
 -> obtain globally increasing revision as Term
 -> Promote local durable suffix
 -> start Lease renewal
+-> Admin: starting/replica_catchup_pending
 -> connect fixed peer with mTLS node identity
 -> query Standby Status
 -> incremental WAL catch-up
@@ -160,8 +167,8 @@ ResumeInstall
 -> bounded Compaction
 ```
 
-Primary 在 Standby 可连接并追到本地 durable watermark 以前不会开放业务服务。Strict 不会自动降级为
-本地确认。
+Primary 在 Standby 可连接并追到本地 durable watermark 以前不会开放业务服务。等待期间同一 Admin
+Listener 保持存活，`readyz=503`；公共 gRPC 仍未绑定。Strict 不会自动降级为本地确认。
 
 ### 3.3 Strict Standby
 
@@ -169,7 +176,9 @@ Primary 在 Standby 可连接并追到本地 durable watermark 以前不会开�
 
 ```text
 ResumeInstall
--> query current leader from etcd
+-> open coordinator client
+-> start loopback Admin: starting/leadership_pending
+-> retry current leader discovery for no-Leader/transient coordinator failure
 -> OpenStandby
 -> recover only through durable committed watermark
 -> open WAL History
@@ -178,7 +187,8 @@ ResumeInstall
 ```
 
 Standby 不注册 `StreamService`，因此当前不能承担读流量。它在内存中维护 replicated committed 数据，
-但这些数据只用于恢复和 Promotion。
+但这些数据只用于恢复和 Promotion。没有当前 Leader 时进程不再退出；它保持 not-ready Admin，直到发现
+Leader 或收到 shutdown。非法 coordinator state 仍立即失败，不会被无限重试隐藏。
 
 ## 4. 数据事实、发布边界与投影
 
@@ -375,6 +385,8 @@ durable 之后，Committer 进入 fatal，结果标记 uncertain。
 
 Compose 使用真实进程、mTLS、三成员 etcd、Toxiproxy 和一次性 Volume，串行验证：
 
+- Standby 无 Leader 时保持进程和 Admin 存活，报告 `leadership_pending`，补齐 Leader 后原进程 ready；
+- Primary 无 Standby 时报告 `replica_catchup_pending` 且公共 gRPC 关闭，补齐 Standby 后原进程 ready；
 - Strict append/read/idempotency 与 Primary/Standby 诊断水位；
 - 一个 etcd member 失效仍可写、失去 quorum 后 Lease Safety Margin 内停止写、恢复后重新服务；
 - Primary `SIGKILL` 后提升 Standby、旧主以 Snapshot 重装后 Failback；
@@ -451,6 +463,7 @@ Catch-up 的跨进程竞争；同一 `wal.History` 内部的 Pin/Collect 由 mut
 | Strict 双 WAL Append | Implemented | 两端 durable 后成功；不自动降级 |
 | 数据副本拓扑 | Bounded | 固定 1 Primary + 1 Standby；静态 Peer；不支持多 Standby/数据 quorum |
 | etcd Term/Lease/Fencing | Implemented | Revision Term、Lease value/ModRevision/LeaseID 校验、Safety Margin |
+| Replicated Startup Admin | Implemented | 单一 Admin 跨 starting/recovery/ready；暂态 Coordinator/Peer 等待不开放公共 gRPC |
 | 增量 WAL Catch-up/Pin | Implemented | Primary 开放业务监听前追赶；传输期文件 Pin；离线 GC 由数据根锁互斥 |
 | Promotion | Implemented | 新 Term 下验证并提交本地完整 durable Batch suffix |
 | Snapshot 格式/校验/原子安装 | Implemented | 安装 Journal、Crash Resume、角色与 committed boundary 校验；新 WAL 发布后清除被替换历史 |
@@ -489,6 +502,9 @@ Catch-up 的跨进程竞争；同一 `wal.History` 内部的 Pin/Collect 由 mut
    replacement Snapshot 完成恢复。
 7. **Catch-up Pin 与 WAL GC 竞争**：离线 GC 与在线节点由数据根锁互斥；同一 History 内 Pin/Collect
    并发测试验证被 Pin 文件不会删除且操作不死锁。
+8. **启动阶段管理面不连续**：Replicated 节点在 Coordinator/Peer 等待前启动同一 loopback Admin；
+   transient/no-Leader 由进程内重试，结构化 reason 和 Compose 场景证明公共 gRPC 保持关闭并可原进程
+   转入 ready。
 
 这些边界不得为了自动化或缩短 RTO 而放宽。
 
@@ -512,29 +528,24 @@ Catch-up 的跨进程竞争；同一 `wal.History` 内部的 Pin/Collect 由 mut
 任务没有持久记录、claim/ack、重试状态或自动执行器。相同事实通过 hash 得到稳定 ID，但进程重启获得
 新 Term 后会形成新任务。当前 Runbook 必须重新读取诊断并核对事实，不能把旧 `task_id` 当授权令牌。
 
-#### P1-2 启动阶段管理面不连续
-
-Primary 对 Standby 的 transport unavailable 会在开放 Admin 前循环重试；Standby 无当前 Leader 时直接
-退出。恢复协议错误已有 Admin-only 状态，但普通启动等待没有 `/livez`、`readyz` 或结构化原因。需要决定
-由进程内 starting diagnostics 还是外部编排器负责重试，不能两边都隐含负责。
-
-#### P1-3 全量 Descriptor/Directory/Tail 常驻
+#### P1-2 全量 Descriptor/Directory/Tail 常驻
 
 Recovery 构造全部 `[]segment.Descriptor`、每 Stream Extent 列表和 MemTable Tail，Read Store 又持有
 Descriptor 副本。Locator 只优化正常冷读定位，不降低启动扫描和常驻元数据。该问题会线性放大启动时间
 与 RSS，是百万 Stream 目标的核心阻塞。
 
-#### P1-4 后台 Maintenance 失败策略不完整
+#### P1-3 后台 Maintenance 失败策略不完整
 
 周期 Checkpoint、Replication State Checkpoint 和 Compaction 失败主要记录日志。Fatal Commit 会停止写，
 但持续非 fatal 失败没有统一退避、failure budget、readiness 降级或容量预测，可能直到磁盘耗尽才硬失败。
 
-#### P1-5 Node Runtime 生命周期重复
+#### P1-4 Node Runtime 生命周期仍未完全统一
 
-Single、Primary、Standby 分别管理 Listener、Admin、后台 ticker 和 shutdown。`ResumeInstall` 曾经因此
-发生行为漂移。可以抽取显式生命周期骨架，但角色、Durability 和恢复判断必须继续保留在强类型边界。
+Primary、Standby 和 recovery-blocked 已共享 Replicated Admin Runtime 与诊断 Provider 切换，但 Single
+仍独立管理 Admin，三种角色也分别管理 gRPC、后台 ticker 和 storage shutdown。后续抽取必须基于实际
+重复继续收敛，不能为了形式统一移动角色、Durability 和恢复判断的强类型边界。
 
-#### P1-6 Replication State 是持久下界而非实时真值
+#### P1-5 Replication State 是持久下界而非实时真值
 
 State 周期落盘是避免每次 Group Commit 增加 metadata fsync 的有意取舍。Promotion、Snapshot、WAL GC
 和诊断必须结合物理 WAL；任何新模块都不能把 State watermark 当作每次提交后的精确实时值。
@@ -565,26 +576,22 @@ State 周期落盘是避免每次 Group Commit 增加 metadata fsync 的有意�
 
 1. Recovery Task 是否只作为诊断契约，还是要发展为持久、可 claim/ack 的控制面资源；
 2. 在线 Snapshot 的触发者是独立运维控制面、受认证 Admin RPC，还是仅保留停机工具；
-3. 启动阶段 Admin 生命周期由节点统一提供，还是明确交给进程管理器重启并接受诊断空窗；
-4. 有界启动实现是否允许在投影损坏时牺牲启动速度进行全扫描，或要求独立修复工具；
-5. 文档如何发布 `Implemented / Accepted Design / Proposal` 状态以及格式兼容版本。
+3. 有界启动实现是否允许在投影损坏时牺牲启动速度进行全扫描，或要求独立修复工具；
+4. 文档如何发布 `Implemented / Accepted Design / Proposal` 状态以及格式兼容版本。
 
 ## 11. 后续开发门禁与建议顺序
 
 建议按以下顺序推进，每项单独提交并重新做整体审计：
 
-恢复证据阶段已经完成 `LOG_DIVERGED`、`NO_RECOVERY_SOURCE` 和 WAL Pin/GC 边界门禁。下一轮从以下
-顺序继续：
+恢复证据与 Replicated 启动可观测性阶段已经完成。下一轮从以下顺序继续：
 
-1. **统一启动可观测性**：先定义 starting/recovery-blocked Admin 生命周期，再抽取最小 Node Runtime
-   骨架；不改变角色和提交语义。
-2. **定义 Maintenance failure policy**：把连续 Checkpoint/Compaction/State 失败映射到稳定诊断、告警
+1. **定义 Maintenance failure policy**：把连续 Checkpoint/Compaction/State 失败映射到稳定诊断、告警
    和退避，补磁盘压力测试。
-3. **实现有界启动元数据**：按 Segment/Stream 规模设计 Descriptor/Directory/Tail 的分页或分层索引，
+2. **实现有界启动元数据**：按 Segment/Stream 规模设计 Descriptor/Directory/Tail 的分页或分层索引，
    保留投影损坏时的明确恢复路径。
-4. **接入受控 Snapshot/GC 自动化**：只有在所有权、认证、幂等任务和 Pin 生命周期冻结后，才接入
+3. **接入受控 Snapshot/GC 自动化**：只有在所有权、认证、幂等任务和 Pin 生命周期冻结后，才接入
    online Snapshot、归档和 GC 调度。
-5. **执行生产候选验收**：规模 benchmark、长稳、磁盘故障、etcd member replacement、升级/回滚和
+4. **执行生产候选验收**：规模 benchmark、长稳、磁盘故障、etcd member replacement、升级/回滚和
    Restore Drill；证据达标后再讨论生产部署和 Dashboard。
 
 每个阶段完成条件：
@@ -600,7 +607,7 @@ State 周期落盘是避免每次 Group Commit 增加 metadata fsync 的有意�
 
 | 主题 | 主要代码 |
 | --- | --- |
-| Single/HA 编排 | `internal/node/node.go`, `internal/node/ha.go` |
+| Single/HA 编排 | `internal/node/node.go`, `internal/node/ha.go`, `internal/node/admin_runtime.go` |
 | API 与限流/RBAC | `internal/service/server.go`, `internal/access/` |
 | Engine 与锁 | `internal/storage/engine/store.go` |
 | Group Commit | `internal/storage/commit/commit.go` |
