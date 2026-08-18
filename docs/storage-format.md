@@ -1086,8 +1086,9 @@ Registry Entry 之后追加通用 Artifact Footer。Registry Snapshot 只包含 
 进入有界 LRU，不整体反序列化 Snapshot。每个 Block 最多 256 Entry。Manifest Checkpoint 内部
 Registry Stream 的 Record 数必须等于 Snapshot `entry_count`，Builder 还要求 Sequence `N` 的
 `assigned_stream_id == N + 1`；投影损坏时以 Registry Stream 为事实重建，不能从 Snapshot 单独
-恢复或重新分配 StreamID。当前 Builder 仍依次构造完整 `[]Mapping`、`[]RegistryEntry` 和编码缓冲；
-这是实现峰值，不是格式要求，后续可在保持 V1 字节格式不变的前提下改为外部排序和流式编码。
+恢复或重新分配 StreamID。当前 Builder 以约 4 MiB Entry 分块生成排序 Run，并以 fan-in 32 做多轮
+外部归并；最终 Run 先扫描计算 Entry/Block 数和 Offset，再扫描写 Block Index，最后扫描写 Entry 与
+Footer。它不构造完整 `[]Mapping`、`[]RegistryEntry` 或编码缓冲，输出仍与 V1 Marshal 字节一致。
 
 ## 11. Snapshot Manifest V1
 

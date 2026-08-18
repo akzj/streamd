@@ -3,9 +3,9 @@
 | 属性 | 内容 |
 | --- | --- |
 | 审计性质 | 代码现实版整体架构审计，不是目标架构复述 |
-| 审计基线 | `3f67cd6`（`main`，2026-08-18） |
+| 审计基线 | `da6f134`（`main`，2026-08-18） |
 | 审计日期 | 2026-08-18 |
-| 相对上次审计新增 | Locator/Tail 投影外部排序与流式构建；Replicated Checkpoint 先持久化 committed state 再发布 Manifest |
+| 相对上次审计新增 | Locator/Tail/Registry 投影外部排序与流式构建；Replicated Checkpoint durable state 顺序保持 |
 | 覆盖范围 | API、存储、索引、Checkpoint、Compaction、恢复、Snapshot、WAL GC、Strict HA、并发与运维入口 |
 | 验证边界 | 代码、单元/race/vet、Compose HA；不等同于性能、长稳、磁盘故障或生产部署验收 |
 
@@ -32,9 +32,8 @@ recovery-blocked 状态，输出确定性 Recovery Task。
    `NO_RECOVERY_SOURCE`、不开放公共 gRPC，并在人工创建 replacement Snapshot 后恢复；该路径同样不是
    自动恢复状态机。
 4. 历史 Stream Directory、Extent、Tail 与 Locator Root 已不再在启动时全量加载或常驻；启动仍全量
-   保留 Manifest Segment Reference 与 Registry Sparse Block Index；Locator/Tail 构建中全部
-   Directory/Extent/Root/Tail 同时常驻的峰值已关闭，
-   Registry Snapshot 构建仍保留多份 O(Stream) 状态，百万 Stream 的 RSS/时延目标尚未验收。
+   保留 Manifest Segment Reference 与 Registry Sparse Block Index；Locator/Tail/Registry 构建中的
+   全量 Stream 投影常驻峰值已关闭，但百万 Stream 的 RSS/时延目标尚未验收。
 5. 没有生产级 Snapshot/GC 调度、对象存储、容量故障策略、长稳和规模验收。
 
 结论：**可以继续开发，当前代码适合作为正确性优先的 V1 工程基线；尚不能宣称生产就绪。后续应按
@@ -283,7 +282,10 @@ Locator/Tail 投影不会再一次性物化全部 Segment Directory。Builder �
 定长临时 Run，以 fan-in 32 多轮外部归并；归并结果按 Stream/Sequence 排序后，每次只编码一个 Locator
 Page，Root 直接顺序落入 Snapshot 输入文件，并在完成每个 Stream 时直接输出 Tail Slot。成功或失败均
 清理 `.build-*`，Locator Pack、Snapshot 与 Tail Catalog 仍使用同一 Generation/Covered Entry ID。
-Registry 路径尚未同样收敛：`RebuildMappings`、`BuildSnapshot` 和完整 Snapshot 编码会形成多份全量状态。
+Registry Builder 按 Sequence 校验内部 Registry Stream，以约 4 MiB Entry 分块生成排序 Run，再以
+fan-in 32 多轮归并；最终 Run 分别顺序扫描以计算布局、写 Sparse Block Index 和写 Entry。输出与旧 V1
+字节格式一致，不再构造完整 `[]Mapping`、`[]RegistryEntry` 或编码缓冲；`RebuildMappings` 仅保留为
+Snapshot 损坏时的事实回退。
 
 ### 5.4 Compaction
 
@@ -540,14 +542,15 @@ Catch-up 的跨进程竞争；同一 `wal.History` 内部的 Pin/Collect 由 mut
 任务没有持久记录、claim/ack、重试状态或自动执行器。相同事实通过 hash 得到稳定 ID，但进程重启获得
 新 Term 后会形成新任务。当前 Runbook 必须重新读取诊断并核对事实，不能把旧 `task_id` 当授权令牌。
 
-#### P1-2 投影构建与剩余稀疏元数据仍未完全有界
+#### P1-2 剩余稀疏元数据仍未完全有界
 
 Recovery 全量 Directory/Extent/Tail/Locator Root 常驻已经关闭：运行视图只保留轻量 Descriptor，Tail
 使用固定 Slot 按需读取和容量 1024 的 LRU，Locator Root 使用固定 Entry 的 `ReadAt` 二分与容量 1024
 的 LRU，WAL/Append 活跃 Stream 才 Seed 到 MemTable。Locator/Tail Builder 已使用外部 Run 和流式输出，
-不再同时保留全部 Directory/Extent/Root/Tail。剩余规模阻塞是 Registry Sparse Block Index 与 Manifest
-Segment Reference 常驻，以及 Registry 构建链上的 `[]Mapping`、`[]RegistryEntry` 和完整编码缓冲。
-它们仍会线性放大百万 Stream 的启动 RSS 或维护峰值。
+不再同时保留全部 Directory/Extent/Root/Tail；Registry Builder 也已使用有界分块、外部 Run 和流式
+Snapshot Writer。剩余规模阻塞是 Registry Sparse Block Index 与 Manifest Segment Reference 常驻，
+它们仍会随 Registry Block 或 Segment 数量线性放大启动 RSS。Compaction Frame 合并受输入字节上限
+约束，但内部仍会物化一次选定输入。
 
 #### P1-3 Node Runtime 生命周期仍未完全统一
 
@@ -598,10 +601,11 @@ WAL GC 和诊断仍必须结合物理 WAL；任何新模块都不能把 State wa
 
 恢复证据与 Replicated 启动可观测性阶段已经完成。下一轮从以下顺序继续：
 
-1. **完成 Registry 流式构建与剩余稀疏元数据**：消除 Registry Snapshot 的 Mapping、Entry、完整编码
-   多份 O(Stream) 状态，并评估 Registry Sparse Index 和 Manifest Segment Reference 上限。
-2. **执行规模与故障验收**：百万 Stream 启动、长稳、磁盘满/短写/fsync 故障、etcd member replacement、
+1. **执行规模与故障验收**：百万 Stream 启动并量化 Registry Sparse Index、Manifest Segment Reference
+   和投影外部 Run 的 RSS/时延/临时磁盘；补磁盘满、短写、fsync 故障、etcd member replacement、
    升级/回滚和 Restore Drill。
+2. **按测量结果收敛剩余元数据**：只有确认 Sparse Index 或 Segment Reference 超出预算，才引入分页、
+   分层 Manifest 或更强的磁盘索引，避免在缺少规模证据时继续增加格式复杂度。
 3. **接入受控 Snapshot/GC 自动化**：只有在所有权、认证、幂等任务和 Pin 生命周期冻结后，才接入
    online Snapshot、归档和 GC 调度。
 4. **补 Maintenance failure policy**：作为可维护性和容量战略预警，把连续失败映射到稳定诊断、告警

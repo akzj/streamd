@@ -39,12 +39,14 @@
 - Checkpoint/Compaction 构建 Locator 时逐个 Segment 访问 Directory，将定长 Extent Record 写入临时
   Run，并以 fan-in 32 做多轮外部归并；最终每次只构造一个 Locator Page，Root 顺序写入临时文件，
   Tail Slot 由同一排序 Extent 流按 Stream 直接生成，不再保留全部 Directory、Extent、Root 或 Tail map。
+- Registry Builder 按 Sequence 扫描内部 Registry Stream，以约 4 MiB Entry 分块生成排序 Run，并以
+  fan-in 32 外部归并；最终 Run 通过布局、Sparse Block Index、Entry 三次顺序扫描生成 V1 Snapshot，
+  不再构造完整 `[]Mapping`、`[]RegistryEntry` 或文件编码缓冲。
 
 当前仍是过渡实现：历史 Directory、Extent、Tail 和 Locator Root 的启动常驻问题已经关闭，但 Manifest
 Segment Reference 与 Registry Sparse Block Index 仍分别随 Segment 和 Registry Block 数量增长；
-Checkpoint/Compaction 的 Locator/Tail Builder 已改为外部排序和流式输出，主要维护期峰值转移到 Registry：
-`RebuildMappings []Mapping`、`BuildSnapshot []RegistryEntry` 和 `MarshalRegistrySnapshot` 完整编码会在同一
-构建链上形成多份 O(Stream) 状态。Compaction 合并 Frame 虽受输入字节上限约束，也尚非完全流式。
+Checkpoint/Compaction 的 Locator、Tail 与 Registry Builder 均已改为外部排序或流式输出，不再聚合
+当前 Generation 的全部 Stream 投影。Compaction 合并 Frame 虽受输入字节上限约束，也尚非完全流式。
 TinyLFU Admission、Segmented LRU、Cache Shard 和 Skip Pointer 生成尚未接入运行时；当前 Builder 只生成
 Previous Pointer。因此已经满足“历史 Extent/Root 不常驻”的结构性要求，但尚未完成百万 Stream 启动
 RSS/时延及投影构建峰值内存验收。
@@ -424,4 +426,4 @@ Cache Entry 必须实现 `estimated_bytes`，包括 Slice Capacity、Map Overhea
 首次 Append 能按需恢复准确 Tail、Tail Cache 保持配置容量，以及 4097 个 Locator Root 不在 Open 时
 物化、首中末/不存在键磁盘二分、Root CRC/顺序延迟校验、Root LRU 容量和换代 FD 关闭。百万 Stream
 启动仍未验收；剩余结构性常驻项是 Registry Sparse Block Index 与 Manifest Segment Reference，维护期
-主要剩余 Registry Snapshot 多份全量状态和受输入字节限制但非完全流式的 Compaction Frame 合并。
+主要剩余受输入字节限制但非完全流式的 Compaction Frame 合并。
