@@ -3,9 +3,9 @@
 | 属性 | 内容 |
 | --- | --- |
 | 审计性质 | 代码现实版整体架构审计，不是目标架构复述 |
-| 审计基线 | `d2988ca`（`main`，2026-08-18） |
+| 审计基线 | `c705a86`（`main`，2026-08-18） |
 | 审计日期 | 2026-08-18 |
-| 相对上次审计新增 | Locator Root 磁盘二分与容量 1024 LRU；Snapshot FD 换代所有权；Root 损坏延迟校验与 Segment 回退 |
+| 相对上次审计新增 | Locator Root 有界加载；Snapshot FD 换代所有权；Replicated Checkpoint 先持久化 committed state 再发布 Manifest |
 | 覆盖范围 | API、存储、索引、Checkpoint、Compaction、恢复、Snapshot、WAL GC、Strict HA、并发与运维入口 |
 | 验证边界 | 代码、单元/race/vet、Compose HA；不等同于性能、长稳、磁盘故障或生产部署验收 |
 
@@ -260,6 +260,7 @@ ResolveTime 当前对 Sequence 范围做二分，每个探测点再走上述 Rec
 maintenanceMu
 -> Engine mu
 -> Committer Barrier
+-> Strict HA: persist Replication State committed/applied floor
 -> snapshot active MemTable
 -> close current Committer
 -> seal/rotate WAL
@@ -505,6 +506,9 @@ Catch-up 的跨进程竞争；同一 `wal.History` 内部的 Pin/Collect 由 mut
 8. **启动阶段管理面不连续**：Replicated 节点在 Coordinator/Peer 等待前启动同一 loopback Admin；
    transient/no-Leader 由进程内重试，结构化 reason 和 Compose 场景证明公共 gRPC 保持关闭并可原进程
    转入 ready。
+9. **Manifest checkpoint 超前于 durable committed state**：Strict Primary 的周期 Checkpoint 在同一 Engine
+   临界区先 Barrier 并持久化 Replication State，再发布可能覆盖相同 Entry 的 Manifest；Crash-point
+   测试保证进程在 Manifest 发布后立即失败时，durable committed/applied 水位仍不落后于 Manifest。
 
 这些边界不得为了自动化或缩短 RTO 而放宽。
 
@@ -544,8 +548,9 @@ Primary、Standby 和 recovery-blocked 已共享 Replicated Admin Runtime 与诊
 
 #### P1-4 Replication State 是持久下界而非实时真值
 
-State 周期落盘是避免每次 Group Commit 增加 metadata fsync 的有意取舍。Promotion、Snapshot、WAL GC
-和诊断必须结合物理 WAL；任何新模块都不能把 State watermark 当作每次提交后的精确实时值。
+State 周期落盘是避免每次 Group Commit 增加 metadata fsync 的有意取舍；但 Strict storage checkpoint
+必须在同一 Engine 临界区先发布覆盖该 Manifest 的 committed/applied State 下界。Promotion、Snapshot、
+WAL GC 和诊断仍必须结合物理 WAL；任何新模块都不能把 State watermark 当作每次提交后的精确实时值。
 
 ### 9.4 P2：性能与运维成熟度
 

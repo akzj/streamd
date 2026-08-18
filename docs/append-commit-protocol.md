@@ -307,6 +307,11 @@ V1 不为每次 Group Commit 再执行一次独立 Metadata WAL `fsync`。Replic
 - REPLICATED_STRICT：与 Standby 对账，保留双方一致的 durable 前缀；Promotion 按复制协议保留合法 durable suffix；
 - 已持久化的旧 Commit Checkpoint 是下界，不是唯一真值。
 
+周期 storage checkpoint 不能把这个“允许滞后”的规则带入 Manifest 边界。Strict Primary 在 Barrier 后、
+发布新 Manifest 前，必须先持久化不低于待 checkpoint Entry 的 Committed/Applied State；两步由同一个
+Engine 锁区间串行化。这样即使在 Manifest 发布后立即崩溃，节点作为 Standby 或 former Primary 重开时，
+也不会看到 Manifest checkpoint 超前于 durable committed watermark。
+
 该规则避免数据 WAL `fsync` 后再进行第二次元数据 `fsync`，同时允许未收到客户端响应的写入在恢复后存在。
 
 ## 12. 响应语义

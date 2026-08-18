@@ -1238,7 +1238,12 @@ State Checkpoint 保存主备协议定义的：
 - 每个可选水位的 `has_value` Flag；
 - Generation、前一 State SHA-256、自身 CRC/SHA-256。
 
-它使用与 Manifest 相同的“新文件 + CURRENT 指针”发布方式，禁止原地覆盖。V1 不为每个 Group Commit 增加独立 Metadata WAL 同步，而是周期生成 State Checkpoint，并按 Append Commit Protocol 的 durable suffix 规则恢复；State Checkpoint 是下界，不能要求修改已发布 Segment。
+它使用与 Manifest 相同的“新文件 + CURRENT 指针”发布方式，禁止原地覆盖。V1 不为每个 Group Commit
+增加独立 Metadata WAL 同步，而是周期生成 State Checkpoint，并按 Append Commit Protocol 的 durable
+suffix 规则恢复；State Checkpoint 是下界，不能要求修改已发布 Segment。Strict Primary 发布新的
+storage Manifest checkpoint 时例外要求顺序屏障：在同一 Engine 临界区先持久化覆盖待发布 Entry 的
+Committed/Applied State，再发布 Manifest，禁止出现 Manifest checkpoint 超前于 durable committed
+watermark 的崩溃状态。
 
 V1 文件名为：
 
