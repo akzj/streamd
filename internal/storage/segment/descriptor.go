@@ -1,6 +1,7 @@
 package segment
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -124,6 +125,33 @@ func MaterializeDescriptors(root string, descriptors []Descriptor) ([]Descriptor
 		result = append(result, loaded)
 	}
 	return result, nil
+}
+
+// VisitDirectories validates and visits one Segment Directory at a time. A
+// light Descriptor opens only its own Segment for the duration of the visit;
+// callers can scan an arbitrary Manifest without retaining all Directories.
+func VisitDirectories(root string, descriptor Descriptor, visit func(format.StreamDirectoryEntry) error) error {
+	if visit == nil {
+		return fmt.Errorf("Segment Directory visitor is required")
+	}
+	if descriptor.Directories != nil {
+		for _, directory := range descriptor.Directories {
+			if err := visit(directory); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	reader, err := OpenReference(root, descriptor.Reference)
+	if err != nil {
+		return err
+	}
+	for _, directory := range reader.Directories {
+		if err = visit(directory); err != nil {
+			return errors.Join(err, reader.Close())
+		}
+	}
+	return reader.Close()
 }
 
 func LightDescriptors(descriptors []Descriptor) []Descriptor {

@@ -18,21 +18,14 @@ type registryExtent struct {
 func RebuildMappings(root string, descriptors []segment.Descriptor) ([]Mapping, error) {
 	var extents []registryExtent
 	for _, descriptor := range descriptors {
-		directories := descriptor.Directories
-		if directories == nil {
-			reader, err := segment.OpenReference(root, descriptor.Reference)
-			if err != nil {
-				return nil, err
-			}
-			directories = append([]format.StreamDirectoryEntry(nil), reader.Directories...)
-			if err = reader.Close(); err != nil {
-				return nil, err
-			}
-		}
-		for _, directory := range directories {
+		err := segment.VisitDirectories(root, descriptor, func(directory format.StreamDirectoryEntry) error {
 			if directory.StreamID == RegistryStreamID {
 				extents = append(extents, registryExtent{descriptor: descriptor, directory: directory})
 			}
+			return nil
+		})
+		if err != nil {
+			return nil, err
 		}
 	}
 	slices.SortFunc(extents, func(a, b registryExtent) int {

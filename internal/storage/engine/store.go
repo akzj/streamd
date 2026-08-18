@@ -586,10 +586,6 @@ func (s *Store) checkpointLocked(states *replicationstate.Store) (format.Manifes
 			return nil, fmt.Errorf("published Manifest Segment set is inconsistent")
 		}
 		var buildErr error
-		descriptors, buildErr = segment.MaterializeDescriptors(s.root.Path(), descriptors)
-		if buildErr != nil {
-			return nil, buildErr
-		}
 		projections, buildErr = s.buildProjectionReferences(generation, coveredEntryID, descriptors)
 		if buildErr != nil {
 			return nil, buildErr
@@ -725,10 +721,6 @@ func (s *Store) Compact(options CompactionOptions) (CompactionResult, error) {
 			descriptors = append(descriptors, descriptor)
 		}
 		var buildErr error
-		descriptors, buildErr = segment.MaterializeDescriptors(s.root.Path(), descriptors)
-		if buildErr != nil {
-			return nil, buildErr
-		}
 		projections, buildErr = s.buildProjectionReferences(generation, coveredEntryID, descriptors)
 		if buildErr != nil {
 			return nil, buildErr
@@ -858,14 +850,18 @@ func (s *Store) buildTailReference(tailID format.UUID, generation, coveredEntryI
 	}
 	latest := make(map[uint64]latestExtent)
 	for _, descriptor := range descriptors {
-		for _, directory := range descriptor.Directories {
+		err := segment.VisitDirectories(s.root.Path(), descriptor, func(directory format.StreamDirectoryEntry) error {
 			if directory.RecordCount > math.MaxUint64-directory.FirstSequence {
-				return format.ArtifactReference{}, fmt.Errorf("Stream %d extent Sequence overflows", directory.StreamID)
+				return fmt.Errorf("Stream %d extent Sequence overflows", directory.StreamID)
 			}
 			next := directory.FirstSequence + directory.RecordCount
 			if current, ok := latest[directory.StreamID]; !ok || next > current.tail.NextSequence {
 				latest[directory.StreamID] = latestExtent{segmentID: descriptor.Reference.SegmentID, tail: memtable.Tail{NextSequence: next, NextByteOffset: directory.NextByteOffset, LastRecordedAt: directory.LastRecordedAt, LastEntryID: directory.LastEntryID}}
 			}
+			return nil
+		})
+		if err != nil {
+			return format.ArtifactReference{}, err
 		}
 	}
 	slots := make([]format.TailSlot, 0, len(latest))

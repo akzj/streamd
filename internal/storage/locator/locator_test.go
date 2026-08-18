@@ -22,9 +22,20 @@ func TestBuildOpenAndLookupLocator(t *testing.T) {
 		writeLocatorSegment(t, root, locatorID(1), 0, 10),
 		writeLocatorSegment(t, root, locatorID(2), 1, 20),
 	}
-	result, err := BuildCheckpoint(root, locatorID(3), locatorID(4), locatorID(5), 7, 9, descriptors)
+	result, err := BuildCheckpoint(root, locatorID(3), locatorID(4), locatorID(5), 7, 9, segment.LightDescriptors(descriptors))
 	if err != nil {
 		t.Fatal(err)
+	}
+	snapshotBytes, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(result.Reference.Path)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := format.UnmarshalLocatorSnapshot(snapshotBytes)
+	if err != nil || len(snapshot.Roots) != 1 || len(snapshot.Packs) != 1 {
+		t.Fatalf("streamed Locator Snapshot = %+v, %v", snapshot.Header, err)
+	}
+	if builds, err := filepath.Glob(filepath.Join(root, "locator", ".build-*")); err != nil || len(builds) != 0 {
+		t.Fatalf("temporary Locator builds = %v, %v", builds, err)
 	}
 	manifest := format.Manifest{Header: format.ManifestHeader{Generation: 7, LastEntryID: 9}, ArtifactReferences: []format.ArtifactReference{{ArtifactType: format.ArtifactTailCatalog, FormatVersion: format.VersionV1, ArtifactID: locatorID(5), FileSize: 1, Path: "catalog/tail", ContentSHA256: sha256.Sum256([]byte("tail"))}, result.Reference}}
 	for _, descriptor := range descriptors {
@@ -45,6 +56,21 @@ func TestBuildOpenAndLookupLocator(t *testing.T) {
 	}
 	if store.CacheLen() != 1 {
 		t.Fatalf("Page Cache length = %d", store.CacheLen())
+	}
+}
+
+func TestBuildCheckpointCleansExternalRunsAfterValidationFailure(t *testing.T) {
+	root := t.TempDir()
+	descriptors := []segment.Descriptor{
+		{Reference: format.SegmentReference{SegmentID: locatorID(1)}, Directories: []format.StreamDirectoryEntry{{StreamID: 1, FirstSequence: 0, RecordCount: 1, NextByteOffset: 1}}},
+		{Reference: format.SegmentReference{SegmentID: locatorID(2)}, Directories: []format.StreamDirectoryEntry{{StreamID: 1, FirstSequence: 2, RecordCount: 1, FirstByteOffset: 2, NextByteOffset: 3}}},
+	}
+	if _, err := BuildCheckpoint(root, locatorID(3), locatorID(4), locatorID(5), 7, 9, descriptors); err == nil {
+		t.Fatal("Locator accepted discontinuous external run")
+	}
+	builds, err := filepath.Glob(filepath.Join(root, "locator", ".build-*"))
+	if err != nil || len(builds) != 0 {
+		t.Fatalf("temporary Locator builds = %v, %v", builds, err)
 	}
 }
 
