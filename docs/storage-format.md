@@ -976,6 +976,9 @@ Previous Pointer 链，暂不生成 Skip Pointer。Root Entry 固定宽度并严
 Header、Pack Reference 和 Footer，记录 Root 区间；查询按 StreamID 使用 `ReadAt` 二分并将正命中放入
 容量 1024 的 LRU，不全量物化 Root。每次磁盘读取校验 Entry CRC、Pack/Page 边界和相邻顺序；Root
 或 Page 损坏时回退当前 Manifest 的 Segment Directory。Page Metadata 使用容量 256 的 LRU。
+Builder 每次只打开并访问一个 Segment Directory，将定长 Extent Record 写入临时 Run，再以 fan-in 32
+多轮外部归并。排序结果每次只构造一个 Page；Root 顺序写入 Snapshot 输入文件，完成每个 Stream 时从
+最后一个 Extent 直接生成 Tail Slot。因此构建期不同时物化全部 Directory、Extent、Root 或 Tail map。
 Snapshot/Pin/Scrub/Retirement 必须沿 Locator Snapshot 显式遍历 Pack，因为 Pack 不是 Manifest 的直接
 Artifact Reference；Generation 换代必须关闭旧 Locator Snapshot Reader 后才能退休旧 Artifact。
 
@@ -1083,7 +1086,8 @@ Registry Entry 之后追加通用 Artifact Footer。Registry Snapshot 只包含 
 进入有界 LRU，不整体反序列化 Snapshot。每个 Block 最多 256 Entry。Manifest Checkpoint 内部
 Registry Stream 的 Record 数必须等于 Snapshot `entry_count`，Builder 还要求 Sequence `N` 的
 `assigned_stream_id == N + 1`；投影损坏时以 Registry Stream 为事实重建，不能从 Snapshot 单独
-恢复或重新分配 StreamID。
+恢复或重新分配 StreamID。当前 Builder 仍依次构造完整 `[]Mapping`、`[]RegistryEntry` 和编码缓冲；
+这是实现峰值，不是格式要求，后续可在保持 V1 字节格式不变的前提下改为外部排序和流式编码。
 
 ## 11. Snapshot Manifest V1
 
