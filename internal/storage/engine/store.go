@@ -21,6 +21,7 @@ import (
 	"github.com/akzj/streamd/internal/storage/lifecycle"
 	locatorstore "github.com/akzj/streamd/internal/storage/locator"
 	"github.com/akzj/streamd/internal/storage/memtable"
+	"github.com/akzj/streamd/internal/storage/projection"
 	readstore "github.com/akzj/streamd/internal/storage/read"
 	"github.com/akzj/streamd/internal/storage/recovery"
 	"github.com/akzj/streamd/internal/storage/registry"
@@ -642,7 +643,7 @@ func (s *Store) checkpointLocked(states *replicationstate.Store) (format.Manifes
 		existing[descriptor.Reference.SegmentID] = true
 	}
 	var descriptors []segment.Descriptor
-	var projections projectionBuild
+	var projections projection.Build
 	published, err := s.lifecycle.PublishFlushWithArtifacts(flush, lastEntryID, lastCRC, func(generation uint64, references []format.SegmentReference, coveredEntryID uint64) ([]format.ArtifactReference, error) {
 		descriptors = append([]segment.Descriptor(nil), s.state.Segments...)
 		for _, reference := range references {
@@ -659,11 +660,11 @@ func (s *Store) checkpointLocked(states *replicationstate.Store) (format.Manifes
 			return nil, fmt.Errorf("published Manifest Segment set is inconsistent")
 		}
 		var buildErr error
-		projections, buildErr = s.buildProjectionReferences(generation, coveredEntryID, descriptors)
+		projections, buildErr = projection.BuildReferences(s.root.Path(), generation, coveredEntryID, s.now().UnixNano(), descriptors)
 		if buildErr != nil {
 			return nil, buildErr
 		}
-		return []format.ArtifactReference{projections.tailReference, projections.locator.Reference, projections.registryReference}, nil
+		return []format.ArtifactReference{projections.TailReference, projections.Locator.Reference, projections.RegistryReference}, nil
 	})
 	if err != nil {
 		s.setFatal(err)
@@ -675,7 +676,7 @@ func (s *Store) checkpointLocked(states *replicationstate.Store) (format.Manifes
 			return format.Manifest{}, false, err
 		}
 	}
-	nextTailCatalog, err := tailstore.OpenCheckpoint(s.root.Path(), projections.tailReference, published.Header.Generation, published.Header.LastEntryID)
+	nextTailCatalog, err := tailstore.OpenCheckpoint(s.root.Path(), projections.TailReference, published.Header.Generation, published.Header.LastEntryID)
 	if err != nil {
 		s.setFatal(err)
 		return format.Manifest{}, false, err
@@ -686,7 +687,7 @@ func (s *Store) checkpointLocked(states *replicationstate.Store) (format.Manifes
 		s.setFatal(err)
 		return format.Manifest{}, false, err
 	}
-	nextRegistryStore, err := registry.OpenCheckpoint(s.root.Path(), projections.registryReference, published.Header.LastEntryID, 64)
+	nextRegistryStore, err := registry.OpenCheckpoint(s.root.Path(), projections.RegistryReference, published.Header.LastEntryID, 64)
 	if err != nil {
 		nextTailCatalog.Close()
 		nextLocator.Close()
@@ -698,7 +699,7 @@ func (s *Store) checkpointLocked(states *replicationstate.Store) (format.Manifes
 	nextRegistry.SetFallback(func() ([]registry.Mapping, error) {
 		return registry.RebuildMappings(s.root.Path(), fallbackDescriptors)
 	})
-	retiredArtifacts := replacedProjectionArtifacts(previous.ArtifactReferences, s.state.Locator, projections)
+	retiredArtifacts := projection.ReplacedArtifacts(previous.ArtifactReferences, s.state.Locator, projections)
 	newTable := memtable.New(0)
 	s.viewMu.Lock()
 	oldTable := s.state.MemTable
@@ -782,7 +783,7 @@ func (s *Store) Compact(options CompactionOptions) (CompactionResult, error) {
 	s.viewMu.RUnlock()
 	previous := current
 	var descriptors []segment.Descriptor
-	var projections projectionBuild
+	var projections projection.Build
 	published, retained, err := s.lifecycle.PublishMergeWithArtifacts(ids, func(generation uint64, references []format.SegmentReference, coveredEntryID uint64) ([]format.ArtifactReference, error) {
 		descriptors = make([]segment.Descriptor, 0, len(references))
 		for _, reference := range references {
@@ -797,17 +798,17 @@ func (s *Store) Compact(options CompactionOptions) (CompactionResult, error) {
 			descriptors = append(descriptors, descriptor)
 		}
 		var buildErr error
-		projections, buildErr = s.buildProjectionReferences(generation, coveredEntryID, descriptors)
+		projections, buildErr = projection.BuildReferences(s.root.Path(), generation, coveredEntryID, s.now().UnixNano(), descriptors)
 		if buildErr != nil {
 			return nil, buildErr
 		}
-		return []format.ArtifactReference{projections.tailReference, projections.locator.Reference, projections.registryReference}, nil
+		return []format.ArtifactReference{projections.TailReference, projections.Locator.Reference, projections.RegistryReference}, nil
 	})
 	if err != nil {
 		s.setFatal(err)
 		return CompactionResult{}, err
 	}
-	nextTailCatalog, err := tailstore.OpenCheckpoint(s.root.Path(), projections.tailReference, published.Header.Generation, published.Header.LastEntryID)
+	nextTailCatalog, err := tailstore.OpenCheckpoint(s.root.Path(), projections.TailReference, published.Header.Generation, published.Header.LastEntryID)
 	if err != nil {
 		s.setFatal(err)
 		return CompactionResult{}, err
@@ -818,7 +819,7 @@ func (s *Store) Compact(options CompactionOptions) (CompactionResult, error) {
 		s.setFatal(err)
 		return CompactionResult{}, err
 	}
-	nextRegistryStore, err := registry.OpenCheckpoint(s.root.Path(), projections.registryReference, published.Header.LastEntryID, 64)
+	nextRegistryStore, err := registry.OpenCheckpoint(s.root.Path(), projections.RegistryReference, published.Header.LastEntryID, 64)
 	if err != nil {
 		nextTailCatalog.Close()
 		nextLocator.Close()
@@ -840,7 +841,7 @@ func (s *Store) Compact(options CompactionOptions) (CompactionResult, error) {
 			return CompactionResult{}, err
 		}
 	}
-	retiredArtifacts := replacedProjectionArtifacts(previous.ArtifactReferences, s.state.Locator, projections)
+	retiredArtifacts := projection.ReplacedArtifacts(previous.ArtifactReferences, s.state.Locator, projections)
 	lightDescriptors := segment.LightDescriptors(descriptors)
 	nextTailResolver := tailstore.NewResolver(table, nextTailCatalog, s.root.Path(), lightDescriptors, defaultStreamCacheCapacity)
 	nextReader := readstore.New(table, nextTailResolver, s.root.Path(), published.Header.Generation, lightDescriptors, nextLocator, defaultStreamCacheCapacity, defaultSegmentHandleCapacity)
@@ -874,54 +875,6 @@ func (s *Store) Compact(options CompactionOptions) (CompactionResult, error) {
 		return CompactionResult{}, err
 	}
 	return CompactionResult{Manifest: published, Created: true, InputSegments: len(selected), InputBytes: inputBytes}, nil
-}
-
-type projectionBuild struct {
-	tailReference     format.ArtifactReference
-	registryReference format.ArtifactReference
-	locator           locatorstore.BuildResult
-}
-
-func (s *Store) buildProjectionReferences(generation, coveredEntryID uint64, descriptors []segment.Descriptor) (projectionBuild, error) {
-	tailID, err := locatorstore.NewID()
-	if err != nil {
-		return projectionBuild{}, err
-	}
-	snapshotID, err := locatorstore.NewID()
-	if err != nil {
-		return projectionBuild{}, err
-	}
-	packID, err := locatorstore.NewID()
-	if err != nil {
-		return projectionBuild{}, err
-	}
-	registryID, err := locatorstore.NewID()
-	if err != nil {
-		return projectionBuild{}, err
-	}
-	locatorResult, err := locatorstore.BuildCheckpoint(s.root.Path(), snapshotID, packID, tailID, generation, coveredEntryID, descriptors)
-	if err != nil {
-		return projectionBuild{}, err
-	}
-	tailReference := locatorResult.TailReference
-	registryReference, err := registry.BuildCheckpointFromSegments(s.root.Path(), registryID, coveredEntryID, s.now().UnixNano(), descriptors)
-	if err != nil {
-		return projectionBuild{}, err
-	}
-	return projectionBuild{tailReference: tailReference, registryReference: registryReference, locator: locatorResult}, nil
-}
-
-func replacedProjectionArtifacts(previous []format.ArtifactReference, oldLocator *locatorstore.Store, replacement projectionBuild) []format.ArtifactReference {
-	var retired []format.ArtifactReference
-	for _, old := range previous {
-		if (old.ArtifactType == format.ArtifactTailCatalog && old.ArtifactID != replacement.tailReference.ArtifactID) || (old.ArtifactType == format.ArtifactLocatorSnapshot && old.ArtifactID != replacement.locator.Reference.ArtifactID) || (old.ArtifactType == format.ArtifactRegistrySnapshot && old.ArtifactID != replacement.registryReference.ArtifactID) {
-			retired = append(retired, old)
-		}
-	}
-	if oldLocator != nil {
-		retired = append(retired, oldLocator.PackArtifacts()...)
-	}
-	return retired
 }
 
 func selectCompactionInputs(references []format.SegmentReference, options CompactionOptions) ([]format.SegmentReference, uint64) {
