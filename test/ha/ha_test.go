@@ -580,11 +580,32 @@ func strictMetricsReady(primary, standby map[string]*dto.MetricFamily) bool {
 		!gaugeEquals(primary, "streamd_watermark_entry_id", map[string]string{"stage": "applied"}, primaryCommitted) {
 		return false
 	}
+	localSyncs, ok := counterValue(primary, "streamd_commit_local_sync_total", nil)
+	if !ok || localSyncs <= 0 {
+		return false
+	}
+	replicates, ok := counterValue(primary, "streamd_commit_replicate_total", nil)
+	if !ok || replicates != localSyncs || standby["streamd_commit_groups_total"] != nil {
+		return false
+	}
 	return gaugeEquals(standby, "streamd_watermark_present", map[string]string{"stage": "replicated"}, 0) &&
 		gaugeEquals(standby, "streamd_watermark_entry_id", map[string]string{"stage": "appended"}, primaryCommitted) &&
 		gaugeEquals(standby, "streamd_watermark_entry_id", map[string]string{"stage": "local_durable"}, primaryCommitted) &&
 		gaugeEquals(standby, "streamd_watermark_entry_id", map[string]string{"stage": "committed"}, primaryCommitted) &&
 		gaugeEquals(standby, "streamd_watermark_entry_id", map[string]string{"stage": "applied"}, primaryCommitted)
+}
+
+func counterValue(families map[string]*dto.MetricFamily, name string, labels map[string]string) (float64, bool) {
+	family := families[name]
+	if family == nil {
+		return 0, false
+	}
+	for _, metric := range family.Metric {
+		if metricLabelsMatch(metric.Label, labels) && metric.Counter != nil {
+			return metric.Counter.GetValue(), true
+		}
+	}
+	return 0, false
 }
 
 func gaugeEquals(families map[string]*dto.MetricFamily, name string, labels map[string]string, want float64) bool {
