@@ -20,6 +20,8 @@
 - 每个 Generation 发布 Sealed Locator Pack/Snapshot，Tail Slot 保存最新 Page Pointer；
 - 冷 Sequence Read 通过 Locator Root、Previous Page 链和页内二分定位 Segment，正常路径不再扫描
   全部 Descriptor；
+- Locator Snapshot 启动只保留 Header、Pack Reference、Root 区偏移与数量；固定 40-byte Root Entry
+  通过 `ReadAt` 磁盘二分，正命中进入容量 1024 的 LRU，不再反序列化全部 Stream Root；
 - 默认容量 256 的 Locator Page LRU Cache；Entry 只保存已校验的 Page Metadata，不保存 Payload；
 - Snapshot、Scrub、Pin 和退休引用图均显式包含 Locator Pack；Locator 损坏时回退 Segment
   Descriptor，不能影响事实数据读取。
@@ -36,12 +38,12 @@
   故障路径可能较慢，但常驻内存不再与全部历史 Extent 数量线性增长；
 - Checkpoint/Compaction 构建投影时显式 Materialize Directory，发布后立即切回轻量 Descriptor。
 
-当前仍是过渡实现：历史 Directory、Extent 和 Tail 的启动常驻问题已经关闭，但 Manifest Segment
-Reference、Locator Root 和 Registry Sparse Block Index 仍分别随 Segment、Stream 和 Registry Block
-数量增长；Checkpoint/Compaction 的投影 Builder 也会临时聚合当前 Generation 的全部 Descriptor 与
-Extent。TinyLFU Admission、Segmented LRU、Cache Shard 和 Skip Pointer 生成尚未接入运行时；当前
-Builder 只生成 Previous Pointer。因此已经满足“历史 Extent 不常驻”的结构性要求，但尚未完成百万
-Stream 启动 RSS/时延及投影构建峰值内存验收。
+当前仍是过渡实现：历史 Directory、Extent、Tail 和 Locator Root 的启动常驻问题已经关闭，但 Manifest
+Segment Reference 与 Registry Sparse Block Index 仍分别随 Segment 和 Registry Block 数量增长；
+Checkpoint/Compaction 的投影 Builder 也会临时聚合当前 Generation 的全部 Descriptor、Extent 与 Root。
+TinyLFU Admission、Segmented LRU、Cache Shard 和 Skip Pointer 生成尚未接入运行时；当前 Builder 只生成
+Previous Pointer。因此已经满足“历史 Extent/Root 不常驻”的结构性要求，但尚未完成百万 Stream 启动
+RSS/时延及投影构建峰值内存验收。
 
 ## 1. 查询问题
 
@@ -226,6 +228,16 @@ ExtentPointer {
 
 Tail Slot 指向最新 Page。Page 保存一组连续 Extent、Previous Pointer 和 Skip Pointer。
 
+Locator Snapshot V1 的 Root Entry 固定为 40 bytes，并按 StreamID 严格递增。Runtime 打开 Snapshot 时
+只校验 Header/Footer、读取少量 Pack Reference，再记录 `roots_offset/root_count`；查询用 `ReadAt`
+二分 Root。每个被读取的 Entry 独立校验 CRC、Pack ID 和 Page Ordinal，二分探测点同时校验相邻
+StreamID 顺序。这样不升级 V1 格式，也不让启动 RSS 随 Stream 数线性增长。
+
+正命中 Root 使用容量 1024 的 LRU；负命中不缓存。Root 与 Page Cache 都是可丢投影，清空只影响性能。
+Root 损坏在访问对应二分路径时延迟发现，Read Store 随即回退 Segment Directory。Checkpoint、Compaction
+切换 Generation 时，在 `viewMu` 保护下先替换 Reader/Locator，再关闭旧 Snapshot FD，避免退休文件仍被
+旧投影持有。
+
 ### 8.2 Sequence Lookup
 
 ```text
@@ -265,8 +277,8 @@ PageCacheKey = (pack_id, page_ordinal)
 - Reader RefCount 期间不能淘汰底层 mmap/Buffer；
 - checksum 失败不进入 Cache，并隔离对应 Artifact。
 
-当前 V1 Runtime 的 Locator Page 与 Registry Block 分别使用单容量上限 LRU，并在锁外执行文件
-读取；TinyLFU、分段与分片是后续优化，不属于当前已实现能力。
+当前 V1 Runtime 的 Locator Root、Locator Page 与 Registry Block 分别使用容量 1024/256/64 的 LRU，
+磁盘读取在 Cache Lock 外执行；TinyLFU、分段与分片是后续优化，不属于当前已实现能力。
 
 ## 10. Segment Handle Cache
 
@@ -405,5 +417,7 @@ Cache Entry 必须实现 `estimated_bytes`，包括 Slice Capacity、Map Overhea
 当前已通过任意 Sequence 定位、Page CRC、Previous Page 多页回溯、Registry 多 Block 查找、容量
 1 淘汰、Cache Clear、Generation 切换、Compaction Overlay 保留、Snapshot Pin 和投影损坏回退
 测试。新增测试证明 checkpoint-only Stream 不进入 MemTable、历史 Segment Directory 不在启动时读取、
-首次 Append 能按需恢复准确 Tail，以及 Tail Cache 保持配置容量。百万 Stream 启动仍未验收，因为
-Locator Root 与 Registry Sparse Block Index 尚未分页，Manifest Segment Reference 也仍全量常驻。
+首次 Append 能按需恢复准确 Tail、Tail Cache 保持配置容量，以及 4097 个 Locator Root 不在 Open 时
+物化、首中末/不存在键磁盘二分、Root CRC/顺序延迟校验、Root LRU 容量和换代 FD 关闭。百万 Stream
+启动仍未验收；剩余结构性常驻项是 Registry Sparse Block Index 与 Manifest Segment Reference，维护期
+还有投影 Builder 全量聚合。
