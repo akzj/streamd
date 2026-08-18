@@ -2,10 +2,14 @@ package replication
 
 import (
 	"context"
+	"crypto/sha256"
 	"testing"
+	"time"
 
 	"github.com/akzj/streamd/internal/storage/engine"
 	"github.com/akzj/streamd/internal/storage/format"
+	"github.com/akzj/streamd/internal/storage/replicationstate"
+	"github.com/akzj/streamd/internal/storage/wal"
 )
 
 func TestStandbyStorePersistsStrictApplyAndReopens(t *testing.T) {
@@ -52,5 +56,91 @@ func TestStandbyStorePersistsStrictApplyAndReopens(t *testing.T) {
 	tail, ok := reopened.state.MemTable.Tail(1)
 	if !ok || tail.NextSequence != 1 {
 		t.Fatalf("reopened data Tail = %+v, ok = %v", tail, ok)
+	}
+}
+
+func TestStandbyApplyResolvesCheckpointTailOnDemand(t *testing.T) {
+	standbyNode := format.NodeIdentity{ClusterID: uuid(9), GroupID: uuid(1), NodeID: uuid(3), CreatedAt: 1}
+	primaryNode := format.NodeIdentity{ClusterID: uuid(9), GroupID: uuid(1), NodeID: uuid(2), CreatedAt: 1}
+	root := t.TempDir()
+	seed, err := engine.OpenWithIdentity(root, standbyNode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = seed.Append(context.Background(), engine.AppendRequest{Namespace: "n", Stream: "s", RequestID: []byte("one"), Producer: "test", Records: []engine.InputRecord{{Payload: []byte("one")}}}); err != nil {
+		t.Fatal(err)
+	}
+	readResult, err := seed.Read("n", "s", 0, 1, 0)
+	if err != nil || len(readResult.Records) != 1 {
+		t.Fatalf("seed Read = %+v, %v", readResult, err)
+	}
+	firstFrame, err := format.MarshalRecordFrame(readResult.Records[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, created, checkpointErr := seed.Checkpoint(); checkpointErr != nil || !created {
+		t.Fatalf("Checkpoint created=%v error=%v", created, checkpointErr)
+	}
+	if err = seed.Close(); err != nil {
+		t.Fatal(err)
+	}
+	history, err := wal.OpenHistory(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, checkpointEntry, err := history.EntryAt(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkpoint := format.ReplicationPosition{Present: true, EntryID: checkpointEntry.EntryID, CRC32C: checkpointEntry.CRC32C}
+	states, err := replicationstate.Open(root, standbyNode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = states.Update(time.Unix(1, 0), func(header *format.ReplicationStateHeader) error {
+		header.Term = 1
+		header.Role = format.ReplicationRoleStandby
+		header.Durability = format.ReplicationDurabilityStrict
+		header.HasLeader = true
+		header.LeaderID = primaryNode.NodeID
+		header.LastAppended = checkpoint
+		header.LocalDurable = checkpoint
+		header.Committed = checkpoint
+		header.Applied = checkpoint
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	standby, err := OpenStandby(root, standbyNode, 1, primaryNode.NodeID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer standby.Close()
+	hash := sha256.Sum256([]byte("two"))
+	frame, err := format.MarshalRecordFrame(format.RecordFrame{EntryID: 2, StreamID: 1, Sequence: 1, ByteOffset: uint64(len(firstFrame)), RecordedAt: readResult.Records[0].RecordedAt + 1, BatchCount: 1, RequestHash: hash, RequestID: []byte("two"), Producer: "test", Payload: []byte("two")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := format.MarshalWALEntry(1, checkpointEntry.CRC32C, frame)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry, err := format.UnmarshalWALEntry(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	previous := Position{Valid: true, EntryID: checkpointEntry.EntryID, CRC32C: checkpointEntry.CRC32C}
+	if err = standby.Receiver().Append(AppendEntries{GroupID: standbyNode.GroupID, Term: 1, LeaderID: primaryNode.NodeID, Previous: previous, Entries: [][]byte{encoded}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = standby.Receiver().Barrier(DurabilityBarrier{GroupID: standbyNode.GroupID, Term: 1, LeaderID: primaryNode.NodeID, ThroughEntryID: entry.EntryID}); err != nil {
+		t.Fatal(err)
+	}
+	if err = standby.Receiver().AdvanceCommit(CommitAdvance{GroupID: standbyNode.GroupID, Term: 1, LeaderID: primaryNode.NodeID, CommitEntryID: entry.EntryID}); err != nil {
+		t.Fatal(err)
+	}
+	tail, ok := standby.state.MemTable.Tail(1)
+	if !ok || tail.NextSequence != 2 {
+		t.Fatalf("Standby Tail = %+v, ok = %v", tail, ok)
 	}
 }

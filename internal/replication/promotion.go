@@ -107,6 +107,11 @@ func Promote(dataRoot string, node format.NodeIdentity, grant PromotionGrant) (P
 				}
 				pending = append(pending, entry)
 				if uint32(len(pending)) == entry.BatchCount {
+					if _, found, tailErr := recovered.TailResolver.EnsureActive(pending[0].StreamID); tailErr != nil {
+						return PromotionResult{}, protocolError(ErrLogDiverged, fmt.Sprintf("Promotion suffix cannot resolve Stream tail: %v", tailErr))
+					} else if !found && (pending[0].Sequence != 0 || pending[0].ByteOffset != 0) {
+						return PromotionResult{}, protocolError(ErrLogDiverged, fmt.Sprintf("Promotion suffix Stream %d has no checkpoint Tail", pending[0].StreamID))
+					}
 					if applyErr := recovered.MemTable.ApplyBatch(pending); applyErr != nil {
 						return PromotionResult{}, protocolError(ErrLogDiverged, fmt.Sprintf("Promotion suffix violates Stream tails: %v", applyErr))
 					}

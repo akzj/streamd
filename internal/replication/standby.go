@@ -207,6 +207,11 @@ func (s *StandbyStore) applyEntries(entries []format.WALEntry) error {
 			return fmt.Errorf("Standby Apply received partial Batch")
 		}
 		batch := entries[:count]
+		if _, found, err := s.state.TailResolver.EnsureActive(batch[0].StreamID); err != nil {
+			return err
+		} else if !found && (batch[0].Sequence != 0 || batch[0].ByteOffset != 0) {
+			return fmt.Errorf("Standby WAL Stream %d has no checkpoint Tail", batch[0].StreamID)
+		}
 		if err := s.state.MemTable.ApplyBatch(batch); err != nil {
 			return err
 		}
