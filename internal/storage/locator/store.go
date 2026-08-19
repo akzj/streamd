@@ -3,6 +3,7 @@ package locator
 import (
 	"bytes"
 	"container/list"
+	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -15,22 +16,41 @@ import (
 )
 
 func VerifyPack(root string, pack format.LocatorPackReference) error {
-	data, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(pack.Path)))
+	file, err := os.Open(filepath.Join(root, filepath.FromSlash(pack.Path)))
 	if err != nil {
 		return err
 	}
-	if uint64(len(data)) != pack.FileSize || len(data) < format.SegmentSectionAlignment+format.ArtifactFooterLength {
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return err
+	}
+	if info.Size() < format.SegmentSectionAlignment+format.ArtifactFooterLength || uint64(info.Size()) != pack.FileSize {
 		return fmt.Errorf("Locator Pack size does not match Snapshot")
 	}
-	header, err := format.UnmarshalLocatorPackHeader(data[:format.LocatorPackHeaderLength])
+	headerBytes := make([]byte, format.LocatorPackHeaderLength)
+	if _, err = file.ReadAt(headerBytes, 0); err != nil {
+		return err
+	}
+	header, err := format.UnmarshalLocatorPackHeader(headerBytes)
 	if err != nil || header.ArtifactID != pack.PackID || header.PageCount != pack.PageCount {
 		return fmt.Errorf("Locator Pack Header does not match Snapshot")
 	}
-	footer, err := format.VerifyArtifact(data[:len(data)-format.ArtifactFooterLength], data[len(data)-format.ArtifactFooterLength:], format.ArtifactLocatorPack, pack.PackID)
-	if err != nil {
+	footerBytes := make([]byte, format.ArtifactFooterLength)
+	if _, err = file.ReadAt(footerBytes, info.Size()-format.ArtifactFooterLength); err != nil {
 		return err
 	}
-	if footer.ContentSHA256 != pack.ContentSHA256 {
+	footer, err := format.UnmarshalArtifactFooter(footerBytes)
+	if err != nil || footer.ArtifactType != format.ArtifactLocatorPack || footer.ArtifactID != pack.PackID || footer.FileLength != uint64(info.Size()) || footer.ContentLength != uint64(info.Size())-format.ArtifactFooterLength {
+		return fmt.Errorf("Locator Pack Footer does not match Snapshot")
+	}
+	digest := sha256.New()
+	if _, err = io.CopyBuffer(digest, io.NewSectionReader(file, 0, int64(footer.ContentLength)), make([]byte, 256*1024)); err != nil {
+		return err
+	}
+	var contentSHA256 [sha256.Size]byte
+	copy(contentSHA256[:], digest.Sum(nil))
+	if contentSHA256 != footer.ContentSHA256 || contentSHA256 != pack.ContentSHA256 {
 		return fmt.Errorf("Locator Pack digest does not match Snapshot")
 	}
 	return nil

@@ -67,6 +67,35 @@ func TestBuildOpenAndLookupLocator(t *testing.T) {
 	if store.CacheLen() != 1 {
 		t.Fatalf("Page Cache length = %d", store.CacheLen())
 	}
+	if err = store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err = VerifyPack(root, result.Pack); err != nil {
+		t.Fatalf("verify Locator Pack: %v", err)
+	}
+	packPath := filepath.Join(root, filepath.FromSlash(result.Pack.Path))
+	packFile, err := os.OpenFile(packPath, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	position, err := format.LocatorPagePosition(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byteAtPage := []byte{0}
+	if _, err = packFile.ReadAt(byteAtPage, int64(position)); err != nil {
+		t.Fatal(err)
+	}
+	byteAtPage[0] ^= 0xff
+	if _, err = packFile.WriteAt(byteAtPage, int64(position)); err != nil {
+		t.Fatal(err)
+	}
+	if err = packFile.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err = VerifyPack(root, result.Pack); err == nil {
+		t.Fatal("corrupt Locator Pack passed streamed verification")
+	}
 }
 
 func TestBuildCheckpointCleansExternalRunsAfterValidationFailure(t *testing.T) {
