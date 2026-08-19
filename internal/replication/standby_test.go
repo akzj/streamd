@@ -51,6 +51,13 @@ func TestStandbyStorePersistsStrictApplyAndReopens(t *testing.T) {
 	if tail, ok := standby.state.MemTable.Tail(1); !ok || tail.NextSequence != 2 {
 		t.Fatalf("post-checkpoint active Tail = %+v, ok = %v", tail, ok)
 	}
+	if err = standby.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	compacted, err := standby.Compact(StandbyCompactionOptions{MinSegments: 2, MaxInputSegments: 4, MaxInputBytes: 64 << 20})
+	if err != nil || !compacted.Created || compacted.InputSegments != 2 || compacted.LiveSegments != 1 {
+		t.Fatalf("Standby Compaction = %+v, error = %v", compacted, err)
+	}
 	if err = primary.Close(); err != nil {
 		t.Fatal(err)
 	}

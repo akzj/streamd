@@ -45,6 +45,13 @@ func runStandbyMaintenance(ctx context.Context, config Config, store *replicatio
 					logger.Error("Standby replication checkpoint failed", "error", checkpointErr)
 				} else {
 					controller.checkpointCompleted(now)
+					minSegments, maxInputSegments, maxInputBytes, _ := config.compactionLimits()
+					compacted, compactErr := store.Compact(replication.StandbyCompactionOptions{MinSegments: minSegments, MaxInputSegments: maxInputSegments, MaxInputBytes: maxInputBytes})
+					if compactErr != nil {
+						logger.Error("Standby Segment Compaction failed", "error", compactErr)
+					} else if compacted.Created {
+						logger.Info("Standby Segment Compaction published", "generation", compacted.Generation, "input_segments", compacted.InputSegments, "input_bytes", compacted.InputBytes, "live_segments", compacted.LiveSegments)
+					}
 				}
 			}
 		}

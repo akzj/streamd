@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -41,6 +42,20 @@ type StandbyMaintenanceStats struct {
 	MemTableRecords uint64
 	MemTableBytes   uint64
 	ActiveWALBytes  uint64
+}
+
+type StandbyCompactionOptions struct {
+	MinSegments      int
+	MaxInputSegments int
+	MaxInputBytes    uint64
+}
+
+type StandbyCompactionResult struct {
+	Created       bool
+	Generation    uint64
+	InputSegments int
+	InputBytes    uint64
+	LiveSegments  int
 }
 
 type standbyLog struct {
@@ -187,6 +202,154 @@ func (s *StandbyStore) Checkpoint() error {
 		return fmt.Errorf("Standby Store is closed")
 	}
 	return s.checkpointLocked()
+}
+
+// Compact replaces a bounded adjacent Segment set while Receiver appends keep
+// using the active WAL/MemTable. Only the final projection switch briefly
+// enters the Receiver maintenance boundary.
+func (s *StandbyStore) Compact(options StandbyCompactionOptions) (StandbyCompactionResult, error) {
+	if options.MinSegments < 2 || options.MaxInputSegments < 2 || options.MaxInputBytes == 0 {
+		return StandbyCompactionResult{}, fmt.Errorf("invalid Standby Compaction options")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return StandbyCompactionResult{}, fmt.Errorf("Standby Store is closed")
+	}
+	current, ok := s.state.Manifest.Current()
+	if !ok || len(current.SegmentReferences) < options.MinSegments {
+		return StandbyCompactionResult{Generation: current.Header.Generation, LiveSegments: len(current.SegmentReferences)}, nil
+	}
+	selected, inputBytes := selectStandbyCompactionInputs(current.SegmentReferences, options)
+	if len(selected) < 2 {
+		return StandbyCompactionResult{Generation: current.Header.Generation, LiveSegments: len(current.SegmentReferences)}, nil
+	}
+	ids := make([]format.UUID, len(selected))
+	for i := range selected {
+		ids[i] = selected[i].SegmentID
+	}
+	existing := make(map[format.UUID]segment.Descriptor, len(s.state.Segments))
+	for _, descriptor := range s.state.Segments {
+		existing[descriptor.Reference.SegmentID] = descriptor
+	}
+	previous := current
+	var descriptors []segment.Descriptor
+	var projections projection.Build
+	published, retained, err := s.lifecycle.PublishMergeWithArtifacts(ids, func(generation uint64, references []format.SegmentReference, coveredEntryID uint64) ([]format.ArtifactReference, error) {
+		descriptors = make([]segment.Descriptor, 0, len(references))
+		for _, reference := range references {
+			if descriptor, found := existing[reference.SegmentID]; found {
+				descriptors = append(descriptors, descriptor)
+				continue
+			}
+			descriptor, describeErr := segment.DescribeReference(s.root.Path(), reference)
+			if describeErr != nil {
+				return nil, describeErr
+			}
+			descriptors = append(descriptors, descriptor)
+		}
+		var buildErr error
+		projections, buildErr = projection.BuildReferences(s.root.Path(), generation, coveredEntryID, s.now().UnixNano(), descriptors)
+		if buildErr != nil {
+			return nil, buildErr
+		}
+		return []format.ArtifactReference{projections.TailReference, projections.Locator.Reference, projections.RegistryReference}, nil
+	})
+	if err != nil {
+		return StandbyCompactionResult{}, s.receiver.fail(err)
+	}
+	nextTailCatalog, err := tailstore.OpenCheckpoint(s.root.Path(), projections.TailReference, published.Header.Generation, published.Header.LastEntryID)
+	if err != nil {
+		return StandbyCompactionResult{}, s.receiver.fail(err)
+	}
+	nextLocator, err := locatorstore.Open(s.root.Path(), published, 256)
+	if err != nil {
+		nextTailCatalog.Close()
+		return StandbyCompactionResult{}, s.receiver.fail(err)
+	}
+	nextRegistryStore, err := registry.OpenCheckpoint(s.root.Path(), projections.RegistryReference, published.Header.LastEntryID, 64)
+	if err != nil {
+		nextTailCatalog.Close()
+		nextLocator.Close()
+		return StandbyCompactionResult{}, s.receiver.fail(err)
+	}
+	nextRegistry := registry.NewWithSnapshot(nextRegistryStore)
+	lightDescriptors := segment.LightDescriptors(descriptors)
+	nextRegistry.SetFallback(func() ([]registry.Mapping, error) {
+		return registry.RebuildMappings(s.root.Path(), lightDescriptors)
+	})
+	retiredArtifacts := projection.ReplacedArtifacts(previous.ArtifactReferences, s.state.Locator, projections)
+	var oldTailCatalog *tailstore.Catalog
+	var oldLocator *locatorstore.Store
+	err = s.receiver.maintain(func(ReceiverState) error {
+		for _, mapping := range s.state.Registry.MappingsAfter(published.Header.LastEntryID) {
+			if applyErr := nextRegistry.ApplyMapping(mapping); applyErr != nil {
+				return applyErr
+			}
+		}
+		oldTailCatalog, oldLocator = s.state.TailCatalog, s.state.Locator
+		s.state.Segments = lightDescriptors
+		s.state.TailCatalog = nextTailCatalog
+		s.state.TailResolver = tailstore.NewResolver(s.state.MemTable, nextTailCatalog, s.root.Path(), lightDescriptors, 1024)
+		s.state.Locator = nextLocator
+		s.state.Registry = nextRegistry
+		return nil
+	})
+	if err != nil {
+		nextTailCatalog.Close()
+		nextLocator.Close()
+		return StandbyCompactionResult{}, err
+	}
+	if oldTailCatalog != nil {
+		err = oldTailCatalog.Close()
+	}
+	if oldLocator != nil {
+		err = errors.Join(err, oldLocator.Close())
+	}
+	if err == nil {
+		err = s.lifecycle.Retire(retained)
+	}
+	if err == nil {
+		err = s.lifecycle.RetireArtifacts(retiredArtifacts)
+	}
+	if err != nil {
+		return StandbyCompactionResult{}, s.receiver.fail(err)
+	}
+	return StandbyCompactionResult{Created: true, Generation: published.Header.Generation, InputSegments: len(selected), InputBytes: inputBytes, LiveSegments: len(published.SegmentReferences)}, nil
+}
+
+func selectStandbyCompactionInputs(references []format.SegmentReference, options StandbyCompactionOptions) ([]format.SegmentReference, uint64) {
+	ordered := append([]format.SegmentReference(nil), references...)
+	slices.SortFunc(ordered, func(a, b format.SegmentReference) int {
+		if a.FirstEntryID < b.FirstEntryID {
+			return -1
+		}
+		if a.FirstEntryID > b.FirstEntryID {
+			return 1
+		}
+		return 0
+	})
+	for start := 0; start+1 < len(ordered); start++ {
+		var bytes uint64
+		var selected []format.SegmentReference
+		for i := start; i < len(ordered) && len(selected) < options.MaxInputSegments; i++ {
+			if len(selected) > 0 {
+				previous := selected[len(selected)-1]
+				if previous.LastEntryID == math.MaxUint64 || ordered[i].FirstEntryID != previous.LastEntryID+1 {
+					break
+				}
+			}
+			if ordered[i].FileSize > options.MaxInputBytes-bytes {
+				break
+			}
+			selected = append(selected, ordered[i])
+			bytes += ordered[i].FileSize
+		}
+		if len(selected) >= 2 {
+			return selected, bytes
+		}
+	}
+	return nil, 0
 }
 
 func (s *StandbyStore) checkpointLocked() error {
