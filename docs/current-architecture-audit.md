@@ -3,9 +3,9 @@
 | 属性 | 内容 |
 | --- | --- |
 | 审计性质 | 代码现实版整体架构审计，不是目标架构复述 |
-| 审计基线 | `a68ab45`（`main`，2026-08-18） |
-| 审计日期 | 2026-08-18 |
-| 相对上次审计新增 | Standby Active WAL History 增量推进、committed MemTable Checkpoint、WAL Rotate 与完整投影发布 |
+| 审计基线 | `d9e3c91`（`main`，2026-08-19） |
+| 审计日期 | 2026-08-19 |
+| 相对上次审计新增 | Primary/Single Freeze/Switch、分层 MemTable 读视图、锁外 Segment 与完整投影发布 |
 | 覆盖范围 | API、存储、索引、Checkpoint、Compaction、恢复、Snapshot、WAL GC、Strict HA、并发与运维入口 |
 | 验证边界 | 本轮代码、单元/race/vet；既有 Compose HA 未在本轮重跑，不等同于性能、长稳、磁盘故障或生产部署验收 |
 
@@ -36,10 +36,11 @@ recovery-blocked 状态，输出确定性 Recovery Task。
    全量 Stream 投影常驻峰值已关闭，但百万 Stream 的 RSS/时延目标尚未验收。
 5. 没有生产级 Snapshot/GC 调度、对象存储、容量故障策略、长稳和规模验收。
 
-此前 Standby 每次 Append 后全量重扫 Active WAL、且 committed MemTable 永不 Flush 的持续运行短板已经关闭：
-History 现在从已验证 Log 状态 O(1) 增量推进；周期 Checkpoint 会在 committed/applied 边界冻结并切换
-MemTable、Rotate WAL，在锁外发布 Segment、Tail、Locator、Registry 与 Manifest。未提交但已 durable 的 WAL
-后缀不进入 Manifest，并在重启后保留。WAL 在线 GC、Standby Segment Compaction 和容量水位仍未闭环。
+此前 Standby 每次 Append 后全量重扫 Active WAL、committed MemTable 永不 Flush，以及 Primary/Single 在完整
+Segment/投影构建期间停止 Append 的持续运行短板已经关闭。两条 Checkpoint 路径都会先 Freeze/Switch，再在
+锁外发布 Segment、Tail、Locator、Registry 与 Manifest；过渡期 Reader 组合 Frozen 与 Active MemTable。
+Standby 未提交但已 durable 的 WAL 后缀不进入 Manifest，并在重启后保留。WAL Seal 仍在 Freeze 临界区全量
+计算当前文件 SHA-256；WAL 在线 GC、Standby Segment Compaction 和容量水位仍未闭环。
 
 结论：**可以继续开发，当前代码适合作为正确性优先的 V1 工程基线；尚不能宣称生产就绪。后续应按
 跨模块风险推进，而不是继续增加彼此孤立的存储功能。**
@@ -279,21 +280,33 @@ maintenanceMu
 -> Engine mu
 -> Committer Barrier
 -> Strict HA: persist Replication State committed/applied floor
--> snapshot active MemTable
 -> close current Committer
+-> freeze old MemTable + seed successor Tails
 -> seal/rotate WAL
+-> install successor Committer + Active/Frozen layered Reader
+-> release Engine mu
+-> snapshot frozen MemTable
 -> write new Segment
 -> build Tail + Locator + Registry projections
 -> publish Manifest
 -> publish CURRENT
 -> open and validate next projections
--> viewMu: atomically replace MemTable/Reader/Registry/Locator
--> create new Committer on new WAL
+-> Engine mu + successor Committer Barrier
+-> merge Registry Overlay created after checkpoint boundary
+-> viewMu: atomically install Segment/projections and Active-only Reader
+-> prune seed-only successor Tails
 -> retire replaced projections
 ```
 
-Checkpoint 在构造和发布期间持有 Engine `mu`，因此 Append 暂停；Read 继续使用旧视图，直到短暂的
-`viewMu` 写锁切换。
+Freeze/Switch 以后立即释放 Engine `mu`，Segment 和完整投影构建期间 Append 写入新 WAL/MemTable，Read
+通过分层视图组合 Frozen 与 Active 记录，幂等重试也可以跨边界读取旧请求。最终切换先在 Engine `mu`
+下用短 Barrier 排空已经进入 successor Committer 的请求，避免误删尚未 Apply 的 seed-only Tail；再合并
+checkpoint 之后创建的 Registry Mapping，并切到 Active-only Reader。Crash Hook 覆盖 WAL Rotate、Manifest
+发布和最终视图安装；并发测试覆盖构建期间 Append、Read、Inspect、ResolveTime、幂等与新 Stream 创建。
+
+Append 暂停窗口尚未完全常数化：Freeze 阶段需要枚举当前活跃 Tail，`WAL.Rotate` 中的 Seal 会在锁内重新
+读取整个 Active WAL 计算 SHA-256，并执行新 WAL/WAL-CURRENT 的 fsync。它不再包含 Segment 与历史投影
+规模，但仍随本周期 WAL 大小和活跃 Stream 数增长。
 
 Locator/Tail 投影不会再一次性物化全部 Segment Directory。Builder 每次只访问一个 Directory，写入
 定长临时 Run，以 fan-in 32 多轮外部归并；归并结果按 Stream/Sequence 排序后，每次只编码一个 Locator
@@ -445,7 +458,7 @@ Compose 使用真实进程、mTLS、三成员 etcd、Toxiproxy 和一次性 Volu
 | 锁 | 保护内容 | 典型持有者 |
 | --- | --- | --- |
 | `maintenanceMu` | Checkpoint、Compaction、Close 的生命周期串行化 | 后台维护、关闭 |
-| `Store.mu` | WAL 分配尾、Registry Overlay、Committer 切换、shutdown | Append、Checkpoint、Compaction、Replication State Checkpoint |
+| `Store.mu` | WAL 分配尾、Registry Overlay、Committer/MemTable Freeze-Switch、shutdown | Append、Checkpoint、Compaction、Replication State Checkpoint |
 | `gateMu` + per-stream channel | Stream Gate 表和同 Stream Append 串行 | Append |
 | `viewMu` | Reader、Segment set、投影和 MemTable 视图切换 | Read RLock；Checkpoint/Compaction WLock |
 | `fatalMu` | Engine 首个 fatal error | 写与维护路径 |
@@ -454,7 +467,8 @@ Compose 使用真实进程、mTLS、三成员 etcd、Toxiproxy 和一次性 Volu
 当前主要获取顺序是：
 
 ```text
-maintenanceMu -> Store.mu -> lifecycle.mu -> viewMu
+maintenanceMu -> Store.mu -> viewMu
+maintenanceMu -> lifecycle.mu（Checkpoint/Compaction 的锁外构建与发布）
 Store.mu -> Committer.submitMu/stateMu
 viewMu -> ReadStore.mu -> HandleCache.mu / Locator.mu
 notifyMu -> viewMu（WaitForAppend 的即时检查）
@@ -492,7 +506,7 @@ Catch-up 的跨进程竞争；同一 `wal.History` 内部的 Pin/Collect 由 mut
 | mTLS + namespace RBAC | Implemented | 业务 Client 和复制 Peer 均验证身份；Admin 仅允许 loopback |
 | WAL/Batch/Expected Sequence/幂等 | Implemented | Request ID + Request Hash；不确定结果可用原请求重试 |
 | Group Commit | Implemented | 有界 channel + 单 writer；多 Stream 合并；分阶段累计统计跨 Checkpoint 连续；Primary/Single 已接 Prometheus |
-| Segment/Manifest/Checkpoint | Implemented | 不可变文件、校验 Footer、原子 CURRENT、Crash Test |
+| Segment/Manifest/Checkpoint | Implemented | 不可变文件、校验 Footer、原子 CURRENT、Freeze/Switch 后锁外构建、Crash Test |
 | Tail/Locator/Registry 投影 | Implemented | 损坏可回退事实数据；正常查询使用有界 Cache |
 | Segment Handle/Locator Root/Locator Page/Registry Block Cache | Implemented | 默认容量 64/1024/256/64；引用计数或 LRU |
 | 自动有界 Compaction | Bounded | 输入 Segment 数/字节有界；内部仍按 Stream 聚合完整输入 Frame |
@@ -541,9 +555,12 @@ Catch-up 的跨进程竞争；同一 `wal.History` 内部的 Pin/Collect 由 mut
 8. **启动阶段管理面不连续**：Replicated 节点在 Coordinator/Peer 等待前启动同一 loopback Admin；
    transient/no-Leader 由进程内重试，结构化 reason 和 Compose 场景证明公共 gRPC 保持关闭并可原进程
    转入 ready。
-9. **Manifest checkpoint 超前于 durable committed state**：Strict Primary 的周期 Checkpoint 在同一 Engine
-   临界区先 Barrier 并持久化 Replication State，再发布可能覆盖相同 Entry 的 Manifest；Crash-point
+9. **Manifest checkpoint 超前于 durable committed state**：Strict Primary 的周期 Checkpoint 在 Freeze
+   临界区先 Barrier 并持久化 Replication State，再锁外发布只覆盖该冻结前缀的 Manifest；Crash-point
    测试保证进程在 Manifest 发布后立即失败时，durable committed/applied 水位仍不落后于 Manifest。
+10. **Primary/Single Checkpoint 长时间停止 Append**：Checkpoint 在短临界区 Freeze/Switch WAL、MemTable、
+    Committer 与分层 Reader；Segment、投影和 Manifest 在锁外构建。最终 Barrier 防止清理尚未 Apply 的
+    seed-only Tail，Registry Overlay 合并保留构建期间创建的新 Stream。
 
 这些边界不得为了自动化或缩短 RTO 而放宽。
 
@@ -562,11 +579,12 @@ Catch-up 的跨进程竞争；同一 `wal.History` 内部的 Pin/Collect 由 mut
 
 ### 9.3 P1：下一阶段架构风险
 
-#### P1-1 Primary Checkpoint 仍会全局暂停 Append
+#### P1-1 Checkpoint Freeze 窗口仍随 WAL 大小增长
 
-Primary/Single 仍在 Engine `mu` 内完成 MemTable Frame 复制、Segment 写入、完整投影构建和 Manifest
-发布，停顿随一个周期写入量和历史投影规模增长。下一步应像 Standby 一样把 Freeze/Switch 与锁外 Flush
-分离，但必须保留 Committer Barrier、Result Uncertain 和 Replication State 先于 Manifest 的顺序。
+Primary/Single 的 Segment、投影和 Manifest 已移到 Engine `mu` 外；但 `WAL.Seal` 仍会在 Freeze 临界区
+从头读取 Active WAL 计算 SHA-256，Rotate 还包含多个 fsync，Tail seed 也与当前活跃 Stream 数线性相关。
+下一步应让 WAL 在顺序 Append 时增量维护 Seal digest，或把可验证的密封计算拆出 Admission 临界区；必须
+同时保持 Footer 内容校验、WAL-CURRENT 原子发布、Entry CRC 链和 Crash Recovery 语义。
 
 #### P1-2 容量与回收没有运行闭环
 
@@ -599,8 +617,9 @@ Primary、Standby 和 recovery-blocked 已共享 Replicated Admin Runtime 与诊
 #### P1-6 Replication State 是持久下界而非实时真值
 
 State 周期落盘是避免每次 Group Commit 增加 metadata fsync 的有意取舍；但 Strict storage checkpoint
-必须在同一 Engine 临界区先发布覆盖该 Manifest 的 committed/applied State 下界。Promotion、Snapshot、
-WAL GC 和诊断仍必须结合物理 WAL；任何新模块都不能把 State watermark 当作每次提交后的精确实时值。
+必须在 Freeze 临界区先发布覆盖冻结前缀的 committed/applied State 下界，锁外 Manifest 不得越过该边界。
+Promotion、Snapshot、WAL GC 和诊断仍必须结合物理 WAL；任何新模块都不能把 State watermark 当作每次
+提交后的精确实时值。
 
 ### 9.4 P2：性能与运维成熟度
 
