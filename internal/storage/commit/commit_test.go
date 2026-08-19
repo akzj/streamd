@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -19,6 +20,7 @@ type fakeLog struct {
 	syncs       int
 	appendErr   error
 	syncErr     error
+	syncDelay   time.Duration
 }
 
 type fakeReplica struct {
@@ -78,10 +80,49 @@ func (f *fakeLog) Append(entries ...[]byte) error {
 }
 
 func (f *fakeLog) Sync() error {
+	if f.syncDelay > 0 {
+		time.Sleep(f.syncDelay)
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.syncs++
 	return f.syncErr
+}
+
+func TestStorageFaultsFailClosed(t *testing.T) {
+	for _, fault := range []error{syscall.ENOSPC, syscall.EROFS, syscall.EIO} {
+		t.Run(fault.Error(), func(t *testing.T) {
+			c := New(&fakeLog{syncErr: fault}, memtable.New(0))
+			defer c.Close()
+			result, err := c.Commit(context.Background(), encodedBatch(t))
+			if !errors.Is(err, fault) || !result.ResultUncertain {
+				t.Fatalf("result = %+v, error = %v", result, err)
+			}
+			water := c.Watermarks()
+			if water.HasLocalDurable || water.HasCommitted || water.HasApplied {
+				t.Fatalf("fault advanced durable state: %+v", water)
+			}
+			if _, err = c.Commit(context.Background(), encodedBatch(t)); !errors.Is(err, fault) {
+				t.Fatalf("subsequent write did not preserve fatal fault: %v", err)
+			}
+		})
+	}
+}
+
+func TestCommitWaitsForSlowFsync(t *testing.T) {
+	delay := 40 * time.Millisecond
+	c := New(&fakeLog{syncDelay: delay}, memtable.New(0))
+	defer c.Close()
+	started := time.Now()
+	if _, err := c.Commit(context.Background(), encodedBatch(t)); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(started); elapsed < delay {
+		t.Fatalf("commit acknowledged before delayed fsync: %v", elapsed)
+	}
+	if water := c.Watermarks(); !water.HasLocalDurable || !water.HasCommitted || !water.HasApplied {
+		t.Fatalf("slow successful fsync did not commit: %+v", water)
+	}
 }
 
 func encodedBatch(t *testing.T) [][]byte {

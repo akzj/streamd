@@ -110,12 +110,12 @@ func WriteFile(path string, id format.UUID, createdAt int64, streams []memtable.
 		return meta, err
 	}
 	hb, _ := format.MarshalSegmentHeader(header)
-	if _, err = f.WriteAt(hb, 0); err != nil {
+	if err = fsutil.WriteFullAt(f, hb, 0); err != nil {
 		return meta, err
 	}
 	for i, d := range dirs {
 		b, _ := format.MarshalStreamDirectoryEntry(d)
-		if _, err = f.WriteAt(b, int64(header.DirectoryOffset)+int64(i*format.StreamDirectoryEntryLength)); err != nil {
+		if err = fsutil.WriteFullAt(f, b, int64(header.DirectoryOffset)+int64(i*format.StreamDirectoryEntryLength)); err != nil {
 			return meta, err
 		}
 	}
@@ -125,10 +125,10 @@ func WriteFile(path string, id format.UUID, createdAt int64, streams []memtable.
 			idx := format.DenseIndexEntry{RelativeByteOffset: relative, RecordedAtDelta: uint64(r.RecordedAt - decoded[si][0].RecordedAt), FrameLength: uint32(len(s.Frames[i])), FrameCRC32C: binary.LittleEndian.Uint32(s.Frames[i][len(s.Frames[i])-4:])}
 			b, _ := format.MarshalDenseIndexEntry(idx)
 			offset := dirs[si].RecordIndexOffset + uint64(i*format.DenseIndexEntryLength)
-			if _, err = f.WriteAt(b, int64(offset)); err != nil {
+			if err = fsutil.WriteFullAt(f, b, int64(offset)); err != nil {
 				return meta, err
 			}
-			if _, err = f.WriteAt(s.Frames[i], int64(dirs[si].StreamDataOffset+relative)); err != nil {
+			if err = fsutil.WriteFullAt(f, s.Frames[i], int64(dirs[si].StreamDataOffset+relative)); err != nil {
 				return meta, err
 			}
 			relative += uint64(len(s.Frames[i]))
@@ -145,7 +145,7 @@ func WriteFile(path string, id format.UUID, createdAt int64, streams []memtable.
 	copy(digest[:], h.Sum(nil))
 	footer := format.SegmentFooter{SegmentID: id, FileLength: header.FooterOffset + format.SegmentFooterSectionLength, ContentLength: header.FooterOffset, StreamCount: header.StreamCount, RecordCount: header.RecordCount, ContentSHA256: digest}
 	fb, _ := format.MarshalSegmentFooter(footer)
-	if _, err = f.WriteAt(fb, int64(header.FooterOffset)); err != nil {
+	if err = fsutil.WriteFullAt(f, fb, int64(header.FooterOffset)); err != nil {
 		return meta, err
 	}
 	if err = f.Sync(); err != nil {

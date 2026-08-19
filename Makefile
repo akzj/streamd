@@ -1,10 +1,16 @@
-.PHONY: test test-race ha-prepare ha-up ha-test ha-logs ha-down test-ha test-ha-repeat test-soak test-soak-72h
+.PHONY: test test-race test-faults test-compat ha-prepare ha-up ha-test ha-logs ha-down test-ha test-ha-repeat test-scale test-soak test-soak-72h
 
 test:
 	go test ./... -count=1
 
 test-race:
 	go test -race ./... -count=1
+
+test-faults:
+	./test/fault/run.sh
+
+test-compat:
+	./test/compat/run.sh
 
 ha-prepare:
 	./test/ha/compose.sh prepare
@@ -34,6 +40,9 @@ test-ha-repeat:
 		$(MAKE) --no-print-directory test-ha || exit $$?; \
 		index=$$((index + 1)); \
 	done
+
+test-scale:
+	./test/scale/run.sh
 
 test-soak:
 	./test/soak/run.sh

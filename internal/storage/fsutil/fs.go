@@ -4,6 +4,7 @@ package fsutil
 import (
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -106,7 +107,7 @@ func AtomicWrite(dir, name string, data []byte, mode fs.FileMode, hook CrashHook
 	if err = tmp.Chmod(mode); err != nil {
 		return err
 	}
-	if _, err = tmp.Write(data); err != nil {
+	if err = WriteFull(tmp, data); err != nil {
 		return err
 	}
 	if hook != nil {
@@ -135,6 +136,51 @@ func AtomicWrite(dir, name string, data []byte, mode fs.FileMode, hook CrashHook
 		}
 	}
 	return SyncDir(dir)
+}
+
+// WriteFull writes the complete buffer or returns an error.
+func WriteFull(writer io.Writer, data []byte) error {
+	for len(data) > 0 {
+		n, err := writer.Write(data)
+		if n < 0 || n > len(data) {
+			return fmt.Errorf("invalid Write count %d for %d bytes", n, len(data))
+		}
+		if n > 0 {
+			data = data[n:]
+		}
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrNoProgress
+		}
+	}
+	return nil
+}
+
+// WriteFullAt writes the complete buffer or returns an error. Regular files
+// normally report an error with a short write, but this explicit loop keeps
+// artifact publishers correct under injected faults and unusual filesystems.
+func WriteFullAt(writer interface {
+	WriteAt([]byte, int64) (int, error)
+}, data []byte, offset int64) error {
+	for len(data) > 0 {
+		n, err := writer.WriteAt(data, offset)
+		if n < 0 || n > len(data) {
+			return fmt.Errorf("invalid WriteAt count %d for %d bytes", n, len(data))
+		}
+		if n > 0 {
+			data = data[n:]
+			offset += int64(n)
+		}
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrNoProgress
+		}
+	}
+	return nil
 }
 func SyncDir(path string) error {
 	d, err := os.Open(path)
