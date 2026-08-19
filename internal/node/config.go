@@ -46,6 +46,8 @@ type MaintenanceConfig struct {
 	DiskHighPercent       uint32 `json:"disk_high_percent,omitempty"`
 	DiskCriticalPercent   uint32 `json:"disk_critical_percent,omitempty"`
 	MinimumAvailableBytes uint64 `json:"minimum_available_bytes,omitempty"`
+	SnapshotInterval      string `json:"snapshot_interval,omitempty"`
+	MaxRetainedWALBytes   uint64 `json:"max_retained_wal_bytes,omitempty"`
 }
 
 type maintenanceLimits struct {
@@ -55,6 +57,8 @@ type maintenanceLimits struct {
 	diskHighPercent       uint32
 	diskCriticalPercent   uint32
 	minimumAvailableBytes uint64
+	snapshotInterval      time.Duration
+	maxRetainedWALBytes   uint64
 }
 
 type CompactionConfig struct {
@@ -198,6 +202,7 @@ func (c Config) maintenanceLimits() (maintenanceLimits, error) {
 	limits := maintenanceLimits{
 		checkInterval: time.Second, memTableBytes: 64 << 20, activeWALBytes: 256 << 20,
 		diskHighPercent: 85, diskCriticalPercent: 95, minimumAvailableBytes: 1 << 30,
+		snapshotInterval: 6 * time.Hour, maxRetainedWALBytes: 4 << 30,
 	}
 	if c.Maintenance.CheckInterval != "" {
 		value, err := time.ParseDuration(c.Maintenance.CheckInterval)
@@ -221,6 +226,16 @@ func (c Config) maintenanceLimits() (maintenanceLimits, error) {
 	if c.Maintenance.MinimumAvailableBytes != 0 {
 		limits.minimumAvailableBytes = c.Maintenance.MinimumAvailableBytes
 	}
+	if c.Maintenance.SnapshotInterval != "" {
+		value, err := time.ParseDuration(c.Maintenance.SnapshotInterval)
+		if err != nil || value <= 0 {
+			return limits, fmt.Errorf("maintenance.snapshot_interval must be a positive duration")
+		}
+		limits.snapshotInterval = value
+	}
+	if c.Maintenance.MaxRetainedWALBytes != 0 {
+		limits.maxRetainedWALBytes = c.Maintenance.MaxRetainedWALBytes
+	}
 	if limits.memTableBytes < 1<<20 || limits.activeWALBytes < 1<<20 {
 		return limits, fmt.Errorf("maintenance MemTable and active WAL thresholds must be at least 1 MiB")
 	}
@@ -229,6 +244,9 @@ func (c Config) maintenanceLimits() (maintenanceLimits, error) {
 	}
 	if limits.minimumAvailableBytes < 64<<20 {
 		return limits, fmt.Errorf("maintenance.minimum_available_bytes must be at least 64 MiB")
+	}
+	if limits.maxRetainedWALBytes < limits.activeWALBytes {
+		return limits, fmt.Errorf("maintenance.max_retained_wal_bytes must not be below active_wal_bytes")
 	}
 	return limits, nil
 }

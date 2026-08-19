@@ -1,10 +1,13 @@
 package node
 
 import (
+	"context"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/akzj/streamd/internal/storage/engine"
+	"github.com/akzj/streamd/internal/storage/format"
 )
 
 func TestMaintenanceControllerTriggersThresholdsAndCapacityHysteresis(t *testing.T) {
@@ -37,6 +40,36 @@ func TestMaintenanceControllerTriggersThresholdsAndCapacityHysteresis(t *testing
 	decision = controller.evaluate(now.Add(5*time.Second), engine.MaintenanceStats{}, diskCapacity{capacity: 1000, available: 250})
 	if decision.high || decision.critical {
 		t.Fatalf("capacity state did not recover: %+v", decision)
+	}
+}
+
+func TestCreateSnapshotAndCollectWALClosesOnlineRetentionLoop(t *testing.T) {
+	data := filepath.Join(t.TempDir(), "data")
+	identity := format.NodeIdentity{ClusterID: nodeTestID(1), GroupID: nodeTestID(2), NodeID: nodeTestID(3), CreatedAt: 1}
+	store, err := engine.OpenWithIdentity(data, identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err = store.Append(context.Background(), engine.AppendRequest{Namespace: "n", Stream: "s", RequestID: []byte("r"), Producer: "test", Records: []engine.InputRecord{{Payload: []byte("record")}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err = createSnapshotAndCollectWAL(store, nil, 1<<30, time.Unix(200, 0)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.Append(context.Background(), engine.AppendRequest{Namespace: "n", Stream: "s", ExpectedSequence: 1, RequestID: []byte("r2"), Producer: "test", Records: []engine.InputRecord{{Payload: []byte("record-2")}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err = createSnapshotAndCollectWAL(store, nil, 1<<30, time.Unix(300, 0)); err != nil {
+		t.Fatal(err)
+	}
+	logs, err := filepath.Glob(filepath.Join(data, "wal", "*.log"))
+	if err != nil || len(logs) != 1 {
+		t.Fatalf("WAL files = %v, error = %v", logs, err)
+	}
+	snapshots, err := filepath.Glob(filepath.Join(data, "snapshots", "auto-*"))
+	if err != nil || len(snapshots) != 1 {
+		t.Fatalf("automatic Snapshots = %v, error = %v", snapshots, err)
 	}
 }
 

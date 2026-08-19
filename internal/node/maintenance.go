@@ -2,13 +2,18 @@ package node
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/akzj/streamd/internal/replication"
 	"github.com/akzj/streamd/internal/storage/engine"
 	"github.com/akzj/streamd/internal/storage/format"
+	"github.com/akzj/streamd/internal/storage/replicationstate"
+	"github.com/akzj/streamd/internal/storage/snapshot"
 	"golang.org/x/sys/unix"
 )
 
@@ -62,6 +67,7 @@ type maintenanceController struct {
 	lastCheckpoint  time.Time
 	high            bool
 	critical        bool
+	lastSnapshot    time.Time
 }
 
 func newMaintenanceController(config Config, now time.Time) (*maintenanceController, error) {
@@ -73,7 +79,7 @@ func newMaintenanceController(config Config, now time.Time) (*maintenanceControl
 	if err != nil {
 		return nil, err
 	}
-	return &maintenanceController{limits: limits, maximumInterval: maximum, lastCheckpoint: now}, nil
+	return &maintenanceController{limits: limits, maximumInterval: maximum, lastCheckpoint: now, lastSnapshot: now}, nil
 }
 
 func (c *maintenanceController) evaluate(now time.Time, stats engine.MaintenanceStats, disk diskCapacity) maintenanceDecision {
@@ -126,7 +132,7 @@ type engineMaintenanceStore interface {
 	Compact(engine.CompactionOptions) (engine.CompactionResult, error)
 }
 
-func runEngineMaintenance(ctx context.Context, config Config, store engineMaintenanceStore, checkpoint func() (format.Manifest, bool, error), logger *slog.Logger) error {
+func runEngineMaintenance(ctx context.Context, config Config, store *engine.Store, states *replicationstate.Store, checkpoint func() (format.Manifest, bool, error), logger *slog.Logger) error {
 	controller, err := newMaintenanceController(config, time.Now())
 	if err != nil {
 		return err
@@ -155,6 +161,16 @@ func runEngineMaintenance(ctx context.Context, config Config, store engineMainte
 						logger.Info("storage checkpoint published", "generation", manifest.Header.Generation, "entry_id", manifest.Header.LastEntryID)
 					}
 					compactMaintenanceStore(store, config, logger)
+					walBytes, sizeErr := walDirectoryBytes(config.DataDirectory)
+					if sizeErr != nil {
+						logger.Error("WAL retention measurement failed", "error", sizeErr)
+					} else if now.Sub(controller.lastSnapshot) >= controller.limits.snapshotInterval || walBytes > controller.limits.maxRetainedWALBytes {
+						if retentionErr := createSnapshotAndCollectWAL(store, states, controller.limits.maxRetainedWALBytes, now); retentionErr != nil {
+							logger.Error("online Snapshot/WAL retention failed", "error", retentionErr)
+						} else {
+							controller.lastSnapshot = now
+						}
+					}
 				}
 			}
 		}
@@ -164,6 +180,90 @@ func runEngineMaintenance(ctx context.Context, config Config, store engineMainte
 		case <-ticker.C:
 		}
 	}
+}
+
+func walDirectoryBytes(root string) (uint64, error) {
+	entries, err := os.ReadDir(filepath.Join(root, "wal"))
+	if err != nil {
+		return 0, err
+	}
+	var total uint64
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".log" {
+			continue
+		}
+		info, infoErr := entry.Info()
+		if infoErr != nil {
+			return 0, infoErr
+		}
+		if info.Size() > 0 {
+			total += uint64(info.Size())
+		}
+	}
+	return total, nil
+}
+
+func createSnapshotAndCollectWAL(store *engine.Store, states *replicationstate.Store, maxRetained uint64, now time.Time) error {
+	destination := filepath.Join(store.DataRoot(), "snapshots", fmt.Sprintf("auto-%020d", now.UnixNano()))
+	created, err := snapshot.CreateOnline(store, destination)
+	if err != nil {
+		return err
+	}
+	verified, err := snapshot.Verify(created.Path)
+	if err != nil {
+		return err
+	}
+	if states != nil {
+		if _, err = states.Update(now, func(header *format.ReplicationStateHeader) error {
+			header.HasInstalledSnapshot = true
+			header.InstalledSnapshotID = verified.SnapshotID
+			header.InstalledSnapshotEntry = format.ReplicationPosition{Present: true, EntryID: verified.CheckpointEntryID, CRC32C: verified.CheckpointCRC32C}
+			return nil
+		}); err != nil {
+			return err
+		}
+	}
+	collected, err := store.CollectWAL(engine.WALCollectionEvidence{SnapshotEntryID: verified.CheckpointEntryID, SnapshotVerified: true, MaxRetainedBytes: maxRetained})
+	if err != nil {
+		return err
+	}
+	if states != nil {
+		_, err = states.Update(now, func(header *format.ReplicationStateHeader) error {
+			header.EarliestWALEntryID = collected.EarliestWAL
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+	}
+	return pruneAutomaticSnapshots(store.DataRoot(), created.Path)
+}
+
+func pruneAutomaticSnapshots(root, keep string) error {
+	directory := filepath.Join(root, "snapshots")
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		return err
+	}
+	keep = filepath.Clean(keep)
+	for _, entry := range entries {
+		if !entry.IsDir() || len(entry.Name()) < len("auto-") || entry.Name()[:len("auto-")] != "auto-" {
+			continue
+		}
+		path := filepath.Join(directory, entry.Name())
+		if filepath.Clean(path) == keep {
+			continue
+		}
+		if err = os.RemoveAll(path); err != nil {
+			return err
+		}
+	}
+	handle, err := os.Open(directory)
+	if err != nil {
+		return err
+	}
+	err = handle.Sync()
+	return errors.Join(err, handle.Close())
 }
 
 func compactMaintenanceStore(store engineMaintenanceStore, config Config, logger *slog.Logger) {

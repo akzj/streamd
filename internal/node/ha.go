@@ -229,7 +229,7 @@ func runPrimary(ctx context.Context, config Config, nodeIdentity format.NodeIden
 	go func() {
 		defer close(backgroundDone)
 		checkpoint := func() (format.Manifest, bool, error) { return store.CheckpointReplicated(states) }
-		if maintenanceErr := runEngineMaintenance(backgroundCtx, config, store, checkpoint, logger); maintenanceErr != nil {
+		if maintenanceErr := runEngineMaintenance(backgroundCtx, config, store, states, checkpoint, logger); maintenanceErr != nil {
 			logger.Error("maintenance loop stopped", "error", maintenanceErr)
 		}
 	}()

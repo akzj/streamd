@@ -100,7 +100,7 @@ func Run(ctx context.Context, config Config, logger *slog.Logger) error {
 	checkpointDone := make(chan struct{})
 	go func() {
 		defer close(checkpointDone)
-		if maintenanceErr := runEngineMaintenance(checkpointCtx, config, store, store.Checkpoint, logger); maintenanceErr != nil {
+		if maintenanceErr := runEngineMaintenance(checkpointCtx, config, store, nil, store.Checkpoint, logger); maintenanceErr != nil {
 			logger.Error("maintenance loop stopped", "error", maintenanceErr)
 		}
 	}()

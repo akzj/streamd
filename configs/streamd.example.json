@@ -14,7 +14,9 @@
     "active_wal_bytes": 268435456,
     "disk_high_percent": 85,
     "disk_critical_percent": 95,
-    "minimum_available_bytes": 1073741824
+    "minimum_available_bytes": 1073741824,
+    "snapshot_interval": "6h",
+    "max_retained_wal_bytes": 4294967296
   },
   "compaction": {
     "min_segments": 32,
