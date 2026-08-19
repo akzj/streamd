@@ -88,3 +88,24 @@ func TestMaintenanceControllerTriggersMaximumIntervalAndWALBytes(t *testing.T) {
 		t.Fatalf("maximum interval decision = %+v", decision)
 	}
 }
+
+func TestMaintenanceControllerRetentionTriggersAndBacksOff(t *testing.T) {
+	now := time.Unix(100, 0)
+	controller := &maintenanceController{
+		limits:       maintenanceLimits{checkInterval: time.Second, snapshotInterval: time.Hour, maxRetainedWALBytes: 100},
+		lastSnapshot: now,
+	}
+	if controller.retentionDue(now.Add(time.Second), 100, false) {
+		t.Fatal("retention triggered at the byte boundary")
+	}
+	if !controller.retentionDue(now.Add(time.Second), 101, false) {
+		t.Fatal("WAL pressure did not trigger retention")
+	}
+	controller.retentionAttempted(now.Add(time.Second))
+	if controller.retentionDue(now.Add(2*time.Second), 101, true) {
+		t.Fatal("retention retry ignored backoff")
+	}
+	if !controller.retentionDue(now.Add(31*time.Second), 101, true) {
+		t.Fatal("retention did not retry after backoff")
+	}
+}

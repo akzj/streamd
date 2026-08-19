@@ -14,6 +14,7 @@ import (
 	"github.com/akzj/streamd/internal/storage/format"
 	"github.com/akzj/streamd/internal/storage/replicationstate"
 	"github.com/akzj/streamd/internal/storage/snapshot"
+	"github.com/akzj/streamd/internal/storage/wal"
 	"golang.org/x/sys/unix"
 )
 
@@ -68,6 +69,7 @@ type maintenanceController struct {
 	high            bool
 	critical        bool
 	lastSnapshot    time.Time
+	nextRetention   time.Time
 }
 
 func newMaintenanceController(config Config, now time.Time) (*maintenanceController, error) {
@@ -107,6 +109,23 @@ func (c *maintenanceController) evaluate(now time.Time, stats engine.Maintenance
 }
 
 func (c *maintenanceController) checkpointCompleted(now time.Time) { c.lastCheckpoint = now }
+
+func (c *maintenanceController) retentionDue(now time.Time, walBytes uint64, high bool) bool {
+	if now.Before(c.nextRetention) {
+		return false
+	}
+	return high || now.Sub(c.lastSnapshot) >= c.limits.snapshotInterval || walBytes > c.limits.maxRetainedWALBytes
+}
+
+func (c *maintenanceController) retentionAttempted(now time.Time) {
+	retry := 30 * time.Second
+	if candidate := c.limits.checkInterval * 10; candidate > retry {
+		retry = candidate
+	}
+	c.nextRetention = now.Add(retry)
+}
+
+func (c *maintenanceController) snapshotCompleted(now time.Time) { c.lastSnapshot = now }
 
 func sampleDiskCapacity(root string) (diskCapacity, error) {
 	var stats unix.Statfs_t
@@ -151,9 +170,11 @@ func runEngineMaintenance(ctx context.Context, config Config, store *engine.Stor
 		} else {
 			decision := controller.evaluate(now, store.MaintenanceStats(), disk)
 			store.SetCapacityCritical(decision.critical)
+			checkpointReady := true
 			if decision.checkpoint {
 				manifest, created, checkpointErr := checkpoint()
 				if checkpointErr != nil {
+					checkpointReady = false
 					logger.Error("storage checkpoint failed", "error", checkpointErr)
 				} else {
 					controller.checkpointCompleted(now)
@@ -161,15 +182,19 @@ func runEngineMaintenance(ctx context.Context, config Config, store *engine.Stor
 						logger.Info("storage checkpoint published", "generation", manifest.Header.Generation, "entry_id", manifest.Header.LastEntryID)
 					}
 					compactMaintenanceStore(store, config, logger)
-					walBytes, sizeErr := walDirectoryBytes(config.DataDirectory)
-					if sizeErr != nil {
-						logger.Error("WAL retention measurement failed", "error", sizeErr)
-					} else if now.Sub(controller.lastSnapshot) >= controller.limits.snapshotInterval || walBytes > controller.limits.maxRetainedWALBytes {
-						if retentionErr := createSnapshotAndCollectWAL(store, states, controller.limits.maxRetainedWALBytes, now); retentionErr != nil {
-							logger.Error("online Snapshot/WAL retention failed", "error", retentionErr)
-						} else {
-							controller.lastSnapshot = now
-						}
+				}
+			}
+			if checkpointReady {
+				walBytes, sizeErr := walDirectoryBytes(config.DataDirectory)
+				if sizeErr != nil {
+					logger.Error("WAL retention measurement failed", "error", sizeErr)
+				} else if controller.retentionDue(now, walBytes, decision.high) {
+					controller.retentionAttempted(now)
+					retentionErr := createSnapshotAndCollectWAL(store, states, controller.limits.maxRetainedWALBytes, now)
+					if retentionErr != nil {
+						logger.Error("online Snapshot/WAL retention failed", "error", retentionErr)
+					} else {
+						controller.snapshotCompleted(now)
 					}
 				}
 			}
@@ -205,7 +230,7 @@ func walDirectoryBytes(root string) (uint64, error) {
 
 func createSnapshotAndCollectWAL(store *engine.Store, states *replicationstate.Store, maxRetained uint64, now time.Time) error {
 	destination := filepath.Join(store.DataRoot(), "snapshots", fmt.Sprintf("auto-%020d", now.UnixNano()))
-	created, err := snapshot.CreateOnline(store, destination)
+	created, err := snapshot.CreateOnlineLinked(store, destination)
 	if err != nil {
 		return err
 	}
@@ -223,9 +248,9 @@ func createSnapshotAndCollectWAL(store *engine.Store, states *replicationstate.S
 			return err
 		}
 	}
-	collected, err := store.CollectWAL(engine.WALCollectionEvidence{SnapshotEntryID: verified.CheckpointEntryID, SnapshotVerified: true, MaxRetainedBytes: maxRetained})
-	if err != nil {
-		return err
+	collected, collectErr := store.CollectWAL(engine.WALCollectionEvidence{SnapshotEntryID: verified.CheckpointEntryID, SnapshotVerified: true, MaxRetainedBytes: maxRetained})
+	if collectErr != nil && !errors.Is(collectErr, wal.ErrRetentionPressure) {
+		return collectErr
 	}
 	if states != nil {
 		_, err = states.Update(now, func(header *format.ReplicationStateHeader) error {
@@ -236,7 +261,10 @@ func createSnapshotAndCollectWAL(store *engine.Store, states *replicationstate.S
 			return err
 		}
 	}
-	return pruneAutomaticSnapshots(store.DataRoot(), created.Path)
+	if err = pruneAutomaticSnapshots(store.DataRoot(), created.Path); err != nil {
+		return err
+	}
+	return collectErr
 }
 
 func pruneAutomaticSnapshots(root, keep string) error {

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/akzj/streamd/internal/storage/engine"
+	"github.com/akzj/streamd/internal/storage/errdefs"
 	"github.com/akzj/streamd/internal/storage/format"
 	"github.com/akzj/streamd/internal/storage/fsutil"
 	"github.com/akzj/streamd/internal/storage/identity"
@@ -111,7 +112,7 @@ func CreatePrimaryOffline(dataRoot, destination string) (result Result, err erro
 		return result, err
 	}
 	defer func() { err = errors.Join(err, store.Close()) }()
-	return create(store, destination, current.Header.Term, true)
+	return create(store, destination, current.Header.Term, true, false)
 }
 
 // CreateOnline takes a short engine checkpoint and then copies only immutable
@@ -128,11 +129,26 @@ func CreateOnline(store *engine.Store, destination string) (result Result, err e
 	return createOnline(store, destination, health.Term)
 }
 
-func createOnline(store *engine.Store, destination string, term uint64) (result Result, err error) {
-	return create(store, destination, term, false)
+// CreateOnlineLinked creates a local Snapshot whose immutable artifacts share
+// disk extents with the live data root through hard links. The destination
+// must be the data root's snapshots directory; this avoids temporarily
+// duplicating all Segment bytes while online WAL retention is under pressure.
+func CreateOnlineLinked(store *engine.Store, destination string) (result Result, err error) {
+	if store == nil {
+		return result, fmt.Errorf("Snapshot engine is required")
+	}
+	health := store.Health()
+	if err = validateSource(health, false); err != nil {
+		return result, err
+	}
+	return create(store, destination, health.Term, false, true)
 }
 
-func create(store *engine.Store, destination string, term uint64, allowReleasedPrimary bool) (result Result, err error) {
+func createOnline(store *engine.Store, destination string, term uint64) (result Result, err error) {
+	return create(store, destination, term, false, false)
+}
+
+func create(store *engine.Store, destination string, term uint64, allowReleasedPrimary, linkArtifacts bool) (result Result, err error) {
 	if store == nil {
 		return result, fmt.Errorf("Snapshot engine is required")
 	}
@@ -208,7 +224,7 @@ func create(store *engine.Store, destination string, term uint64, allowReleasedP
 		return result, err
 	}
 	manifestName := filepath.ToSlash(filepath.Join("manifests", manifestFileName))
-	if err = copyFile(filepath.Join(staging, filepath.FromSlash(manifestName)), filepath.Join(dataAbs, filepath.FromSlash(manifestName))); err != nil {
+	if err = materializeArtifact(filepath.Join(staging, filepath.FromSlash(manifestName)), filepath.Join(dataAbs, filepath.FromSlash(manifestName)), linkArtifacts); err != nil {
 		return result, err
 	}
 	artifacts := []format.SnapshotArtifact{{ArtifactType: format.ArtifactManifest, FormatVersion: format.VersionV1, Flags: format.SegmentRefHasLocal, ArtifactID: manifest.Header.FileID, FileSize: uint64(len(manifestBytes)), LocalName: manifestName, ContentSHA256: manifest.Footer.ContentSHA256}}
@@ -231,7 +247,7 @@ func create(store *engine.Store, destination string, term uint64, allowReleasedP
 		if err = os.MkdirAll(filepath.Dir(filepath.Join(staging, filepath.FromSlash(reference.Path))), 0750); err != nil {
 			return result, err
 		}
-		if err = copyFile(filepath.Join(staging, filepath.FromSlash(reference.Path)), source); err != nil {
+		if err = materializeArtifact(filepath.Join(staging, filepath.FromSlash(reference.Path)), source, linkArtifacts); err != nil {
 			return result, err
 		}
 		artifacts = append(artifacts, format.SnapshotArtifact{ArtifactType: reference.ArtifactType, FormatVersion: format.VersionV1, Flags: format.SegmentRefHasLocal, ArtifactID: reference.ArtifactID, FileSize: reference.FileSize, LocalName: reference.Path, ContentSHA256: reference.ContentSHA256})
@@ -247,7 +263,7 @@ func create(store *engine.Store, destination string, term uint64, allowReleasedP
 				if err = os.MkdirAll(filepath.Dir(filepath.Join(staging, filepath.FromSlash(pack.Path))), 0750); err != nil {
 					return result, err
 				}
-				if err = copyFile(filepath.Join(staging, filepath.FromSlash(pack.Path)), filepath.Join(dataAbs, filepath.FromSlash(pack.Path))); err != nil {
+				if err = materializeArtifact(filepath.Join(staging, filepath.FromSlash(pack.Path)), filepath.Join(dataAbs, filepath.FromSlash(pack.Path)), linkArtifacts); err != nil {
 					return result, err
 				}
 				artifacts = append(artifacts, format.SnapshotArtifact{ArtifactType: format.ArtifactLocatorPack, FormatVersion: format.VersionV1, Flags: format.SegmentRefHasLocal, ArtifactID: pack.PackID, FileSize: pack.FileSize, LocalName: pack.Path, ContentSHA256: pack.ContentSHA256})
@@ -264,7 +280,7 @@ func create(store *engine.Store, destination string, term uint64, allowReleasedP
 		if err = os.MkdirAll(filepath.Dir(filepath.Join(staging, filepath.FromSlash(reference.LocalPath))), 0750); err != nil {
 			return result, err
 		}
-		if err = copyFile(filepath.Join(staging, filepath.FromSlash(reference.LocalPath)), filepath.Join(dataAbs, filepath.FromSlash(reference.LocalPath))); err != nil {
+		if err = materializeArtifact(filepath.Join(staging, filepath.FromSlash(reference.LocalPath)), filepath.Join(dataAbs, filepath.FromSlash(reference.LocalPath)), linkArtifacts); err != nil {
 			return result, err
 		}
 		artifacts = append(artifacts, format.SnapshotArtifact{ArtifactType: format.ArtifactSegment, FormatVersion: format.VersionV1, Flags: format.SegmentRefHasLocal, ArtifactID: reference.SegmentID, FileSize: reference.FileSize, LocalName: reference.LocalPath, ContentSHA256: reference.ContentSHA256})
@@ -319,7 +335,7 @@ func validateSource(health engine.Health, allowReleasedPrimary bool) error {
 		if health.Durability != format.ReplicationDurabilityStrict {
 			return fmt.Errorf("replicated Snapshot source is not a Strict Primary")
 		}
-		if health.WriteUnavailable != nil {
+		if health.WriteUnavailable != nil && !errors.Is(health.WriteUnavailable, errdefs.ErrCapacityCritical) {
 			return fmt.Errorf("Strict Primary is not safely writable: %w", health.WriteUnavailable)
 		}
 	case format.ReplicationRoleRecovering:
@@ -463,6 +479,16 @@ func copyFile(destination, source string) error {
 	}
 	ok = true
 	return nil
+}
+
+func materializeArtifact(destination, source string, link bool) error {
+	if link {
+		if err := os.Link(source, destination); err != nil {
+			return fmt.Errorf("link immutable Snapshot Artifact %s: %w", filepath.Base(source), err)
+		}
+		return nil
+	}
+	return copyFile(destination, source)
 }
 
 func inside(root, path string) bool {

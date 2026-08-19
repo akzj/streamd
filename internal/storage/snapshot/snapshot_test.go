@@ -274,6 +274,28 @@ func TestCreateOnlineStrictPrimaryRequiresCommittedWritableSource(t *testing.T) 
 	if created.Term != 7 || !health.Watermarks.HasCommitted || created.CheckpointEntryID > health.Watermarks.Committed {
 		t.Fatalf("Snapshot = %+v, Health = %+v", created, health)
 	}
+	store.SetCapacityCritical(true)
+	linkedPath := filepath.Join(data, "snapshots", "linked")
+	if _, err = CreateOnlineLinked(store, linkedPath); err != nil {
+		t.Fatalf("capacity-critical maintenance Snapshot: %v", err)
+	}
+	liveSegments, globErr := filepath.Glob(filepath.Join(data, "segments", "*.seg"))
+	linkedSegments, linkedGlobErr := filepath.Glob(filepath.Join(linkedPath, "segments", "*.seg"))
+	if globErr != nil || linkedGlobErr != nil || len(liveSegments) != 1 || len(linkedSegments) != 1 {
+		t.Fatalf("live Segments = %v (%v), linked Segments = %v (%v)", liveSegments, globErr, linkedSegments, linkedGlobErr)
+	}
+	liveInfo, statErr := os.Stat(liveSegments[0])
+	if statErr != nil {
+		t.Fatal(statErr)
+	}
+	linkedInfo, statErr := os.Stat(linkedSegments[0])
+	if statErr != nil {
+		t.Fatal(statErr)
+	}
+	if !os.SameFile(liveInfo, linkedInfo) {
+		t.Fatal("local maintenance Snapshot copied an immutable Segment instead of linking it")
+	}
+	store.SetCapacityCritical(false)
 
 	guard.err = errors.New("lease expired")
 	destination := filepath.Join(t.TempDir(), "unsafe-snapshot")
