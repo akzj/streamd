@@ -35,8 +35,12 @@ type extent struct {
 	reference format.SegmentReference
 	directory format.StreamDirectoryEntry
 }
+type tableView interface {
+	ActiveRange(streamID uint64) (base, next uint64, ok bool)
+	Read(streamID, from uint64, maxRecords int) ([]format.RecordFrame, uint64, error)
+}
 type Store struct {
-	table      *memtable.Table
+	table      tableView
 	tails      *tailstore.Resolver
 	root       string
 	generation uint64
@@ -45,11 +49,72 @@ type Store struct {
 	locator    *locatorstore.Store
 }
 
-func New(table *memtable.Table, tails *tailstore.Resolver, root string, generation uint64, segments []segment.Descriptor, locator *locatorstore.Store, streamCacheCapacity, handleCapacity int) *Store {
+func New(table tableView, tails *tailstore.Resolver, root string, generation uint64, segments []segment.Descriptor, locator *locatorstore.Store, streamCacheCapacity, handleCapacity int) *Store {
 	if tails == nil {
-		tails = tailstore.NewResolver(table, nil, root, segments, streamCacheCapacity)
+		active, ok := table.(*memtable.Table)
+		if !ok {
+			panic("read Store requires an explicit Tail Resolver for a layered MemTable")
+		}
+		tails = tailstore.NewResolver(active, nil, root, segments, streamCacheCapacity)
 	}
 	return &Store{table: table, tails: tails, root: root, generation: generation, segments: append([]segment.Descriptor(nil), segments...), handles: segment.NewHandleCache(root, handleCapacity), locator: locator}
+}
+
+// LayerTables exposes a continuous read view while a frozen MemTable is being
+// flushed and new appends are committed into its successor. Tail resolution
+// remains owned by the active table; this view only routes record reads.
+func LayerTables(active, frozen *memtable.Table) tableView {
+	return layeredTable{active: active, frozen: frozen}
+}
+
+type layeredTable struct {
+	active *memtable.Table
+	frozen *memtable.Table
+}
+
+func (t layeredTable) ActiveRange(streamID uint64) (base, next uint64, ok bool) {
+	frozenBase, frozenNext, frozenOK := t.frozen.ActiveRange(streamID)
+	activeBase, activeNext, activeOK := t.active.ActiveRange(streamID)
+	switch {
+	case frozenOK && frozenBase < frozenNext:
+		return frozenBase, max(frozenNext, activeNext), true
+	case activeOK:
+		return activeBase, activeNext, true
+	case frozenOK:
+		return frozenBase, frozenNext, true
+	default:
+		return 0, 0, false
+	}
+}
+
+func (t layeredTable) Read(streamID, from uint64, maxRecords int) ([]format.RecordFrame, uint64, error) {
+	if maxRecords <= 0 {
+		return nil, from, nil
+	}
+	frozenBase, frozenNext, frozenOK := t.frozen.ActiveRange(streamID)
+	activeBase, activeNext, activeOK := t.active.ActiveRange(streamID)
+	if frozenOK && from >= frozenBase && from < frozenNext {
+		limit := maxRecords
+		if available := frozenNext - from; available < uint64(limit) {
+			limit = int(available)
+		}
+		records, next, err := t.frozen.Read(streamID, from, limit)
+		if err != nil || len(records) == maxRecords || next < frozenNext {
+			return records, next, err
+		}
+		if activeOK && next >= activeBase && next < activeNext {
+			more, activeNextSequence, activeErr := t.active.Read(streamID, next, maxRecords-len(records))
+			return append(records, more...), activeNextSequence, activeErr
+		}
+		return records, next, nil
+	}
+	if activeOK && from >= activeBase {
+		return t.active.Read(streamID, from, maxRecords)
+	}
+	if frozenOK {
+		return t.frozen.Read(streamID, from, maxRecords)
+	}
+	return t.active.Read(streamID, from, maxRecords)
 }
 func (s *Store) Read(streamID, from uint64, maxRecords int, maxBytes uint64) (Result, error) {
 	tail, ok, err := s.tails.Lookup(streamID)
