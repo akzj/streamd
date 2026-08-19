@@ -7,6 +7,7 @@ duration=${SOAK_DURATION:-10m}
 workers=${SOAK_WORKERS:-16}
 streams=${SOAK_STREAMS:-10000}
 payload=${SOAK_PAYLOAD_BYTES:-1024}
+rate=${SOAK_REQUESTS_PER_SECOND:-100}
 sample_interval=${SOAK_SAMPLE_INTERVAL:-60}
 run_id=${SOAK_RUN_ID:-"$(date -u +%Y%m%dT%H%M%SZ)-$$"}
 run_dir="$repo_root/.tmp/soak/$run_id"
@@ -18,6 +19,10 @@ case "$sample_interval" in
   ''|*[!0-9]*) echo "SOAK_SAMPLE_INTERVAL must be seconds" >&2; exit 2;;
 esac
 [ "$sample_interval" -gt 0 ] || { echo "SOAK_SAMPLE_INTERVAL must be positive" >&2; exit 2; }
+case "$rate" in
+  ''|*[!0-9]*) echo "SOAK_REQUESTS_PER_SECOND must be a positive integer" >&2; exit 2;;
+esac
+[ "$rate" -gt 0 ] || { echo "SOAK_REQUESTS_PER_SECOND must be positive" >&2; exit 2; }
 
 mkdir -p "$run_dir/bin" "$run_dir/primary" "$run_dir/standby"
 (cd "$repo_root" && go build -o "$run_dir/bin/streamd-bench" ./cmd/streamd-bench)
@@ -40,6 +45,7 @@ trap 'exit 143' TERM
   -duration "$duration" -mode strict \
   -workers "$workers" -streams "$streams" -precreate-streams \
   -payload-bytes "$payload" -batch 1 -checkpoint-interval 1m \
+  -max-requests-per-second "$rate" -retention-interval 1h -max-retained-wal-bytes 4294967296 \
   -data "$run_dir/primary" -standby-data "$run_dir/standby" \
   -verify=true >"$run_dir/report.json" 2>"$run_dir/benchmark.log" &
 bench_pid=$!

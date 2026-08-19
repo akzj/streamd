@@ -21,6 +21,7 @@ import (
 	"github.com/akzj/streamd/internal/storage/format"
 	"github.com/akzj/streamd/internal/storage/fsutil"
 	"github.com/akzj/streamd/internal/storage/scrub"
+	"github.com/akzj/streamd/internal/storage/snapshot"
 	"github.com/akzj/streamd/internal/storage/wal"
 )
 
@@ -52,6 +53,10 @@ type report struct {
 	ReopenVerified   bool         `json:"reopen_verified"`
 	ReopenHeapAlloc  uint64       `json:"reopen_heap_alloc_bytes,omitempty"`
 	ReopenHeapSys    uint64       `json:"reopen_heap_sys_bytes,omitempty"`
+	Checkpoints      uint64       `json:"checkpoints"`
+	Compactions      uint64       `json:"compactions"`
+	Snapshots        uint64       `json:"snapshots"`
+	WALDeletedBytes  uint64       `json:"wal_deleted_bytes"`
 	GroupCommit      commitReport `json:"group_commit"`
 }
 
@@ -122,8 +127,11 @@ func main() {
 	queueCapacity := flag.Int("queue-capacity", 1024, "bounded WAL request queue capacity")
 	precreate := flag.Bool("precreate-streams", false, "create every Stream before the timed steady-state run")
 	verifyReopen := flag.Bool("verify-reopen", false, "close, reopen, and sample the checkpointed store before scrub (single mode)")
+	maxRequestsPerSecond := flag.Int("max-requests-per-second", 0, "global request rate ceiling; 0 is unlimited")
+	retentionInterval := flag.Duration("retention-interval", 0, "online linked Snapshot and WAL collection interval; 0 disables")
+	maxRetainedWALBytes := flag.Uint64("max-retained-wal-bytes", 4<<30, "retained WAL budget used by online collection")
 	flag.Parse()
-	if *duration <= 0 || *workers <= 0 || *streams < *workers || *batch <= 0 || *payloadBytes < 0 || *checkpoint < 0 || *groupDelay <= 0 || *groupRequests <= 0 || *groupBytes == 0 || *queueCapacity <= 0 || (*mode != "single" && *mode != "strict") {
+	if *duration <= 0 || *workers <= 0 || *streams < *workers || *batch <= 0 || *payloadBytes < 0 || *checkpoint < 0 || *groupDelay <= 0 || *groupRequests <= 0 || *groupBytes == 0 || *queueCapacity <= 0 || *maxRequestsPerSecond < 0 || *retentionInterval < 0 || (*retentionInterval > 0 && *checkpoint == 0) || (*mode != "single" && *mode != "strict") {
 		fatal(fmt.Errorf("invalid benchmark arguments"))
 	}
 	groupOptions := engine.GroupCommitOptions{MaxDelay: *groupDelay, MaxRequests: *groupRequests, MaxBytes: *groupBytes, QueueCapacity: *queueCapacity}
@@ -207,6 +215,18 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), *duration)
 	defer cancel()
 	var requests, records, bytesWritten, failures, deadlineExits, uncertainResults atomic.Uint64
+	var checkpoints, compactions, snapshotsCreated, walDeletedBytes atomic.Uint64
+	var pace <-chan time.Time
+	var paceTicker *time.Ticker
+	if *maxRequestsPerSecond > 0 {
+		interval := time.Second / time.Duration(*maxRequestsPerSecond)
+		if interval <= 0 {
+			interval = time.Nanosecond
+		}
+		paceTicker = time.NewTicker(interval)
+		defer paceTicker.Stop()
+		pace = paceTicker.C
+	}
 	payload := make([]byte, *payloadBytes)
 	var wait sync.WaitGroup
 	started := time.Now()
@@ -222,6 +242,13 @@ func main() {
 			}
 			counter := uint64(0)
 			for ctx.Err() == nil {
+				if pace != nil {
+					select {
+					case <-ctx.Done():
+						return
+					case <-pace:
+					}
+				}
 				streamIndex := worker + int(counter%uint64(workerStreams))**workers
 				inputs := make([]engine.InputRecord, *batch)
 				for i := range inputs {
@@ -264,6 +291,8 @@ func main() {
 		}
 		ticker := time.NewTicker(*checkpoint)
 		defer ticker.Stop()
+		lastSnapshot := time.Now()
+		previousSnapshot := ""
 		for {
 			select {
 			case <-ctx.Done():
@@ -271,6 +300,38 @@ func main() {
 			case <-ticker.C:
 				if _, _, checkpointErr := store.Checkpoint(); checkpointErr != nil {
 					failures.Add(1)
+					continue
+				}
+				checkpoints.Add(1)
+				compacted, compactErr := store.Compact(engine.CompactionOptions{MinSegments: 32, MaxInputSegments: 8, MaxInputBytes: 64 << 20})
+				if compactErr != nil {
+					failures.Add(1)
+					continue
+				}
+				if compacted.Created {
+					compactions.Add(1)
+				}
+				if *retentionInterval > 0 && time.Since(lastSnapshot) >= *retentionInterval {
+					destination := filepath.Join(dataPath, "snapshots", fmt.Sprintf("soak-%020d", time.Now().UnixNano()))
+					created, snapshotErr := snapshot.CreateOnlineLinked(store, destination)
+					if snapshotErr == nil {
+						_, snapshotErr = snapshot.Verify(created.Path)
+					}
+					var collected wal.GCResult
+					if snapshotErr == nil {
+						collected, snapshotErr = store.CollectWAL(engine.WALCollectionEvidence{SnapshotEntryID: created.CheckpointEntryID, SnapshotVerified: true, MaxRetainedBytes: *maxRetainedWALBytes})
+					}
+					if snapshotErr != nil {
+						failures.Add(1)
+						continue
+					}
+					snapshotsCreated.Add(1)
+					walDeletedBytes.Add(collected.DeletedBytes)
+					lastSnapshot = time.Now()
+					if previousSnapshot != "" {
+						_ = os.RemoveAll(previousSnapshot)
+					}
+					previousSnapshot = created.Path
 				}
 			}
 		}
@@ -285,6 +346,10 @@ func main() {
 	drainSeconds := time.Since(drainStarted).Seconds()
 	commitStats := subtractCommitStats(store.CommitStats(), commitBaseline)
 	output := report{DurationSeconds: elapsed, SetupSeconds: setupSeconds, DrainSeconds: drainSeconds, Precreated: *precreate, Workers: *workers, Streams: *streams, BatchRecords: *batch, PayloadBytes: *payloadBytes, Requests: requests.Load(), Records: records.Load(), Bytes: bytesWritten.Load(), Errors: failures.Load(), DeadlineExits: deadlineExits.Load(), UncertainResults: uncertainResults.Load(), DataDirectory: dataPath, Mode: *mode, StandbyDirectory: standbyPath}
+	output.Checkpoints = checkpoints.Load()
+	output.Compactions = compactions.Load()
+	output.Snapshots = snapshotsCreated.Load()
+	output.WALDeletedBytes = walDeletedBytes.Load()
 	output.RequestsPerSec = float64(output.Requests) / elapsed
 	output.RecordsPerSec = float64(output.Records) / elapsed
 	output.MiBPerSec = float64(output.Bytes) / elapsed / (1 << 20)
