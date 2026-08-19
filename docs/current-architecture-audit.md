@@ -3,9 +3,9 @@
 | 属性 | 内容 |
 | --- | --- |
 | 审计性质 | 代码现实版整体架构审计，不是目标架构复述 |
-| 审计基线 | `d9e3c91`（`main`，2026-08-19） |
+| 审计基线 | `348c042`（`main`，2026-08-19） |
 | 审计日期 | 2026-08-19 |
-| 相对上次审计新增 | Primary/Single Freeze/Switch、分层 MemTable 读视图、锁外 Segment 与完整投影发布 |
+| 相对上次审计新增 | Active WAL 增量 Seal Digest；恢复扫描重建有效前缀 Hash 状态；Seal 不再全量重读 WAL |
 | 覆盖范围 | API、存储、索引、Checkpoint、Compaction、恢复、Snapshot、WAL GC、Strict HA、并发与运维入口 |
 | 验证边界 | 本轮代码、单元/race/vet；既有 Compose HA 未在本轮重跑，不等同于性能、长稳、磁盘故障或生产部署验收 |
 
@@ -39,8 +39,9 @@ recovery-blocked 状态，输出确定性 Recovery Task。
 此前 Standby 每次 Append 后全量重扫 Active WAL、committed MemTable 永不 Flush，以及 Primary/Single 在完整
 Segment/投影构建期间停止 Append 的持续运行短板已经关闭。两条 Checkpoint 路径都会先 Freeze/Switch，再在
 锁外发布 Segment、Tail、Locator、Registry 与 Manifest；过渡期 Reader 组合 Frozen 与 Active MemTable。
-Standby 未提交但已 durable 的 WAL 后缀不进入 Manifest，并在重启后保留。WAL Seal 仍在 Freeze 临界区全量
-计算当前文件 SHA-256；WAL 在线 GC、Standby Segment Compaction 和容量水位仍未闭环。
+Standby 未提交但已 durable 的 WAL 后缀不进入 Manifest，并在重启后保留。Active WAL 的 SHA-256 状态现在
+随 Header/Append 增量推进；重启扫描只把完整有效前缀纳入 Hash，截断后可继续 Append，Seal 不再全量重读
+当前文件。WAL 在线 GC、Standby Segment Compaction 和容量水位仍未闭环。
 
 结论：**可以继续开发，当前代码适合作为正确性优先的 V1 工程基线；尚不能宣称生产就绪。后续应按
 跨模块风险推进，而不是继续增加彼此孤立的存储功能。**
@@ -204,7 +205,7 @@ Overlay，并删除只用于切换的 seed-only Tail。没有当前 Leader 时�
 | 对象 | 当前角色 | 是否可重建 | 当前加载方式 |
 | --- | --- | --- | --- |
 | Record Frame | 逻辑 Record 的规范编码 | 否 | WAL/MemTable/Segment 中读取 |
-| WAL | 尚未进入 Manifest Checkpoint 的顺序事实和复制日志 | 被 Segment+Snapshot 覆盖后可回收 | Active WAL 打开；Append 后 O(1) 推进 History，Rotate/启动时重建文件链 |
+| WAL | 尚未进入 Manifest Checkpoint 的顺序事实和复制日志 | 被 Segment+Snapshot 覆盖后可回收 | Active WAL 打开；Append 后 O(1) 推进 History 与 Seal Digest，Rotate/启动时重建文件链 |
 | Segment | 已 Checkpoint 的不可变 Record 事实 | 无其他副本时不可重建 | 启动验证轻量 Header/Footer；仅最新 Directory 恢复时间水位，历史 Directory 按需打开 |
 | Registry Stream | 名称到 StreamID 分配事实 | 否 | Segment/WAL；Snapshot 只加速查询 |
 | Manifest + CURRENT | 当前不可变 Segment/Artifact 集合的原子发布边界 | 不能从 Cache 推断 | 当前 Generation 常驻内存 |
@@ -304,9 +305,13 @@ Freeze/Switch 以后立即释放 Engine `mu`，Segment 和完整投影构建期�
 checkpoint 之后创建的 Registry Mapping，并切到 Active-only Reader。Crash Hook 覆盖 WAL Rotate、Manifest
 发布和最终视图安装；并发测试覆盖构建期间 Append、Read、Inspect、ResolveTime、幂等与新 Stream 创建。
 
-Append 暂停窗口尚未完全常数化：Freeze 阶段需要枚举当前活跃 Tail，`WAL.Rotate` 中的 Seal 会在锁内重新
-读取整个 Active WAL 计算 SHA-256，并执行新 WAL/WAL-CURRENT 的 fsync。它不再包含 Segment 与历史投影
-规模，但仍随本周期 WAL 大小和活跃 Stream 数增长。
+Append 暂停窗口尚未完全常数化：Freeze 阶段需要枚举当前活跃 Tail，`WAL.Rotate` 仍执行旧 WAL Sync、
+Footer Sync、新 WAL Header Sync、目录 Sync 和 `WAL-CURRENT` 原子发布。Seal Digest 已在 Append 时增量
+维护，不再于锁内重读并 Hash 整个 Active WAL；但停顿仍受存储 fsync 时延与活跃 Stream 数影响。
+
+开发机 `BenchmarkSealWithIncrementalDigest` 在数据预先 Sync 后测得 1 MiB/32 MiB WAL 的 Seal 分别约
+3.3 ms/10.6 ms（各 3 次）。它证明基准边界已经建立，并暴露剩余文件系统同步成本；样本数和硬件均不足以
+形成生产 p99 或“延迟与 WAL 大小无关”的结论。
 
 Locator/Tail 投影不会再一次性物化全部 Segment Directory。Builder 每次只访问一个 Directory，写入
 定长临时 Run，以 fan-in 32 多轮外部归并；归并结果按 Stream/Sequence 排序后，每次只编码一个 Locator
@@ -505,6 +510,7 @@ Catch-up 的跨进程竞争；同一 `wal.History` 内部的 Pin/Collect 由 mut
 | gRPC Record Stream API | Implemented | Append、AppendBatch、Read、ResolveTime、Inspect、Subscribe |
 | mTLS + namespace RBAC | Implemented | 业务 Client 和复制 Peer 均验证身份；Admin 仅允许 loopback |
 | WAL/Batch/Expected Sequence/幂等 | Implemented | Request ID + Request Hash；不确定结果可用原请求重试 |
+| WAL Seal Digest | Implemented | Create/Append 增量维护；恢复扫描从完整有效前缀重建；Seal 不重读 WAL |
 | Group Commit | Implemented | 有界 channel + 单 writer；多 Stream 合并；分阶段累计统计跨 Checkpoint 连续；Primary/Single 已接 Prometheus |
 | Segment/Manifest/Checkpoint | Implemented | 不可变文件、校验 Footer、原子 CURRENT、Freeze/Switch 后锁外构建、Crash Test |
 | Tail/Locator/Registry 投影 | Implemented | 损坏可回退事实数据；正常查询使用有界 Cache |
@@ -561,6 +567,9 @@ Catch-up 的跨进程竞争；同一 `wal.History` 内部的 Pin/Collect 由 mut
 10. **Primary/Single Checkpoint 长时间停止 Append**：Checkpoint 在短临界区 Freeze/Switch WAL、MemTable、
     Committer 与分层 Reader；Segment、投影和 Manifest 在锁外构建。最终 Barrier 防止清理尚未 Apply 的
     seed-only Tail，Registry Overlay 合并保留构建期间创建的新 Stream。
+11. **WAL Seal 在 Freeze 临界区全量重读并 Hash**：Log 从 Header 开始维护增量 SHA-256 状态，每个完整
+    Append 成功后推进；重启扫描只纳入 CRC、Entry 和连续性验证通过的完整前缀。截断恢复后继续 Append、
+    Seal 和完整 Sealed WAL 扫描由回归测试覆盖。
 
 这些边界不得为了自动化或缩短 RTO 而放宽。
 
@@ -579,25 +588,18 @@ Catch-up 的跨进程竞争；同一 `wal.History` 内部的 Pin/Collect 由 mut
 
 ### 9.3 P1：下一阶段架构风险
 
-#### P1-1 Checkpoint Freeze 窗口仍随 WAL 大小增长
-
-Primary/Single 的 Segment、投影和 Manifest 已移到 Engine `mu` 外；但 `WAL.Seal` 仍会在 Freeze 临界区
-从头读取 Active WAL 计算 SHA-256，Rotate 还包含多个 fsync，Tail seed 也与当前活跃 Stream 数线性相关。
-下一步应让 WAL 在顺序 Append 时增量维护 Seal digest，或把可验证的密封计算拆出 Admission 临界区；必须
-同时保持 Footer 内容校验、WAL-CURRENT 原子发布、Entry CRC 链和 Crash Recovery 语义。
-
-#### P1-2 容量与回收没有运行闭环
+#### P1-1 容量与回收没有运行闭环
 
 Checkpoint 只有时间触发，没有 MemTable/WAL 字节阈值、Immutable backlog、磁盘 High/Critical Admission
 或 Flush 预留空间；Snapshot 创建和 WAL GC 仍是离线运维入口。Standby 已能 Rotate/Flush，但 Sealed WAL
 与 Segment 仍会持续占用磁盘，且尚未执行有界 Compaction。
 
-#### P1-3 Recovery Task 不是恢复状态机
+#### P1-2 Recovery Task 不是恢复状态机
 
 任务没有持久记录、claim/ack、重试状态或自动执行器。相同事实通过 hash 得到稳定 ID，但进程重启获得
 新 Term 后会形成新任务。当前 Runbook 必须重新读取诊断并核对事实，不能把旧 `task_id` 当授权令牌。
 
-#### P1-4 剩余稀疏元数据与 Stream 状态仍未完全有界
+#### P1-3 剩余稀疏元数据与 Stream 状态仍未完全有界
 
 Recovery 全量 Directory/Extent/Tail/Locator Root 常驻已经关闭：运行视图只保留轻量 Descriptor，Tail
 使用固定 Slot 按需读取和容量 1024 的 LRU，Locator Root 使用固定 Entry 的 `ReadAt` 二分与容量 1024
@@ -608,13 +610,13 @@ Snapshot Writer。剩余规模阻塞是 Registry Sparse Block Index 与 Manifest
 约束，但内部仍会物化一次选定输入。Engine 的 `appendGates` 和 `notifications` 还会按曾访问 Stream 常驻，
 新 Stream 分配也仍在全局 Engine 锁内同步提交 Registry Stream 0。
 
-#### P1-5 Node Runtime 生命周期仍未完全统一
+#### P1-4 Node Runtime 生命周期仍未完全统一
 
 Primary、Standby 和 recovery-blocked 已共享 Replicated Admin Runtime 与诊断 Provider 切换，但 Single
 仍独立管理 Admin，三种角色也分别管理 gRPC、后台 ticker 和 storage shutdown。后续抽取必须基于实际
 重复继续收敛，不能为了形式统一移动角色、Durability 和恢复判断的强类型边界。
 
-#### P1-6 Replication State 是持久下界而非实时真值
+#### P1-5 Replication State 是持久下界而非实时真值
 
 State 周期落盘是避免每次 Group Commit 增加 metadata fsync 的有意取舍；但 Strict storage checkpoint
 必须在 Freeze 临界区先发布覆盖冻结前缀的 committed/applied State 下界，锁外 Manifest 不得越过该边界。
@@ -623,6 +625,8 @@ Promotion、Snapshot、WAL GC 和诊断仍必须结合物理 WAL；任何新模�
 
 ### 9.4 P2：性能与运维成熟度
 
+- Checkpoint Freeze 已消除 WAL 全量 Hash，但仍包含多个 fsync，并按当前活跃 Stream 枚举 Tail；需要在
+  目标磁盘和规模下测量 p99，而不是仅凭本地微基准继续改写协议；
 - Compaction 峰值内存仍与一次输入的记录量相关；
 - ResolveTime 是 Sequence 二分加随机 Record 读取，不是专用时间索引；
 - Locator 损坏会逐 Segment 按需扫描 Directory，故障时延没有 SLO，但不会常驻全部 Extent；
