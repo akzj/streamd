@@ -221,7 +221,8 @@ remote snapshot bytes
 
 当前 `make test-soak-72h` 已提供可审计执行入口：默认 100 requests/s 控制本地 72 小时磁盘预算，周期
 Checkpoint 后执行有界 Compaction，每小时创建 verified linked Snapshot 并回收 Primary covered WAL；
-运行目录持续保存 RSS/VSZ/FD/Primary bytes/Standby bytes。该 harness 的 Standby 是独立 durable WAL，
+运行目录持续保存 RSS/VSZ/FD/Primary bytes/Standby bytes，以及 Primary/Standby 的
+WAL/Segment/Locator/Trash/Snapshot 数量。该 harness 的 Standby 是独立 durable WAL，
 不是完整 Standby 进程，因此 HA 进程切换与网络故障仍由 Compose 门禁覆盖，不能由此替代。
 
 正式 72 小时运行前的 3 分钟 Strict smoke 必须至少跨两次 Checkpoint，并确认 `trash/` 不随投影替换增长。
@@ -233,6 +234,9 @@ Primary 始终只有 1 个 live Locator Pack 且 `trash_files=0`。
 benchmark 收敛到同一个在线 retention 事务，并让 benchmark 把周期 Checkpoint/Compaction/Snapshot 错误
 实时写入 stderr。修复后的 20 秒 Strict 诊断跨 3 次 Snapshot，`errors=0`、Scrub/Standby 验证成功、
 只保留 1 个 Snapshot、Primary WAL 回落到 2 个。该诊断只证明缺陷闭环，不能替代重新计时的 72 小时 Run。
+随后 Harness 结束边界还发现并关闭 Scrub 误报：当 Manifest checkpoint 已由 Snapshot 覆盖、WAL 前缀
+已经合法删除且没有后续记录时，首个保留 WAL 从 checkpoint+1 开始。Scrub 现验证该边界及非空首文件的
+previous CRC；40 秒 Harness 回归完成两次 GC、最终 Scrub/Standby 验证成功并输出 14 列资源/对象采样。
 
 至少包含：
 

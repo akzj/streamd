@@ -3,7 +3,7 @@
 | 属性 | 内容 |
 | --- | --- |
 | 审计性质 | 代码现实版整体架构审计，不是目标架构复述 |
-| 审计基线 | `a7380c2`（`main`，2026-08-19；本文件后的审计修正另行提交） |
+| 审计基线 | `b801c08`（`main`，2026-08-19；本文件后的审计修正另行提交） |
 | 审计日期 | 2026-08-19 |
 | 相对上次审计新增 | 容量 Admission、阈值维护、在线 Snapshot/WAL GC、Standby Compaction、运行时 Stream 状态回收、规模/故障/兼容/Soak 门禁 |
 | 覆盖范围 | API、存储、索引、Checkpoint、Compaction、恢复、Snapshot、WAL GC、Strict HA、并发与运维入口 |
@@ -591,6 +591,10 @@ Collect 可完成但不会删除被 Pin 文件。
     编排，benchmark 删除 WAL 后没有发布 Installed Snapshot 恢复锚点，下一次 State checkpoint 被格式
     不变量拒绝。两条调用链现共用 `storage/retention.CreateSnapshotAndCollect`；回归测试连续推进两个
     Strict Snapshot，秒级 Strict smoke 完成 3 次轮换、错误为 0、最终只保留 1 个 Snapshot。
+16. **合法 WAL 前缀回收后 Scrub 误报 Manifest checkpoint 无法验证**：没有后续写入时，首个保留 WAL
+    正好从 `Manifest.LastEntryID+1` 开始，旧 Scrub 仍要求某个保留文件以 checkpoint 结尾。Scrub 现与
+    Recovery 使用相同边界：接受该连续起点；若首文件非空，还必须验证首 Entry 的 previous CRC。Harness
+    回归在两次在线 GC 后完成最终 Scrub，错误为 0。
 
 这些边界不得为了自动化或缩短 RTO 而放宽。
 
