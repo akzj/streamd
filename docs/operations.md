@@ -144,6 +144,26 @@ streamd -config /etc/streamd/streamd.json
 不能通过增大内存占用强制满足 Segment 数目标。打开的 Segment Reader 由独立 Handle Cache 限制，
 当前默认最多保留 64 个空闲/复用 Handle。
 
+容量维护同样是重启生效配置，Single、Primary 和 Standby 共用采样与 Admission 水位；Primary/Single
+还会生成本地在线 Snapshot 并回收已被 Manifest 与 verified Snapshot 双重覆盖的 sealed WAL：
+
+| 字段 | 默认值 | 语义 |
+| --- | ---: | --- |
+| `maintenance.check_interval` | `1s` | 容量与维护条件采样周期 |
+| `maintenance.memtable_bytes` | 67108864 | 触发 Checkpoint 的 Active MemTable 字节 |
+| `maintenance.active_wal_bytes` | 268435456 | 触发 Checkpoint/Rotate 的 Active WAL 字节 |
+| `maintenance.disk_high_percent` | 85 | 进入 High 并加速 Checkpoint/Compaction/retention |
+| `maintenance.disk_critical_percent` | 95 | 拒绝新写，保留读与维护 |
+| `maintenance.minimum_available_bytes` | 1073741824 | 低于该值进入 Critical；恢复要求大于两倍并低于 High |
+| `maintenance.snapshot_interval` | `6h` | verified 在线 Snapshot 的最长间隔 |
+| `maintenance.max_retained_wal_bytes` | 4294967296 | retention 目标；不得低于 Active WAL 阈值 |
+
+容量采样失败按 Critical 处理。Critical 不阻止维护 Snapshot；本地自动 Snapshot 对不可变 Artifact 使用
+同文件系统硬链接，避免在磁盘压力下复制整个 Segment 集。只有新 Snapshot 完整发布并再次 Verify 后才
+执行 WAL 删除；即使删除后仍超过预算，新的 earliest WAL 位置也必须先持久化，再报告 retention pressure。
+Standby 每次成功 Checkpoint 后同样执行一次有界 Compaction，但当前仍不自动创建恢复 Snapshot 或传输
+Primary Snapshot。
+
 Strict 节点使用同一个二进制。Primary 的关键配置如下，Standby 将 `role` 改为 `standby`，且不配置
 `peer_*`：
 
@@ -176,6 +196,23 @@ Strict 节点使用同一个二进制。Primary 的关键配置如下，Standby 
 线性事务取得新 Term/Lease、旧 Leader Key 已消失、Standby 前缀追平后才打开公共 Stream API。
 Standby 只注册内部 ReplicationService，不接受公共 Append。所需 WAL 已 GC 时 Primary 保持不就绪，
 运维先按 Snapshot Install Runbook 恢复 Standby，再重启 Primary 完成增量追赶。
+
+发布候选的本地门禁入口：
+
+```bash
+make test
+make test-race
+make test-faults       # ENOSPC/EROFS/EIO、慢 fsync、短写、torn WAL、crash point
+make test-compat       # 固定 V1 基线双向 upgrade/rollback scrub
+make test-ha           # 三成员 etcd、mTLS、故障与恢复协议
+make test-scale        # 默认一百万 Stream，保留峰值 RSS/重开/全量 scrub 证据
+make test-soak-72h     # 有速率与磁盘预算的 72 小时持续写、维护和最终 scrub
+```
+
+默认 `make test-scale` 会创建一百万个低密度 Stream。V1 Locator 格式至少为每个 Stream 分配一个
+64 KiB Page，实测最终 Locator Pack 为 65,536,069,720 bytes；执行前至少预留 80 GiB 可用空间，并将
+运行目录放在允许产生该体量临时/最终 Artifact 的测试磁盘。Locator Verify 和 Scrub 使用流式 SHA-256，
+不会再把整个 Pack 读入内存，但这不降低磁盘占用。
 
 所有 Single、Primary 和 Standby 启动路径都在打开 Engine、连接 Coordinator 或监听网络以前检查
 `SNAPSHOT-INSTALL.json`，并完成可恢复的安装事务。存在无效或无法完成的 Journal 时节点失败关闭，

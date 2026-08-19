@@ -166,6 +166,16 @@ Object storage implementation
 
 Extent Page Size 只有在查询 Hop、IO 放大、内存和构建成本综合结果明确后才能冻结。
 
+2026-08-19 的默认一百万 Stream 验收已经给出第一组真实边界：预创建耗时 4146.99 秒，Checkpoint
+生成 1,000,000 个 64 KiB Locator Page，单个 Locator Pack 为 65,536,069,720 bytes，最终数据目录约
+63 GiB；重开耗时 0.273 秒，重开后 Heap Alloc 为 39,538,424 bytes，全量 Scrub 成功。该结果证明启动
+元数据已按需读取，但也证明“一 Stream 至少一固定 Page”的 V1 格式对大量低记录数 Stream 存在约
+64 KiB/Stream 的确定性磁盘放大，后续必须比较可变长 Page 或多 Stream Page，不能只调整 Cache 容量。
+
+原验收二进制的 Scrub 因 `VerifyPack` 整体 `ReadFile` 出现 65,357,528 KiB 峰值 RSS；改为流式 SHA-256
+后，在同一 65.5 GB Pack 上独立全量 Scrub 用时 41.45 秒、峰值 RSS 626,280 KiB、退出码 0。两组数字
+必须分别解读：前者是已关闭的校验实现缺陷，后者不消除 Locator 格式本身的磁盘放大。
+
 ## 10. 空间效率
 
 对每种 Record 大小报告：
@@ -209,6 +219,11 @@ remote snapshot bytes
 
 ## 13. Soak Test
 
+当前 `make test-soak-72h` 已提供可审计执行入口：默认 100 requests/s 控制本地 72 小时磁盘预算，周期
+Checkpoint 后执行有界 Compaction，每小时创建 verified linked Snapshot 并回收 Primary covered WAL；
+运行目录持续保存 RSS/VSZ/FD/Primary bytes/Standby bytes。该 harness 的 Standby 是独立 durable WAL，
+不是完整 Standby 进程，因此 HA 进程切换与网络故障仍由 Compose 门禁覆盖，不能由此替代。
+
 至少包含：
 
 - 72 小时持续混合读写；
@@ -248,6 +263,9 @@ streamd 的 Record Header、CRC、Dense Index、Registry 和主备复制开销�
 Profile 采集轮次与正常基准轮次分开，避免工具扰动结果。
 
 ## 16. 发布门槛
+
+自动化入口包括 `make test-faults`、`make test-compat`、`make test-ha`、`make test-scale` 和
+`make test-soak-72h`。前四项的退出状态可以即时判定；72 小时门禁只能在自然结束和资源曲线复核后判定。
 
 V1 不在设计文档预设绝对吞吐数字。实现进入生产候选前必须满足：
 

@@ -3,11 +3,11 @@
 | 属性 | 内容 |
 | --- | --- |
 | 审计性质 | 代码现实版整体架构审计，不是目标架构复述 |
-| 审计基线 | `348c042`（`main`，2026-08-19） |
+| 审计基线 | `97b528f`（`main`，2026-08-19；本文件后的审计修正另行提交） |
 | 审计日期 | 2026-08-19 |
-| 相对上次审计新增 | Active WAL 增量 Seal Digest；恢复扫描重建有效前缀 Hash 状态；Seal 不再全量重读 WAL |
+| 相对上次审计新增 | 容量 Admission、阈值维护、在线 Snapshot/WAL GC、Standby Compaction、运行时 Stream 状态回收、规模/故障/兼容/Soak 门禁 |
 | 覆盖范围 | API、存储、索引、Checkpoint、Compaction、恢复、Snapshot、WAL GC、Strict HA、并发与运维入口 |
-| 验证边界 | 本轮代码、单元/race/vet；既有 Compose HA 未在本轮重跑，不等同于性能、长稳、磁盘故障或生产部署验收 |
+| 验证边界 | 单元/race/vet/buf、Compose HA、确定性存储故障、V1 双向兼容和百万 Stream 门禁已通过；72 小时结果按本文证据状态单独记录 |
 
 ## 1. 审计结论
 
@@ -21,7 +21,7 @@ Segment、Manifest、投影索引、mTLS/RBAC、复制水位和诊断不是设�
 误当作可传输 Package。`PlanSnapshot` 不再只返回进程错误，而是进入只开放 loopback Admin 的
 recovery-blocked 状态，输出确定性 Recovery Task。
 
-当前仍不能按“生产级完整 HA Stream Store”验收，原因已经从局部数据正确性转向运行闭环和规模边界：
+当前仍不能按“生产级完整 HA Stream Store”验收，原因已经从局部数据正确性转向跨机恢复与目标环境证据：
 
 1. Snapshot 恢复是结构化人工任务，不包含传输、执行、确认或持久任务状态机；正常数据面在任务完成前
    保持关闭。
@@ -32,16 +32,20 @@ recovery-blocked 状态，输出确定性 Recovery Task。
    `NO_RECOVERY_SOURCE`、不开放公共 gRPC，并在人工创建 replacement Snapshot 后恢复；该路径同样不是
    自动恢复状态机。
 4. 历史 Stream Directory、Extent、Tail 与 Locator Root 已不再在启动时全量加载或常驻；启动仍全量
-   保留 Manifest Segment Reference 与 Registry Sparse Block Index；Locator/Tail/Registry 构建中的
-   全量 Stream 投影常驻峰值已关闭，但百万 Stream 的 RSS/时延目标尚未验收。
-5. 没有生产级 Snapshot/GC 调度、对象存储、容量故障策略、长稳和规模验收。
+   保留 Manifest Segment Reference 与 Registry Sparse Block Index。默认一百万 Stream 验收退出码 0，
+   重开 0.273 秒、Heap Alloc 39.5 MB、全量 Scrub 成功；但首次预创建耗时 4146.99 秒，固定 64 KiB
+   Locator Page 形成 65.5 GB Pack。启动内存边界得到证明，低密度 Stream 的索引空间效率没有通过。
+5. 自动 Snapshot/WAL GC 和容量故障策略已经接入 Single/Primary；尚无对象存储、Snapshot 自动传输，
+   Standby sealed WAL 也不能在没有可安装 Snapshot 证据时独立回收。72 小时结果必须等真实运行结束。
 
 此前 Standby 每次 Append 后全量重扫 Active WAL、committed MemTable 永不 Flush，以及 Primary/Single 在完整
 Segment/投影构建期间停止 Append 的持续运行短板已经关闭。两条 Checkpoint 路径都会先 Freeze/Switch，再在
 锁外发布 Segment、Tail、Locator、Registry 与 Manifest；过渡期 Reader 组合 Frozen 与 Active MemTable。
 Standby 未提交但已 durable 的 WAL 后缀不进入 Manifest，并在重启后保留。Active WAL 的 SHA-256 状态现在
 随 Header/Append 增量推进；重启扫描只把完整有效前缀纳入 Hash，截断后可继续 Append，Seal 不再全量重读
-当前文件。WAL 在线 GC、Standby Segment Compaction 和容量水位仍未闭环。
+当前文件。Single/Primary 现按 MemTable、Active WAL、时间与磁盘水位触发维护；Critical 拒绝新写但保留
+读、Checkpoint 和使用不可变硬链接的本地 Snapshot。verified Snapshot 与 Manifest 共同覆盖后才在线
+删除 sealed WAL。Standby 已接入同样的容量 Admission、Checkpoint 和有界 Segment Compaction。
 
 结论：**可以继续开发，当前代码适合作为正确性优先的 V1 工程基线；尚不能宣称生产就绪。后续应按
 跨模块风险推进，而不是继续增加彼此孤立的存储功能。**
@@ -515,7 +519,7 @@ Catch-up 的跨进程竞争；同一 `wal.History` 内部的 Pin/Collect 由 mut
 | Segment/Manifest/Checkpoint | Implemented | 不可变文件、校验 Footer、原子 CURRENT、Freeze/Switch 后锁外构建、Crash Test |
 | Tail/Locator/Registry 投影 | Implemented | 损坏可回退事实数据；正常查询使用有界 Cache |
 | Segment Handle/Locator Root/Locator Page/Registry Block Cache | Implemented | 默认容量 64/1024/256/64；引用计数或 LRU |
-| 自动有界 Compaction | Bounded | 输入 Segment 数/字节有界；内部仍按 Stream 聚合完整输入 Frame |
+| 自动有界 Compaction | Bounded | Single、Primary、Standby 均接入；输入 Segment 数/字节有界；内部仍按 Stream 聚合完整输入 Frame |
 | Strict 双 WAL Append | Implemented | 两端 durable 后成功；不自动降级 |
 | 数据副本拓扑 | Bounded | 固定 1 Primary + 1 Standby；静态 Peer；不支持多 Standby/数据 quorum |
 | etcd Term/Lease/Fencing | Implemented | Revision Term、Lease value/ModRevision/LeaseID 校验、Safety Margin |
@@ -527,13 +531,14 @@ Catch-up 的跨进程竞争；同一 `wal.History` 内部的 Pin/Collect 由 mut
 | 显式 Snapshot 恢复 | Implemented | 离线 create/verify/install/resume + Compose 空盘恢复证据 |
 | 自动 Snapshot 传输/安装 | Not implemented | 没有分块传输、对象地址、持久任务或安装确认协议 |
 | 旧主 Rejoin | Bounded | `ResolveRejoin` 仅决策函数；生产路径优先 Snapshot 重装 |
-| WAL GC | Bounded | 安全离线命令；无在线/周期调度 |
-| 在线 Snapshot | Bounded | `CreateOnline` 正确性边界已实现，但没有受控管理入口或调度 |
+| WAL GC | Bounded | 离线命令与 Single/Primary 在线周期调度；只删除 Manifest+verified Snapshot 覆盖的 sealed 前缀；无跨节点备份 |
+| 在线 Snapshot | Bounded | Single/Primary 自动生成并 Verify 本地 linked Snapshot；无传输、对象存储或独立故障域副本 |
+| 容量 Admission | Implemented | MemTable/Active WAL/High/Critical/最小可用字节阈值；Critical 拒绝新写并保留读与维护，带恢复滞回 |
 | Standby Read | Not implemented | Standby 只注册 ReplicationService |
 | HTTP Gateway | Not implemented | 只有 loopback Admin HTTP |
 | 对象存储/归档 | Not implemented | 没有实现和故障语义 |
 | 有界启动元数据 | Bounded | 历史 Directory/Extent/Tail/Locator Root 已延迟加载；Segment Reference、Registry Sparse Index 仍随规模增长 |
-| 百万 Stream/长稳/磁盘压力验收 | Not implemented | 现有 benchmark 不是生产容量证明 |
+| 百万 Stream/长稳/磁盘压力验收 | Bounded | 百万 Stream 重开与 Scrub 已通过，但 64 KiB/Stream Locator 放大超出合理空间目标；72h 仍只在最终报告成功后算通过 |
 | Dashboard | Deferred | 当前只有 Prometheus 指标和诊断 JSON |
 
 ## 9. 风险清单
@@ -570,6 +575,12 @@ Catch-up 的跨进程竞争；同一 `wal.History` 内部的 Pin/Collect 由 mut
 11. **WAL Seal 在 Freeze 临界区全量重读并 Hash**：Log 从 Header 开始维护增量 SHA-256 状态，每个完整
     Append 成功后推进；重启扫描只纳入 CRC、Entry 和连续性验证通过的完整前缀。截断恢复后继续 Append、
     Seal 和完整 Sealed WAL 扫描由回归测试覆盖。
+12. **在线 Primary Snapshot 越过 durable State**：Strict Primary 使用强制携带
+    `ReplicationState.Store` 的 Snapshot 入口；Checkpoint+Pin 在同一 Freeze 边界先持久化 committed/applied
+    下界。缺少 State Store 的 replicated Snapshot 被代码拒绝。
+13. **容量压力下无法回收或扩大空间**：Capacity Critical 不再阻止维护 Snapshot；自动本地 Snapshot 对
+    不可变 Artifact 使用硬链接，避免复制完整 Segment 集。WAL 删除后即使仍超过预算，也先持久化新的
+    earliest WAL 和 verified Snapshot，再返回 retention pressure。
 
 这些边界不得为了自动化或缩短 RTO 而放宽。
 
@@ -578,21 +589,23 @@ Catch-up 的跨进程竞争；同一 `wal.History` 内部的 Pin/Collect 由 mut
 当前没有发现新的、已由现有测试证明可直接破坏 committed 数据的开放 P0 缺陷；但以下验收缺口在
 生产声明前必须关闭：
 
-- 磁盘满、只读文件系统、短写、fsync 延迟/失败和文件损坏的节点级故障矩阵；
+- `ENOSPC`、`EROFS`、`EIO`、慢 fsync、短写、torn WAL 和 Checkpoint crash 的确定性门禁已建立；
+  仍需在目标内核、文件系统与 SSD 上执行设备级故障矩阵；
 - Snapshot/Restore Drill 的真实数据规模、恢复耗时和容量预算；
 - 长稳、进程反复崩溃、网络抖动以及 etcd member replacement；
-- 升级/回滚和磁盘格式兼容门禁；
+- 固定 V1 基线 `3555719` 的双向 upgrade/rollback 全量 Scrub 已建立；网络协议滚动升级仍需部署验收；
 - 明确的备份副本、密钥、审计与灾难恢复责任人。
 
 在这些证据完成前，`make test-ha` 只能证明当前受控拓扑的协议闭环，不能作为生产就绪证明。
 
 ### 9.3 P1：下一阶段架构风险
 
-#### P1-1 容量与回收没有运行闭环
+#### P1-1 容量与回收的剩余边界
 
-Checkpoint 只有时间触发，没有 MemTable/WAL 字节阈值、Immutable backlog、磁盘 High/Critical Admission
-或 Flush 预留空间；Snapshot 创建和 WAL GC 仍是离线运维入口。Standby 已能 Rotate/Flush，但 Sealed WAL
-与 Segment 仍会持续占用磁盘，且尚未执行有界 Compaction。
+Single/Primary 已按时间、MemTable、Active WAL 与磁盘 High/Critical 自动 Checkpoint、Compaction、Snapshot
+和 WAL GC；Standby 已接入 Admission、Checkpoint 与 Compaction。剩余边界是 Standby 不拥有 Primary 的
+可安装 Snapshot，不能独立回收 sealed WAL；自动 Snapshot 也只是同盘生命周期副本，不是独立故障域备份。
+此外还没有 Flush 预留空间、对象存储上传、带宽预算或持续失败的统一 readiness/failure budget。
 
 #### P1-2 Recovery Task 不是恢复状态机
 
@@ -606,9 +619,11 @@ Recovery 全量 Directory/Extent/Tail/Locator Root 常驻已经关闭：运行�
 的 LRU，WAL/Append 活跃 Stream 才 Seed 到 MemTable。Locator/Tail Builder 已使用外部 Run 和流式输出，
 不再同时保留全部 Directory/Extent/Root/Tail；Registry Builder 也已使用有界分块、外部 Run 和流式
 Snapshot Writer。剩余规模阻塞是 Registry Sparse Block Index 与 Manifest Segment Reference 常驻，
-它们仍会随 Registry Block 或 Segment 数量线性放大启动 RSS。Compaction Frame 合并受输入字节上限
-约束，但内部仍会物化一次选定输入。Engine 的 `appendGates` 和 `notifications` 还会按曾访问 Stream 常驻，
-新 Stream 分配也仍在全局 Engine 锁内同步提交 Registry Stream 0。
+它们仍会随 Registry Block 或 Segment 数量线性放大启动 RSS。一百万低密度 Stream 实测每个 Stream
+至少占一个 64 KiB Locator Page，形成 65,536,069,720 bytes Pack；这是格式级空间放大，不是 Cache
+调参可以解决。首次 Stream Registry 串行提交也使预创建一百万 Stream 耗时 4146.99 秒。Compaction Frame 合并受输入字节上限
+约束，但内部仍会物化一次选定输入。Engine 的 `appendGates` 和 `notifications` 已按引用计数回收，不再
+按曾访问 Stream 永久常驻；新 Stream 分配仍在全局 Engine 锁内同步提交 Registry Stream 0。
 
 #### P1-4 Node Runtime 生命周期仍未完全统一
 
@@ -631,7 +646,9 @@ Promotion、Snapshot、WAL GC 和诊断仍必须结合物理 WAL；任何新模�
 - ResolveTime 是 Sequence 二分加随机 Record 读取，不是专用时间索引；
 - Locator 损坏会逐 Segment 按需扫描 Directory，故障时延没有 SLO，但不会常驻全部 Extent；
 - Registry 的反向 `LookupID` 可能跨 Block 顺序读取，当前不在业务热路径；
-- 没有 Snapshot/GC 自动调度、传输限速、持久 Pin Lease 或对象存储；
+- Locator Pack Verify/Scrub 已改为流式 SHA-256；同一 65.5 GB Pack 的独立 Scrub 峰值 RSS 从原验收
+  暴露的 65,357,528 KiB 降至 626,280 KiB，但固定 Page 的磁盘成本仍未解决；
+- 已有本地 Snapshot/GC 自动调度；仍无传输限速、持久 Pin Lease、对象存储或跨故障域副本；
 - Maintenance failure policy 属于可维护性战略预警：持续非 fatal Checkpoint/Compaction/State 失败尚无
   统一退避、failure budget、readiness 降级或容量预测，但它不是当前功能完整性的首要阻塞；
 - 已有磁盘容量/可用空间和按类型文件字节指标，但 Snapshot、GC、Compaction、Cache、Pin 的事件指标、
@@ -658,19 +675,18 @@ Promotion、Snapshot、WAL GC 和诊断仍必须结合物理 WAL；任何新模�
 
 ## 11. 后续开发门禁与建议顺序
 
-建议按以下顺序推进，每项单独提交并重新做整体审计：
+本轮四阶段已经进入实现与验收收口：Checkpoint/WAL Seal、容量与回收、运行时规模有界化、生产候选
+门禁均有真实调用链和自动化入口。72 小时运行是时间型验收，只有进程自然结束、最终 Scrub 成功且资源
+曲线复核后才能关闭，不因短时 smoke 或“已经启动”提前标记完成。
 
-恢复证据与 Replicated 启动可观测性阶段已经完成。下一轮从以下顺序继续：
+72 小时之后的建议顺序：
 
-1. **执行规模与故障验收**：百万 Stream 启动并量化 Registry Sparse Index、Manifest Segment Reference
-   和投影外部 Run 的 RSS/时延/临时磁盘；补磁盘满、短写、fsync 故障、etcd member replacement、
-   升级/回滚和 Restore Drill。
-2. **按测量结果收敛剩余元数据**：只有确认 Sparse Index 或 Segment Reference 超出预算，才引入分页、
-   分层 Manifest 或更强的磁盘索引，避免在缺少规模证据时继续增加格式复杂度。
-3. **接入受控 Snapshot/GC 自动化**：只有在所有权、认证、幂等任务和 Pin 生命周期冻结后，才接入
-   online Snapshot、归档和 GC 调度。
-4. **补 Maintenance failure policy**：作为可维护性和容量战略预警，把连续失败映射到稳定诊断、告警
-   和退避；它不早于上述功能完整性与规模验收。
+1. 72 小时结束后优先设计兼容的 Locator V2：评估可变长 Page 或多 Stream Page，并处理新 Stream
+   Registry 串行提交；百万 Stream 已确认这两项越过空间与建表时间预算，不能再只做 Cache 调优。
+2. 在目标内核/文件系统/SSD 上执行设备级掉盘、只读、ENOSPC、延迟与 Restore Drill，并补 etcd member
+   replacement 和跨版本滚动部署证据。
+3. 设计 Primary Snapshot 到 Standby/对象存储的受控传输与持久 Pin Lease，关闭 Standby WAL 长期保留边界。
+4. 最后补 Maintenance 连续失败预算、退避、稳定诊断和容量预测；这属于可维护性增强，不替代数据安全证据。
 
 每个阶段完成条件：
 
@@ -695,6 +711,8 @@ Promotion、Snapshot、WAL GC 和诊断仍必须结合物理 WAL；任何新模�
 | WAL History/GC Pin | `internal/storage/wal/history.go` |
 | Snapshot | `internal/storage/snapshot/` |
 | WAL Retention | `internal/storage/retention/manager.go` |
+| 容量维护 | `internal/node/maintenance.go`, `internal/replication/standby.go` |
+| 规模/故障/兼容/Soak | `test/scale/`, `test/fault/`, `test/compat/`, `test/soak/` |
 | Strict Replication | `internal/replication/primary.go`, `receiver.go`, `standby.go`, `catchup.go` |
 | Plan/Promotion/Rejoin | `internal/replication/planner.go`, `promotion.go`, `rejoin.go` |
 | Term/Lease | `internal/coordinator/etcd/coordinator.go`, `internal/leadership/controller.go` |
