@@ -14,6 +14,7 @@ var (
 	ErrRecordTooLarge   = errors.New("record too large")
 	ErrClosed           = errors.New("store closed")
 	ErrNotLeader        = errors.New("node is not a writable leader")
+	ErrCapacityCritical = errors.New("storage capacity is critical")
 )
 
 type SequenceAheadError struct {

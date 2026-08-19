@@ -11,6 +11,7 @@ import (
 	"os"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/akzj/streamd/internal/storage/commit"
@@ -60,6 +61,13 @@ type Health struct {
 	Role             format.ReplicationRole
 	Durability       format.ReplicationDurability
 	Term             uint64
+	CapacityCritical bool
+}
+
+type MaintenanceStats struct {
+	MemTableRecords uint64
+	MemTableBytes   uint64
+	ActiveWALBytes  uint64
 }
 
 type CompactionOptions struct {
@@ -108,35 +116,36 @@ const (
 )
 
 type Store struct {
-	maintenanceMu  sync.Mutex
-	mu             sync.Mutex
-	gateMu         sync.Mutex
-	viewMu         sync.RWMutex
-	fatalMu        sync.RWMutex
-	notifyMu       sync.Mutex
-	root           *fsutil.Root
-	state          *recovery.Result
-	lifecycle      *lifecycle.Manager
-	committer      *commit.Committer
-	reader         *readstore.Store
-	now            func() time.Time
-	notifications  map[streamKey]chan struct{}
-	appendGates    map[streamKey]chan struct{}
-	closed         bool
-	shutdown       bool
-	fatal          error
-	nextEntryID    uint64
-	previousCRC32C uint32
-	lastRecordedAt int64
-	checkpointHook fsutil.CrashHook
-	term           uint64
-	role           format.ReplicationRole
-	durability     format.ReplicationDurability
-	guard          commit.Guard
-	commitOptions  commit.Options
-	commitStatsMu  sync.Mutex
-	commitStats    commit.Stats
-	commitArchived bool
+	maintenanceMu    sync.Mutex
+	mu               sync.Mutex
+	gateMu           sync.Mutex
+	viewMu           sync.RWMutex
+	fatalMu          sync.RWMutex
+	notifyMu         sync.Mutex
+	root             *fsutil.Root
+	state            *recovery.Result
+	lifecycle        *lifecycle.Manager
+	committer        *commit.Committer
+	reader           *readstore.Store
+	now              func() time.Time
+	notifications    map[streamKey]chan struct{}
+	appendGates      map[streamKey]chan struct{}
+	closed           bool
+	shutdown         bool
+	fatal            error
+	nextEntryID      uint64
+	previousCRC32C   uint32
+	lastRecordedAt   int64
+	checkpointHook   fsutil.CrashHook
+	term             uint64
+	role             format.ReplicationRole
+	durability       format.ReplicationDurability
+	guard            commit.Guard
+	commitOptions    commit.Options
+	commitStatsMu    sync.Mutex
+	commitStats      commit.Stats
+	commitArchived   bool
+	capacityCritical atomic.Bool
 }
 
 func (s *Store) DataRoot() string { return s.root.Path() }
@@ -180,7 +189,22 @@ func (s *Store) ResolveTime(namespace, name string, target int64, mode readstore
 func (s *Store) Health() Health {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return Health{Watermarks: s.committer.Watermarks(), Fatal: errors.Join(s.committer.FatalError(), s.fatalError()), WriteUnavailable: s.writeUnavailable(), Role: s.role, Durability: s.durability, Term: s.term}
+	return Health{Watermarks: s.committer.Watermarks(), Fatal: errors.Join(s.committer.FatalError(), s.fatalError()), WriteUnavailable: s.writeUnavailable(), Role: s.role, Durability: s.durability, Term: s.term, CapacityCritical: s.capacityCritical.Load()}
+}
+
+// SetCapacityCritical is controlled by the node maintenance loop. Critical
+// capacity rejects new writes while preserving reads and maintenance access.
+func (s *Store) SetCapacityCritical(critical bool) { s.capacityCritical.Store(critical) }
+
+func (s *Store) MaintenanceStats() MaintenanceStats {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	records, bytes := s.state.MemTable.Stats()
+	walBytes := s.state.WAL.Scan().LastGoodOffset
+	if walBytes < 0 {
+		walBytes = 0
+	}
+	return MaintenanceStats{MemTableRecords: records, MemTableBytes: bytes, ActiveWALBytes: uint64(walBytes)}
 }
 
 func (s *Store) CommitStats() commit.Stats {
@@ -1079,6 +1103,9 @@ func (s *Store) writeUnavailable() error {
 		if err := s.guard.CanCommit(); err != nil {
 			return fmt.Errorf("%w: %v", errdefs.ErrNotLeader, err)
 		}
+	}
+	if s.capacityCritical.Load() {
+		return errdefs.ErrCapacityCritical
 	}
 	return nil
 }

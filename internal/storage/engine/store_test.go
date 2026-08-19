@@ -1095,3 +1095,36 @@ func TestCompactionPreservesRegistryOverlayAfterCheckpoint(t *testing.T) {
 		t.Fatalf("active Registry overlay Read = %+v, %v", result, err)
 	}
 }
+
+func TestCapacityCriticalRejectsAppendButPreservesReadAndMaintenance(t *testing.T) {
+	store, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	request := AppendRequest{Namespace: "agent", Stream: "events", RequestID: []byte("first"), Producer: "test", Records: []InputRecord{{Payload: []byte("one")}}}
+	if _, err = store.Append(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	stats := store.MaintenanceStats()
+	if stats.MemTableRecords != 2 || stats.MemTableBytes == 0 || stats.ActiveWALBytes == 0 {
+		t.Fatalf("maintenance stats = %+v", stats)
+	}
+	store.SetCapacityCritical(true)
+	request.ExpectedSequence = 1
+	request.RequestID = []byte("second")
+	if _, err = store.Append(context.Background(), request); !errors.Is(err, errdefs.ErrCapacityCritical) {
+		t.Fatalf("Append error = %v", err)
+	}
+	result, err := store.Read("agent", "events", 0, 10, 0)
+	if err != nil || len(result.Records) != 1 {
+		t.Fatalf("Read during capacity critical = %+v, %v", result, err)
+	}
+	if _, created, checkpointErr := store.Checkpoint(); checkpointErr != nil || !created {
+		t.Fatalf("Checkpoint during capacity critical created=%v error=%v", created, checkpointErr)
+	}
+	store.SetCapacityCritical(false)
+	if _, err = store.Append(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+}

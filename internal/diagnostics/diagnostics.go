@@ -30,6 +30,7 @@ const (
 	ReasonStateInconsistent           ReasonCode = "state_inconsistent"
 	ReasonLeadershipPending           ReasonCode = "leadership_pending"
 	ReasonReplicaCatchUpPending       ReasonCode = "replica_catchup_pending"
+	ReasonCapacityCritical            ReasonCode = "capacity_critical"
 )
 
 type RecoveryAction string
@@ -173,6 +174,9 @@ func EngineSnapshot(health engine.Health, draining bool, lease LeaseProvider) Sn
 	} else if draining {
 		snapshot.Status, snapshot.Ready, snapshot.WriteReady = StatusReadyRead, false, false
 		snapshot.Reasons = []Reason{reason(ReasonServerDraining)}
+	} else if health.CapacityCritical {
+		snapshot.Status, snapshot.Ready, snapshot.WriteReady = StatusReadyRead, false, false
+		snapshot.Reasons = []Reason{reason(ReasonCapacityCritical)}
 	} else if health.WriteUnavailable != nil {
 		snapshot.Status, snapshot.Ready, snapshot.WriteReady = StatusReadyRead, false, false
 		snapshot.Reasons = []Reason{reason(ReasonWriteGuardUnavailable)}
@@ -445,6 +449,7 @@ func reason(code ReasonCode) Reason {
 		ReasonStateInconsistent:           "runtime state is internally inconsistent",
 		ReasonLeadershipPending:           "waiting for a coordinator leadership decision",
 		ReasonReplicaCatchUpPending:       "waiting for the configured replica to catch up",
+		ReasonCapacityCritical:            "storage capacity is critical; writes are paused",
 	}
 	return Reason{Code: code, Message: messages[code]}
 }

@@ -8,6 +8,7 @@ import (
 	"github.com/akzj/streamd/internal/replication"
 	"github.com/akzj/streamd/internal/storage/commit"
 	"github.com/akzj/streamd/internal/storage/engine"
+	"github.com/akzj/streamd/internal/storage/errdefs"
 	"github.com/akzj/streamd/internal/storage/format"
 )
 
@@ -75,6 +76,14 @@ func TestStandbySnapshotIsReadyRead(t *testing.T) {
 	snapshot := provider.Snapshot()
 	if !snapshot.Ready || snapshot.WriteReady || snapshot.Status != StatusReadyRead || snapshot.Role != "standby" || snapshot.Term != 3 || len(snapshot.Reasons) != 0 {
 		t.Fatalf("Standby snapshot = %+v", snapshot)
+	}
+}
+
+func TestEngineSnapshotReportsCapacityCritical(t *testing.T) {
+	health := engine.Health{Role: format.ReplicationRoleSingle, Durability: format.ReplicationDurabilitySingleSync, CapacityCritical: true, WriteUnavailable: errdefs.ErrCapacityCritical}
+	snapshot := EngineSnapshot(health, false, nil)
+	if snapshot.Status != StatusReadyRead || snapshot.Ready || snapshot.WriteReady || len(snapshot.Reasons) != 1 || snapshot.Reasons[0].Code != ReasonCapacityCritical {
+		t.Fatalf("capacity critical snapshot = %+v", snapshot)
 	}
 }
 

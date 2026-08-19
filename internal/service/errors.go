@@ -43,6 +43,9 @@ func mapError(err error, requestID []byte) error {
 	if errors.Is(err, errdefs.ErrNotLeader) {
 		return streamdStatus(codes.FailedPrecondition, streamdv1.ErrorCode_ERROR_CODE_NOT_LEADER, "node is not a writable leader", true, uncertain, nil, nil, requestID)
 	}
+	if errors.Is(err, errdefs.ErrCapacityCritical) {
+		return resourceExhausted("storage capacity is critical", nil, requestID)
+	}
 	if write != nil {
 		return streamdStatus(codes.DataLoss, streamdv1.ErrorCode_ERROR_CODE_DATA_LOSS, "durable write failed", false, write.ResultUncertain, nil, nil, requestID)
 	}

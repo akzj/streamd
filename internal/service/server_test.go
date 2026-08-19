@@ -123,6 +123,14 @@ func TestDeadlineAfterWriteIsMarkedUncertain(t *testing.T) {
 	}
 }
 
+func TestMapErrorReportsCapacityCritical(t *testing.T) {
+	err := mapError(errdefs.ErrCapacityCritical, []byte("request"))
+	detail := assertError(t, err, codes.ResourceExhausted, streamdv1.ErrorCode_ERROR_CODE_RESOURCE_EXHAUSTED, false)
+	if !detail.Retryable || detail.ResultUncertain || string(detail.RequestId) != "request" {
+		t.Fatalf("detail = %+v", detail)
+	}
+}
+
 func TestProducerResolverFailureIsUnauthenticated(t *testing.T) {
 	store, err := engine.Open(t.TempDir())
 	if err != nil {
