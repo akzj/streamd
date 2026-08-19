@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -47,6 +48,10 @@ type report struct {
 	Mode             string       `json:"mode"`
 	StandbyDirectory string       `json:"standby_directory,omitempty"`
 	StandbyVerified  bool         `json:"standby_verified"`
+	ReopenSeconds    float64      `json:"reopen_seconds,omitempty"`
+	ReopenVerified   bool         `json:"reopen_verified"`
+	ReopenHeapAlloc  uint64       `json:"reopen_heap_alloc_bytes,omitempty"`
+	ReopenHeapSys    uint64       `json:"reopen_heap_sys_bytes,omitempty"`
 	GroupCommit      commitReport `json:"group_commit"`
 }
 
@@ -116,6 +121,7 @@ func main() {
 	groupBytes := flag.Uint64("group-bytes", 4<<20, "maximum encoded bytes per WAL group")
 	queueCapacity := flag.Int("queue-capacity", 1024, "bounded WAL request queue capacity")
 	precreate := flag.Bool("precreate-streams", false, "create every Stream before the timed steady-state run")
+	verifyReopen := flag.Bool("verify-reopen", false, "close, reopen, and sample the checkpointed store before scrub (single mode)")
 	flag.Parse()
 	if *duration <= 0 || *workers <= 0 || *streams < *workers || *batch <= 0 || *payloadBytes < 0 || *checkpoint < 0 || *groupDelay <= 0 || *groupRequests <= 0 || *groupBytes == 0 || *queueCapacity <= 0 || (*mode != "single" && *mode != "strict") {
 		fatal(fmt.Errorf("invalid benchmark arguments"))
@@ -189,7 +195,7 @@ func main() {
 	}()
 	setupStarted := time.Now()
 	if *precreate {
-		if err = precreateStreams(store, *streams); err != nil {
+		if err = precreateStreams(store, *streams, *workers); err != nil {
 			fatal(err)
 		}
 		if err = store.CommitBarrier(context.Background()); err != nil {
@@ -291,6 +297,33 @@ func main() {
 			fatal(err)
 		}
 		closed = true
+		if *verifyReopen {
+			if *mode != "single" {
+				fatal(fmt.Errorf("verify-reopen currently requires single mode"))
+			}
+			reopenStarted := time.Now()
+			reopened, reopenErr := engine.OpenWithIdentity(dataPath, identity)
+			if reopenErr != nil {
+				fatal(reopenErr)
+			}
+			output.ReopenSeconds = time.Since(reopenStarted).Seconds()
+			for _, index := range sampleStreamIndexes(*streams) {
+				info, inspectErr := reopened.Inspect("benchmark", fmt.Sprintf("stream-%08d", index))
+				if inspectErr != nil || !info.Exists || info.NextSequence == 0 {
+					_ = reopened.Close()
+					fatal(fmt.Errorf("reopen verification failed for Stream %d: info=%+v error=%w", index, info, inspectErr))
+				}
+			}
+			runtime.GC()
+			var memory runtime.MemStats
+			runtime.ReadMemStats(&memory)
+			output.ReopenHeapAlloc = memory.HeapAlloc
+			output.ReopenHeapSys = memory.HeapSys
+			output.ReopenVerified = true
+			if err = reopened.Close(); err != nil {
+				fatal(err)
+			}
+		}
 		scrubReport, scrubErr := scrub.DataRoot(dataPath)
 		if scrubErr != nil {
 			fatal(scrubErr)
@@ -326,20 +359,56 @@ func main() {
 	}
 }
 
-func precreateStreams(store *engine.Store, streams int) error {
-	for stream := 0; stream < streams; stream++ {
-		requestID := make([]byte, 16)
-		binary.LittleEndian.PutUint64(requestID[:8], uint64(stream))
-		copy(requestID[8:], "setup")
-		_, err := store.Append(context.Background(), engine.AppendRequest{
-			Namespace: "benchmark", Stream: fmt.Sprintf("stream-%08d", stream), RequestID: requestID,
-			Producer: "streamd-bench/setup", Records: []engine.InputRecord{{}},
-		})
-		if err != nil {
-			return fmt.Errorf("precreate Stream %d: %w", stream, err)
-		}
+func precreateStreams(store *engine.Store, streams, workers int) error {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var next atomic.Uint64
+	errCh := make(chan error, 1)
+	var wait sync.WaitGroup
+	if workers > streams {
+		workers = streams
 	}
-	return nil
+	for worker := 0; worker < workers; worker++ {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			for {
+				stream := next.Add(1) - 1
+				if stream >= uint64(streams) || ctx.Err() != nil {
+					return
+				}
+				requestID := make([]byte, 16)
+				binary.LittleEndian.PutUint64(requestID[:8], stream)
+				copy(requestID[8:], "setup")
+				_, err := store.Append(ctx, engine.AppendRequest{
+					Namespace: "benchmark", Stream: fmt.Sprintf("stream-%08d", stream), RequestID: requestID,
+					Producer: "streamd-bench/setup", Records: []engine.InputRecord{{}},
+				})
+				if err != nil {
+					select {
+					case errCh <- fmt.Errorf("precreate Stream %d: %w", stream, err):
+						cancel()
+					default:
+					}
+					return
+				}
+			}
+		}()
+	}
+	wait.Wait()
+	select {
+	case err := <-errCh:
+		return err
+	default:
+		return nil
+	}
+}
+
+func sampleStreamIndexes(streams int) []int {
+	if streams <= 1 {
+		return []int{0}
+	}
+	return []int{0, streams / 2, streams - 1}
 }
 
 func subtractCommitStats(after, before commit.Stats) commit.Stats {

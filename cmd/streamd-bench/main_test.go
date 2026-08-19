@@ -34,4 +34,14 @@ func TestBuildCommitReportAvoidsZeroDenominators(t *testing.T) {
 	}
 }
 
+func TestSampleStreamIndexes(t *testing.T) {
+	if got := sampleStreamIndexes(1); len(got) != 1 || got[0] != 0 {
+		t.Fatalf("one Stream samples = %v", got)
+	}
+	got := sampleStreamIndexes(10)
+	if len(got) != 3 || got[0] != 0 || got[1] != 5 || got[2] != 9 {
+		t.Fatalf("ten Stream samples = %v", got)
+	}
+}
+
 func closeEnough(got, want float64) bool { return math.Abs(got-want) < 1e-9 }
