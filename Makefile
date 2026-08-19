@@ -1,4 +1,4 @@
-.PHONY: test test-race ha-prepare ha-up ha-test ha-logs ha-down test-ha test-ha-repeat
+.PHONY: test test-race ha-prepare ha-up ha-test ha-logs ha-down test-ha test-ha-repeat test-soak test-soak-72h
 
 test:
 	go test ./... -count=1
@@ -34,3 +34,9 @@ test-ha-repeat:
 		$(MAKE) --no-print-directory test-ha || exit $$?; \
 		index=$$((index + 1)); \
 	done
+
+test-soak:
+	./test/soak/run.sh
+
+test-soak-72h:
+	SOAK_DURATION=72h ./test/soak/run.sh
