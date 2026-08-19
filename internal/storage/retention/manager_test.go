@@ -3,6 +3,7 @@ package retention
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -12,6 +13,66 @@ import (
 	"github.com/akzj/streamd/internal/storage/replicationstate"
 	"github.com/akzj/streamd/internal/storage/snapshot"
 )
+
+type retentionGuard struct{}
+
+func (retentionGuard) CanCommit() error { return nil }
+
+type retentionReplica struct{}
+
+func (retentionReplica) Replicate(_ context.Context, encoded [][]byte) (uint64, error) {
+	entry, err := format.UnmarshalWALEntry(encoded[len(encoded)-1])
+	return entry.EntryID, err
+}
+
+func (retentionReplica) AdvanceCommit(context.Context, uint64) error { return nil }
+
+func TestOnlineReplicatedRetentionCanAdvanceSnapshotAfterWALCollection(t *testing.T) {
+	root := t.TempDir()
+	identity := format.NodeIdentity{ClusterID: retentionID(1), GroupID: retentionID(2), NodeID: retentionID(3), CreatedAt: 1}
+	store, err := engine.OpenReplicated(root, identity, engine.ReplicationOptions{Term: 7, Role: format.ReplicationRolePrimary, Durability: format.ReplicationDurabilityStrict, Replica: retentionReplica{}, Guard: retentionGuard{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	states, err := replicationstate.Open(root, identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = states.Update(time.Unix(100, 0), func(header *format.ReplicationStateHeader) error {
+		header.Term = 7
+		header.Role = format.ReplicationRolePrimary
+		header.Durability = format.ReplicationDurabilityStrict
+		header.HasLeader = true
+		header.LeaderID = identity.NodeID
+		header.HasLease = true
+		header.LeaseExpiresAt = time.Unix(100, 0).Add(time.Hour).UnixNano()
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.Append(context.Background(), engine.AppendRequest{Namespace: "n", Stream: "s", RequestID: []byte("r1"), Producer: "test", Records: []engine.InputRecord{{Payload: []byte("one")}}}); err != nil {
+		t.Fatal(err)
+	}
+	first, err := CreateSnapshotAndCollect(store, states, filepath.Join(root, "snapshots", "first"), 1<<30, time.Unix(200, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.Append(context.Background(), engine.AppendRequest{Namespace: "n", Stream: "s", ExpectedSequence: 1, RequestID: []byte("r2"), Producer: "test", Records: []engine.InputRecord{{Payload: []byte("two")}}}); err != nil {
+		t.Fatal(err)
+	}
+	second, err := CreateSnapshotAndCollect(store, states, filepath.Join(root, "snapshots", "second"), 1<<30, time.Unix(300, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Snapshot.CheckpointEntryID <= first.Snapshot.CheckpointEntryID || second.Snapshot.SnapshotID == first.Snapshot.SnapshotID {
+		t.Fatalf("Snapshots did not advance: first=%+v second=%+v", first.Snapshot, second.Snapshot)
+	}
+	current, ok := states.Current()
+	if !ok || !current.Header.HasInstalledSnapshot || current.Header.InstalledSnapshotID != second.Snapshot.SnapshotID || current.Header.InstalledSnapshotEntry.EntryID != second.Snapshot.CheckpointEntryID || current.Header.EarliestWALEntryID != second.Collection.EarliestWAL {
+		t.Fatalf("Replication State did not retain the second Snapshot recovery floor: %+v, ok=%v", current.Header, ok)
+	}
+}
 
 func TestManagerCollectsOnlyFromPinnedVerifiedSnapshot(t *testing.T) {
 	root := t.TempDir()

@@ -13,8 +13,7 @@ import (
 	"github.com/akzj/streamd/internal/storage/engine"
 	"github.com/akzj/streamd/internal/storage/format"
 	"github.com/akzj/streamd/internal/storage/replicationstate"
-	"github.com/akzj/streamd/internal/storage/snapshot"
-	"github.com/akzj/streamd/internal/storage/wal"
+	"github.com/akzj/streamd/internal/storage/retention"
 	"golang.org/x/sys/unix"
 )
 
@@ -237,47 +236,14 @@ func walDirectoryBytes(root string) (uint64, error) {
 
 func createSnapshotAndCollectWAL(store *engine.Store, states *replicationstate.Store, maxRetained uint64, now time.Time) error {
 	destination := filepath.Join(store.DataRoot(), "snapshots", fmt.Sprintf("auto-%020d", now.UnixNano()))
-	var created snapshot.Result
-	var err error
-	if states != nil {
-		created, err = snapshot.CreateOnlineReplicatedLinked(store, states, destination)
-	} else {
-		created, err = snapshot.CreateOnlineLinked(store, destination)
-	}
+	result, err := retention.CreateSnapshotAndCollect(store, states, destination, maxRetained, now)
 	if err != nil {
 		return err
 	}
-	verified, err := snapshot.Verify(created.Path)
-	if err != nil {
+	if err = pruneAutomaticSnapshots(store.DataRoot(), result.Snapshot.Path); err != nil {
 		return err
 	}
-	if states != nil {
-		if _, err = states.Update(now, func(header *format.ReplicationStateHeader) error {
-			header.HasInstalledSnapshot = true
-			header.InstalledSnapshotID = verified.SnapshotID
-			header.InstalledSnapshotEntry = format.ReplicationPosition{Present: true, EntryID: verified.CheckpointEntryID, CRC32C: verified.CheckpointCRC32C}
-			return nil
-		}); err != nil {
-			return err
-		}
-	}
-	collected, collectErr := store.CollectWAL(engine.WALCollectionEvidence{SnapshotEntryID: verified.CheckpointEntryID, SnapshotVerified: true, MaxRetainedBytes: maxRetained})
-	if collectErr != nil && !errors.Is(collectErr, wal.ErrRetentionPressure) {
-		return collectErr
-	}
-	if states != nil {
-		_, err = states.Update(now, func(header *format.ReplicationStateHeader) error {
-			header.EarliestWALEntryID = collected.EarliestWAL
-			return nil
-		})
-		if err != nil {
-			return err
-		}
-	}
-	if err = pruneAutomaticSnapshots(store.DataRoot(), created.Path); err != nil {
-		return err
-	}
-	return collectErr
+	return nil
 }
 
 func pruneAutomaticSnapshots(root, keep string) error {

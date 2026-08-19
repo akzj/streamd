@@ -21,8 +21,8 @@ import (
 	"github.com/akzj/streamd/internal/storage/format"
 	"github.com/akzj/streamd/internal/storage/fsutil"
 	"github.com/akzj/streamd/internal/storage/replicationstate"
+	"github.com/akzj/streamd/internal/storage/retention"
 	"github.com/akzj/streamd/internal/storage/scrub"
-	"github.com/akzj/streamd/internal/storage/snapshot"
 	"github.com/akzj/streamd/internal/storage/wal"
 )
 
@@ -319,12 +319,14 @@ func main() {
 				return
 			case <-ticker.C:
 				if _, _, checkpointErr := store.Checkpoint(); checkpointErr != nil {
+					fmt.Fprintf(os.Stderr, "streamd-bench: periodic checkpoint: %v\n", checkpointErr)
 					failures.Add(1)
 					continue
 				}
 				checkpoints.Add(1)
 				compacted, compactErr := store.Compact(engine.CompactionOptions{MinSegments: 32, MaxInputSegments: 8, MaxInputBytes: 64 << 20})
 				if compactErr != nil {
+					fmt.Fprintf(os.Stderr, "streamd-bench: periodic compaction: %v\n", compactErr)
 					failures.Add(1)
 					continue
 				}
@@ -333,31 +335,19 @@ func main() {
 				}
 				if *retentionInterval > 0 && time.Since(lastSnapshot) >= *retentionInterval {
 					destination := filepath.Join(dataPath, "snapshots", fmt.Sprintf("soak-%020d", time.Now().UnixNano()))
-					var created snapshot.Result
-					var snapshotErr error
-					if benchmarkStates != nil {
-						created, snapshotErr = snapshot.CreateOnlineReplicatedLinked(store, benchmarkStates, destination)
-					} else {
-						created, snapshotErr = snapshot.CreateOnlineLinked(store, destination)
-					}
-					if snapshotErr == nil {
-						_, snapshotErr = snapshot.Verify(created.Path)
-					}
-					var collected wal.GCResult
-					if snapshotErr == nil {
-						collected, snapshotErr = store.CollectWAL(engine.WALCollectionEvidence{SnapshotEntryID: created.CheckpointEntryID, SnapshotVerified: true, MaxRetainedBytes: *maxRetainedWALBytes})
-					}
+					retained, snapshotErr := retention.CreateSnapshotAndCollect(store, benchmarkStates, destination, *maxRetainedWALBytes, time.Now())
 					if snapshotErr != nil {
+						fmt.Fprintf(os.Stderr, "streamd-bench: periodic snapshot retention: %v\n", snapshotErr)
 						failures.Add(1)
 						continue
 					}
 					snapshotsCreated.Add(1)
-					walDeletedBytes.Add(collected.DeletedBytes)
+					walDeletedBytes.Add(retained.Collection.DeletedBytes)
 					lastSnapshot = time.Now()
 					if previousSnapshot != "" {
 						_ = os.RemoveAll(previousSnapshot)
 					}
-					previousSnapshot = created.Path
+					previousSnapshot = retained.Snapshot.Path
 				}
 			}
 		}
