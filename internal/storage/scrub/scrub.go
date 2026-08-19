@@ -213,6 +213,9 @@ func scrubWAL(root string, manifest format.Manifest, hasManifest bool, report *R
 			checkpointVerified = true
 		}
 		if i == 0 {
+			if hasManifest && manifest.Header.RecordCount > 0 && manifest.Header.LastEntryID != ^uint64(0) && file.scan.Header.FirstEntryID == manifest.Header.LastEntryID+1 && (file.scan.EntryCount == 0 || file.scan.FirstEntryPreviousCRC32C == manifest.Header.LastEntryCRC32C) {
+				checkpointVerified = true
+			}
 			continue
 		}
 		previous := files[i-1].scan
