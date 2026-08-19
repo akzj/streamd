@@ -98,26 +98,10 @@ func Run(ctx context.Context, config Config, logger *slog.Logger) error {
 	go func() { serveErrors <- admin.Serve(adminListener) }()
 	checkpointCtx, stopCheckpoints := context.WithCancel(context.Background())
 	checkpointDone := make(chan struct{})
-	checkpointInterval, _ := config.checkpointDuration()
 	go func() {
 		defer close(checkpointDone)
-		ticker := time.NewTicker(checkpointInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-checkpointCtx.Done():
-				return
-			case <-ticker.C:
-				manifest, created, checkpointErr := store.Checkpoint()
-				if checkpointErr != nil {
-					logger.Error("checkpoint failed", "error", checkpointErr)
-				} else {
-					if created {
-						logger.Info("checkpoint published", "generation", manifest.Header.Generation, "entry_id", manifest.Header.LastEntryID)
-					}
-					compactStore(store, config, logger)
-				}
-			}
+		if maintenanceErr := runEngineMaintenance(checkpointCtx, config, store, store.Checkpoint, logger); maintenanceErr != nil {
+			logger.Error("maintenance loop stopped", "error", maintenanceErr)
 		}
 	}()
 	logger.Info("streamd started", "grpc_address", grpcListener.Addr().String(), "admin_address", adminListener.Addr().String())
@@ -161,18 +145,6 @@ func resumePendingSnapshotInstall(dataDirectory string, logger *slog.Logger) err
 		logger.Info("resumed Snapshot install before recovery")
 	}
 	return nil
-}
-
-func compactStore(store *engine.Store, config Config, logger *slog.Logger) {
-	minSegments, maxInputSegments, maxInputBytes, _ := config.compactionLimits()
-	result, err := store.Compact(engine.CompactionOptions{MinSegments: minSegments, MaxInputSegments: maxInputSegments, MaxInputBytes: maxInputBytes})
-	if err != nil {
-		logger.Error("Segment Compaction failed", "error", err)
-		return
-	}
-	if result.Created {
-		logger.Info("Segment Compaction published", "generation", result.Manifest.Header.Generation, "input_segments", result.InputSegments, "input_bytes", result.InputBytes, "live_segments", len(result.Manifest.SegmentReferences))
-	}
 }
 
 func adminServer(provider diagnostics.Provider, registry *prometheus.Registry) *http.Server {

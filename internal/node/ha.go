@@ -228,20 +228,9 @@ func runPrimary(ctx context.Context, config Config, nodeIdentity format.NodeIden
 	backgroundDone := make(chan struct{})
 	go func() {
 		defer close(backgroundDone)
-		checkpointInterval, _ := config.checkpointDuration()
-		checkpointTicker := time.NewTicker(checkpointInterval)
-		defer checkpointTicker.Stop()
-		for {
-			select {
-			case <-backgroundCtx.Done():
-				return
-			case <-checkpointTicker.C:
-				if _, _, checkpointErr := store.CheckpointReplicated(states); checkpointErr != nil {
-					logger.Error("storage checkpoint failed", "error", checkpointErr)
-				} else {
-					compactStore(store, config, logger)
-				}
-			}
+		checkpoint := func() (format.Manifest, bool, error) { return store.CheckpointReplicated(states) }
+		if maintenanceErr := runEngineMaintenance(backgroundCtx, config, store, checkpoint, logger); maintenanceErr != nil {
+			logger.Error("maintenance loop stopped", "error", maintenanceErr)
 		}
 	}()
 	logger.Info("streamd Strict Primary started", "term", grant.Term, "grpc_address", grpcListener.Addr().String(), "peer", config.Replication.PeerAddress)

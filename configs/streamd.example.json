@@ -8,6 +8,14 @@
   "shutdown_timeout": "30s",
   "subscribe_send_timeout": "30s",
   "checkpoint_interval": "1m",
+  "maintenance": {
+    "check_interval": "1s",
+    "memtable_bytes": 67108864,
+    "active_wal_bytes": 268435456,
+    "disk_high_percent": 85,
+    "disk_critical_percent": 95,
+    "minimum_available_bytes": 1073741824
+  },
   "compaction": {
     "min_segments": 32,
     "max_input_segments": 8,

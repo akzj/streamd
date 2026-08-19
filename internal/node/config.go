@@ -29,6 +29,7 @@ type Config struct {
 	ShutdownTimeout      string                      `json:"shutdown_timeout"`
 	SubscribeSendTimeout string                      `json:"subscribe_send_timeout"`
 	CheckpointInterval   string                      `json:"checkpoint_interval"`
+	Maintenance          MaintenanceConfig           `json:"maintenance,omitempty"`
 	Compaction           CompactionConfig            `json:"compaction,omitempty"`
 	TLS                  TLSConfig                   `json:"tls"`
 	PrincipalsByURI      map[string]access.Principal `json:"principals_by_uri"`
@@ -36,6 +37,24 @@ type Config struct {
 	Limits               service.Limits              `json:"limits"`
 	OTLPTraceEndpoint    string                      `json:"otlp_trace_endpoint,omitempty"`
 	Replication          ReplicationConfig           `json:"replication,omitempty"`
+}
+
+type MaintenanceConfig struct {
+	CheckInterval         string `json:"check_interval,omitempty"`
+	MemTableBytes         uint64 `json:"memtable_bytes,omitempty"`
+	ActiveWALBytes        uint64 `json:"active_wal_bytes,omitempty"`
+	DiskHighPercent       uint32 `json:"disk_high_percent,omitempty"`
+	DiskCriticalPercent   uint32 `json:"disk_critical_percent,omitempty"`
+	MinimumAvailableBytes uint64 `json:"minimum_available_bytes,omitempty"`
+}
+
+type maintenanceLimits struct {
+	checkInterval         time.Duration
+	memTableBytes         uint64
+	activeWALBytes        uint64
+	diskHighPercent       uint32
+	diskCriticalPercent   uint32
+	minimumAvailableBytes uint64
 }
 
 type CompactionConfig struct {
@@ -128,6 +147,9 @@ func (c Config) Validate() error {
 	if _, _, _, err := c.compactionLimits(); err != nil {
 		return err
 	}
+	if _, err := c.maintenanceLimits(); err != nil {
+		return err
+	}
 	if len(c.PrincipalsByURI) == 0 || len(c.Authorization) == 0 {
 		return fmt.Errorf("at least one client Principal and authorization rule are required")
 	}
@@ -170,6 +192,45 @@ func (c Config) Validate() error {
 		}
 	}
 	return nil
+}
+
+func (c Config) maintenanceLimits() (maintenanceLimits, error) {
+	limits := maintenanceLimits{
+		checkInterval: time.Second, memTableBytes: 64 << 20, activeWALBytes: 256 << 20,
+		diskHighPercent: 85, diskCriticalPercent: 95, minimumAvailableBytes: 1 << 30,
+	}
+	if c.Maintenance.CheckInterval != "" {
+		value, err := time.ParseDuration(c.Maintenance.CheckInterval)
+		if err != nil || value <= 0 {
+			return limits, fmt.Errorf("maintenance.check_interval must be a positive duration")
+		}
+		limits.checkInterval = value
+	}
+	if c.Maintenance.MemTableBytes != 0 {
+		limits.memTableBytes = c.Maintenance.MemTableBytes
+	}
+	if c.Maintenance.ActiveWALBytes != 0 {
+		limits.activeWALBytes = c.Maintenance.ActiveWALBytes
+	}
+	if c.Maintenance.DiskHighPercent != 0 {
+		limits.diskHighPercent = c.Maintenance.DiskHighPercent
+	}
+	if c.Maintenance.DiskCriticalPercent != 0 {
+		limits.diskCriticalPercent = c.Maintenance.DiskCriticalPercent
+	}
+	if c.Maintenance.MinimumAvailableBytes != 0 {
+		limits.minimumAvailableBytes = c.Maintenance.MinimumAvailableBytes
+	}
+	if limits.memTableBytes < 1<<20 || limits.activeWALBytes < 1<<20 {
+		return limits, fmt.Errorf("maintenance MemTable and active WAL thresholds must be at least 1 MiB")
+	}
+	if limits.diskHighPercent == 0 || limits.diskHighPercent >= limits.diskCriticalPercent || limits.diskCriticalPercent >= 100 {
+		return limits, fmt.Errorf("maintenance disk watermarks must satisfy 0 < high < critical < 100")
+	}
+	if limits.minimumAvailableBytes < 64<<20 {
+		return limits, fmt.Errorf("maintenance.minimum_available_bytes must be at least 64 MiB")
+	}
+	return limits, nil
 }
 
 func (c Config) compactionLimits() (int, int, uint64, error) {

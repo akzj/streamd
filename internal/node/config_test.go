@@ -87,3 +87,27 @@ func TestConfigValidatesCompactionBudgets(t *testing.T) {
 		t.Fatal("undersized Compaction byte budget was accepted")
 	}
 }
+
+func TestConfigValidatesMaintenanceLimits(t *testing.T) {
+	config, err := LoadConfig(writeConfig(t, validConfig))
+	if err != nil {
+		t.Fatal(err)
+	}
+	config.Maintenance = MaintenanceConfig{CheckInterval: "500ms", MemTableBytes: 8 << 20, ActiveWALBytes: 32 << 20, DiskHighPercent: 80, DiskCriticalPercent: 90, MinimumAvailableBytes: 128 << 20}
+	if err = config.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	config.Maintenance.DiskHighPercent = 95
+	if err = config.Validate(); err == nil {
+		t.Fatal("inverted disk watermarks were accepted")
+	}
+}
+
+func writeConfig(t *testing.T, data string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "streamd.json")
+	if err := os.WriteFile(path, []byte(data), 0600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
