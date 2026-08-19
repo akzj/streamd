@@ -655,6 +655,13 @@ func TestCompactSwitchesGenerationBeforeRetiringInputs(t *testing.T) {
 			t.Fatalf("retired input Segment remains live: %v", statErr)
 		}
 	}
+	trash, err := os.ReadDir(filepath.Join(dir, "trash"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(trash) != 0 {
+		t.Fatalf("retired Compaction files remain in trash: %d", len(trash))
+	}
 }
 
 func TestPinnedManifestDefersCompactionRetirement(t *testing.T) {

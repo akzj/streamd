@@ -912,6 +912,9 @@ func (s *Store) checkpointLocked(states *replicationstate.Store) (format.Manifes
 	if err = s.lifecycle.RetireArtifacts(retiredArtifacts); err != nil {
 		return published, true, err
 	}
+	if err = s.lifecycle.CollectTrash(time.Now()); err != nil {
+		return published, true, err
+	}
 	if s.checkpointHook != nil {
 		if err = s.checkpointHook("after_view_install"); err != nil {
 			return published, true, err
@@ -1051,6 +1054,9 @@ func (s *Store) Compact(options CompactionOptions) (CompactionResult, error) {
 		return CompactionResult{}, err
 	}
 	if err = s.lifecycle.RetireArtifacts(retiredArtifacts); err != nil {
+		return CompactionResult{}, err
+	}
+	if err = s.lifecycle.CollectTrash(time.Now()); err != nil {
 		return CompactionResult{}, err
 	}
 	return CompactionResult{Manifest: published, Created: true, InputSegments: len(selected), InputBytes: inputBytes}, nil
