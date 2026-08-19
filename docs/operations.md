@@ -215,7 +215,8 @@ make test-soak-72h     # 有速率与磁盘预算的 72 小时持续写、维护
 
 72 小时门禁必须从同一提交重新完整计时。运行期间 `benchmark.log` 必须保持为空；第一次 WAL GC 后还要
 持续确认 Snapshot ID/checkpoint 前进、旧 Snapshot 被删除、Primary sealed WAL 周期回落，以及 Trash、
-Segment、RSS 和 FD 保持有界。进程仍存活或第一次 Snapshot 成功都不构成通过。任何周期维护错误都会写入
+Segment、RSS 和 FD 保持有界；这些资源和对象数量由 `resources.csv` 同步采样。进程仍存活或第一次
+Snapshot 成功都不构成通过。任何周期维护错误都会写入
 `benchmark.log` 并计入最终 `errors`；发现确定性不变量失败时应终止该 Run、保留完整产物并在修复后重跑，
 不能把修复前后的时长拼接为 72 小时。
 
