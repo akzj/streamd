@@ -1128,3 +1128,26 @@ func TestCapacityCriticalRejectsAppendButPreservesReadAndMaintenance(t *testing.
 		t.Fatal(err)
 	}
 }
+
+func TestTransientPerStreamStateIsReclaimed(t *testing.T) {
+	store, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	for i := 0; i < 1000; i++ {
+		name := fmt.Sprintf("stream-%d", i)
+		if _, err = store.Append(context.Background(), AppendRequest{Namespace: "scale", Stream: name, RequestID: []byte("request"), Producer: "test", Records: []InputRecord{{Payload: []byte("record")}}}); err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if waitErr := store.WaitForAppend(ctx, "scale", name, 1); !errors.Is(waitErr, context.Canceled) {
+			t.Fatalf("WaitForAppend error = %v", waitErr)
+		}
+	}
+	stats := store.MaintenanceStats()
+	if stats.AppendGates != 0 || stats.NotificationStreams != 0 {
+		t.Fatalf("transient state retained after idle: %+v", stats)
+	}
+}

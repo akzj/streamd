@@ -65,9 +65,11 @@ type Health struct {
 }
 
 type MaintenanceStats struct {
-	MemTableRecords uint64
-	MemTableBytes   uint64
-	ActiveWALBytes  uint64
+	MemTableRecords     uint64
+	MemTableBytes       uint64
+	ActiveWALBytes      uint64
+	AppendGates         uint64
+	NotificationStreams uint64
 }
 
 type WALCollectionEvidence struct {
@@ -115,6 +117,14 @@ type streamKey struct {
 	namespace string
 	stream    string
 }
+type appendGate struct {
+	token chan struct{}
+	refs  int
+}
+type notification struct {
+	ch      chan struct{}
+	waiters int
+}
 
 const (
 	defaultStreamCacheCapacity   = 1024
@@ -134,8 +144,8 @@ type Store struct {
 	committer        *commit.Committer
 	reader           *readstore.Store
 	now              func() time.Time
-	notifications    map[streamKey]chan struct{}
-	appendGates      map[streamKey]chan struct{}
+	notifications    map[streamKey]*notification
+	appendGates      map[streamKey]*appendGate
 	closed           bool
 	shutdown         bool
 	fatal            error
@@ -204,13 +214,19 @@ func (s *Store) SetCapacityCritical(critical bool) { s.capacityCritical.Store(cr
 
 func (s *Store) MaintenanceStats() MaintenanceStats {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	records, bytes := s.state.MemTable.Stats()
 	walBytes := s.state.WAL.Scan().LastGoodOffset
+	s.mu.Unlock()
 	if walBytes < 0 {
 		walBytes = 0
 	}
-	return MaintenanceStats{MemTableRecords: records, MemTableBytes: bytes, ActiveWALBytes: uint64(walBytes)}
+	s.gateMu.Lock()
+	gates := len(s.appendGates)
+	s.gateMu.Unlock()
+	s.notifyMu.Lock()
+	notifications := len(s.notifications)
+	s.notifyMu.Unlock()
+	return MaintenanceStats{MemTableRecords: records, MemTableBytes: bytes, ActiveWALBytes: uint64(walBytes), AppendGates: uint64(gates), NotificationStreams: uint64(notifications)}
 }
 
 // CollectWAL removes only sealed WAL files covered by both the current
@@ -436,7 +452,7 @@ func open(path string, node *format.NodeIdentity, replication *ReplicationOption
 	if current, ok := state.Manifest.Current(); ok {
 		generation = current.Header.Generation
 	}
-	return &Store{root: root, state: state, lifecycle: lifecycle.New(root.Path(), state.Manifest), committer: commit.NewWithOptions(state.WAL, state.MemTable, commitOptions), reader: readstore.New(state.MemTable, state.TailResolver, root.Path(), generation, state.Segments, state.Locator, defaultStreamCacheCapacity, defaultSegmentHandleCapacity), now: time.Now, notifications: make(map[streamKey]chan struct{}), appendGates: make(map[streamKey]chan struct{}), nextEntryID: state.WAL.NextEntryID(), previousCRC32C: state.WAL.PreviousEntryCRC32C(), lastRecordedAt: lastRecordedAt, term: term, role: role, durability: durability, guard: guard, commitOptions: commitOptions}, nil
+	return &Store{root: root, state: state, lifecycle: lifecycle.New(root.Path(), state.Manifest), committer: commit.NewWithOptions(state.WAL, state.MemTable, commitOptions), reader: readstore.New(state.MemTable, state.TailResolver, root.Path(), generation, state.Segments, state.Locator, defaultStreamCacheCapacity, defaultSegmentHandleCapacity), now: time.Now, notifications: make(map[streamKey]*notification), appendGates: make(map[streamKey]*appendGate), nextEntryID: state.WAL.NextEntryID(), previousCRC32C: state.WAL.PreviousEntryCRC32C(), lastRecordedAt: lastRecordedAt, term: term, role: role, durability: durability, guard: guard, commitOptions: commitOptions}, nil
 }
 
 func watermarksFromState(header format.ReplicationStateHeader) commit.Watermarks {
@@ -1181,21 +1197,28 @@ func (s *Store) WaitForAppend(ctx context.Context, namespace, name string, after
 		s.notifyMu.Unlock()
 		return errdefs.ErrClosed
 	}
-	ch := s.notifications[key]
-	if ch == nil {
-		ch = make(chan struct{})
-		s.notifications[key] = ch
+	n := s.notifications[key]
+	if n == nil {
+		n = &notification{ch: make(chan struct{})}
+		s.notifications[key] = n
 	}
+	n.waiters++
 	info, err := s.Inspect(namespace, name)
 	if err != nil || (info.Exists && info.NextSequence > after) {
+		s.releaseNotificationLocked(key, n)
 		s.notifyMu.Unlock()
 		return err
 	}
 	s.notifyMu.Unlock()
+	defer func() {
+		s.notifyMu.Lock()
+		s.releaseNotificationLocked(key, n)
+		s.notifyMu.Unlock()
+	}()
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
-	case <-ch:
+	case <-n.ch:
 		s.notifyMu.Lock()
 		closed := s.closed
 		s.notifyMu.Unlock()
@@ -1206,14 +1229,23 @@ func (s *Store) WaitForAppend(ctx context.Context, namespace, name string, after
 	}
 }
 
+func (s *Store) releaseNotificationLocked(key streamKey, n *notification) {
+	if n.waiters > 0 {
+		n.waiters--
+	}
+	if n.waiters == 0 && s.notifications[key] == n {
+		delete(s.notifications, key)
+	}
+}
+
 func (s *Store) signal(namespace, name string) {
 	key := streamKey{namespace: namespace, stream: name}
 	s.notifyMu.Lock()
 	if !s.closed {
-		if ch := s.notifications[key]; ch != nil {
-			close(ch)
+		if n := s.notifications[key]; n != nil {
+			close(n.ch)
+			delete(s.notifications, key)
 		}
-		s.notifications[key] = make(chan struct{})
 	}
 	s.notifyMu.Unlock()
 }
@@ -1222,8 +1254,8 @@ func (s *Store) closeNotifications() {
 	s.notifyMu.Lock()
 	if !s.closed {
 		s.closed = true
-		for key, ch := range s.notifications {
-			close(ch)
+		for key, n := range s.notifications {
+			close(n.ch)
 			delete(s.notifications, key)
 		}
 	}
@@ -1281,16 +1313,30 @@ func (s *Store) acquireAppendGate(ctx context.Context, key streamKey) (func(), e
 	s.gateMu.Lock()
 	gate := s.appendGates[key]
 	if gate == nil {
-		gate = make(chan struct{}, 1)
+		gate = &appendGate{token: make(chan struct{}, 1)}
 		s.appendGates[key] = gate
 	}
+	gate.refs++
 	s.gateMu.Unlock()
 	select {
-	case gate <- struct{}{}:
-		return func() { <-gate }, nil
+	case gate.token <- struct{}{}:
+		return func() {
+			<-gate.token
+			s.releaseAppendGate(key, gate)
+		}, nil
 	case <-ctx.Done():
+		s.releaseAppendGate(key, gate)
 		return nil, ctx.Err()
 	}
+}
+
+func (s *Store) releaseAppendGate(key streamKey, gate *appendGate) {
+	s.gateMu.Lock()
+	gate.refs--
+	if gate.refs == 0 && s.appendGates[key] == gate {
+		delete(s.appendGates, key)
+	}
+	s.gateMu.Unlock()
 }
 
 func (s *Store) finishAppend(future *commit.Future, namespace, stream string, release func()) {
