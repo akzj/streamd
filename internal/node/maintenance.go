@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/akzj/streamd/internal/replication"
 	"github.com/akzj/streamd/internal/storage/engine"
 	"github.com/akzj/streamd/internal/storage/format"
 	"golang.org/x/sys/unix"
@@ -14,6 +15,39 @@ import (
 type diskCapacity struct {
 	capacity  uint64
 	available uint64
+}
+
+func runStandbyMaintenance(ctx context.Context, config Config, store *replication.StandbyStore, logger *slog.Logger) error {
+	controller, err := newMaintenanceController(config, time.Now())
+	if err != nil {
+		return err
+	}
+	ticker := time.NewTicker(controller.limits.checkInterval)
+	defer ticker.Stop()
+	for {
+		now := time.Now()
+		disk, sampleErr := sampleDiskCapacity(config.DataDirectory)
+		if sampleErr != nil {
+			store.SetCapacityCritical(true)
+			logger.Error("Standby capacity sample failed; replication writes paused", "error", sampleErr)
+		} else {
+			stats := store.MaintenanceStats()
+			decision := controller.evaluate(now, engine.MaintenanceStats{MemTableRecords: stats.MemTableRecords, MemTableBytes: stats.MemTableBytes, ActiveWALBytes: stats.ActiveWALBytes}, disk)
+			store.SetCapacityCritical(decision.critical)
+			if decision.checkpoint {
+				if checkpointErr := store.Checkpoint(); checkpointErr != nil {
+					logger.Error("Standby replication checkpoint failed", "error", checkpointErr)
+				} else {
+					controller.checkpointCompleted(now)
+				}
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+		}
+	}
 }
 
 type maintenanceDecision struct {

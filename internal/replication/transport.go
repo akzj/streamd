@@ -301,7 +301,7 @@ func rpcError(err error) error {
 		return nil
 	}
 	code := codes.FailedPrecondition
-	if !IsCode(err, ErrInvalidState) && !IsCode(err, ErrWrongGroup) && !IsCode(err, ErrTermStale) && !IsCode(err, ErrNotLeader) && !IsCode(err, ErrLogGap) && !IsCode(err, ErrLogDiverged) && !IsCode(err, ErrNoRecoverySource) && !IsCode(err, ErrNeedsSnapshot) {
+	if !IsCode(err, ErrInvalidState) && !IsCode(err, ErrWrongGroup) && !IsCode(err, ErrTermStale) && !IsCode(err, ErrNotLeader) && !IsCode(err, ErrLogGap) && !IsCode(err, ErrLogDiverged) && !IsCode(err, ErrNoRecoverySource) && !IsCode(err, ErrNeedsSnapshot) && !IsCode(err, ErrCapacityCritical) {
 		return status.Error(codes.Internal, "replication operation failed")
 	}
 	if IsCode(err, ErrInvalidState) || IsCode(err, ErrWrongGroup) {
@@ -310,6 +310,8 @@ func rpcError(err error) error {
 		code = codes.OutOfRange
 	} else if IsCode(err, ErrLogDiverged) {
 		code = codes.DataLoss
+	} else if IsCode(err, ErrCapacityCritical) {
+		code = codes.ResourceExhausted
 	}
 	return status.Error(code, fmt.Sprintf("replication: %v", err))
 }

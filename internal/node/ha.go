@@ -363,18 +363,8 @@ func runStandby(ctx context.Context, config Config, nodeIdentity format.NodeIden
 	checkpointDone := make(chan struct{})
 	go func() {
 		defer close(checkpointDone)
-		interval, _ := config.checkpointDuration()
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-checkpointCtx.Done():
-				return
-			case <-ticker.C:
-				if checkpointErr := store.Checkpoint(); checkpointErr != nil {
-					logger.Error("Standby replication checkpoint failed", "error", checkpointErr)
-				}
-			}
+		if maintenanceErr := runStandbyMaintenance(checkpointCtx, config, store, logger); maintenanceErr != nil {
+			logger.Error("Standby maintenance loop stopped", "error", maintenanceErr)
 		}
 	}()
 	logger.Info("streamd Strict Standby started", "term", grant.Term, "leader", fmt.Sprintf("%x", grant.LeaderID), "grpc_address", grpcListener.Addr().String())

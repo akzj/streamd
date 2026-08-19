@@ -27,6 +27,7 @@ const (
 	ErrLogDiverged      ErrorCode = "LOG_DIVERGED"
 	ErrNoRecoverySource ErrorCode = "NO_RECOVERY_SOURCE"
 	ErrNeedsSnapshot    ErrorCode = "NEEDS_SNAPSHOT"
+	ErrCapacityCritical ErrorCode = "CAPACITY_CRITICAL"
 )
 
 type ProtocolError struct {

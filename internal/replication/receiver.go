@@ -21,6 +21,7 @@ type EntryLookup func(entryID uint64) (format.WALEntry, bool)
 type TermObserver func(term uint64, leaderID format.UUID) error
 type ApplyThrough func(firstEntryID, lastEntryID uint64) error
 type ApplyEntries func([]format.WALEntry) error
+type AppendAdmission func() error
 
 type ReceiverState struct {
 	Term          uint64
@@ -41,6 +42,7 @@ type ReceiverConfig struct {
 	ObserveTerm  TermObserver
 	ApplyThrough ApplyThrough
 	ApplyEntries ApplyEntries
+	CanAppend    AppendAdmission
 }
 
 type Receiver struct {
@@ -53,6 +55,7 @@ type Receiver struct {
 	observeTerm  TermObserver
 	applyThrough ApplyThrough
 	applyEntries ApplyEntries
+	canAppend    AppendAdmission
 	checksums    map[uint64]uint32
 	entries      map[uint64]format.WALEntry
 	state        ReceiverState
@@ -107,7 +110,7 @@ func NewReceiver(log StandbyLog, config ReceiverConfig) (*Receiver, error) {
 			}
 		}
 	}
-	return &Receiver{groupID: config.GroupID, nodeID: config.NodeID, log: log, checksumAt: config.ChecksumAt, entryAt: config.EntryAt, observeTerm: config.ObserveTerm, applyThrough: config.ApplyThrough, applyEntries: config.ApplyEntries, checksums: make(map[uint64]uint32), entries: make(map[uint64]format.WALEntry), state: config.State}, nil
+	return &Receiver{groupID: config.GroupID, nodeID: config.NodeID, log: log, checksumAt: config.ChecksumAt, entryAt: config.EntryAt, observeTerm: config.ObserveTerm, applyThrough: config.ApplyThrough, applyEntries: config.ApplyEntries, canAppend: config.CanAppend, checksums: make(map[uint64]uint32), entries: make(map[uint64]format.WALEntry), state: config.State}, nil
 }
 
 func (r *Receiver) State() (ReceiverState, error) {
@@ -201,6 +204,11 @@ func (r *Receiver) Append(message AppendEntries) error {
 	}
 	if decoded[appendFrom].EntryID != next {
 		return protocolError(ErrLogGap, "AppendEntries overlap does not connect to local tail")
+	}
+	if r.canAppend != nil {
+		if err := r.canAppend(); err != nil {
+			return protocolError(ErrCapacityCritical, "Standby storage capacity is critical")
+		}
 	}
 	if err := r.log.Append(message.Entries[appendFrom:]...); err != nil {
 		r.fatal = fmt.Errorf("append Standby WAL: %w", err)

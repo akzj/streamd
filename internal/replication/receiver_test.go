@@ -65,6 +65,36 @@ func TestReceiverAppendIsContinuousAndIdempotent(t *testing.T) {
 	}
 }
 
+func TestReceiverCapacityAdmissionRejectsOnlyNewWALData(t *testing.T) {
+	log := &receiverLog{}
+	critical := true
+	config := testReceiverConfig(ReceiverState{})
+	config.ChecksumAt = log.checksumAt
+	config.EntryAt = log.entryAt
+	config.CanAppend = func() error {
+		if critical {
+			return errors.New("critical")
+		}
+		return nil
+	}
+	receiver, err := NewReceiver(log, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	message := appendMessage(4, Position{}, encodedEntries(t, 1, 0, 0))
+	if err = receiver.Append(message); !IsCode(err, ErrCapacityCritical) || len(log.entries) != 0 {
+		t.Fatalf("critical Append error=%v entries=%d", err, len(log.entries))
+	}
+	critical = false
+	if err = receiver.Append(message); err != nil {
+		t.Fatal(err)
+	}
+	critical = true
+	if err = receiver.Append(message); err != nil {
+		t.Fatalf("idempotent Append was rejected at critical capacity: %v", err)
+	}
+}
+
 func TestReceiverBarrierAndOutOfOrderCommitAdvance(t *testing.T) {
 	log := &receiverLog{}
 	var applied [][2]uint64

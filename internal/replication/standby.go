@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/akzj/streamd/internal/storage/format"
@@ -23,16 +24,23 @@ import (
 )
 
 type StandbyStore struct {
-	mu        sync.Mutex
-	root      *fsutil.Root
-	identity  format.NodeIdentity
-	state     *recovery.Result
-	states    *replicationstate.Store
-	history   *wal.History
-	lifecycle *lifecycle.Manager
-	receiver  *Receiver
-	now       func() time.Time
-	closed    bool
+	mu               sync.Mutex
+	root             *fsutil.Root
+	identity         format.NodeIdentity
+	state            *recovery.Result
+	states           *replicationstate.Store
+	history          *wal.History
+	lifecycle        *lifecycle.Manager
+	receiver         *Receiver
+	now              func() time.Time
+	closed           bool
+	capacityCritical atomic.Bool
+}
+
+type StandbyMaintenanceStats struct {
+	MemTableRecords uint64
+	MemTableBytes   uint64
+	ActiveWALBytes  uint64
 }
 
 type standbyLog struct {
@@ -127,6 +135,12 @@ func OpenStandby(path string, node format.NodeIdentity, term uint64, leaderID fo
 		ChecksumAt: lookupChecksum, EntryAt: lookupEntry,
 		ObserveTerm:  store.observeTerm,
 		ApplyEntries: store.applyEntries,
+		CanAppend: func() error {
+			if store.capacityCritical.Load() {
+				return fmt.Errorf("storage capacity is critical")
+			}
+			return nil
+		},
 	})
 	if err != nil {
 		recovered.Close()
@@ -143,6 +157,19 @@ func OpenStandby(path string, node format.NodeIdentity, term uint64, leaderID fo
 }
 
 func (s *StandbyStore) Receiver() *Receiver { return s.receiver }
+
+func (s *StandbyStore) SetCapacityCritical(critical bool) { s.capacityCritical.Store(critical) }
+
+func (s *StandbyStore) MaintenanceStats() StandbyMaintenanceStats {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	records, bytes := s.state.MemTable.Stats()
+	walBytes := s.state.WAL.Scan().LastGoodOffset
+	if walBytes < 0 {
+		walBytes = 0
+	}
+	return StandbyMaintenanceStats{MemTableRecords: records, MemTableBytes: bytes, ActiveWALBytes: uint64(walBytes)}
+}
 
 func (s *StandbyStore) Hello() (ReplicaHello, error) {
 	state, err := s.receiver.State()
