@@ -70,6 +70,12 @@ type MaintenanceStats struct {
 	ActiveWALBytes  uint64
 }
 
+type WALCollectionEvidence struct {
+	SnapshotEntryID  uint64
+	SnapshotVerified bool
+	MaxRetainedBytes uint64
+}
+
 type CompactionOptions struct {
 	MinSegments      int
 	MaxInputSegments int
@@ -205,6 +211,56 @@ func (s *Store) MaintenanceStats() MaintenanceStats {
 		walBytes = 0
 	}
 	return MaintenanceStats{MemTableRecords: records, MemTableBytes: bytes, ActiveWALBytes: uint64(walBytes)}
+}
+
+// CollectWAL removes only sealed WAL files covered by both the current
+// Manifest and one externally verified installable Snapshot. Maintenance is
+// serialized with Checkpoint/Compaction and admitted appends are drained before
+// the history view is opened.
+func (s *Store) CollectWAL(evidence WALCollectionEvidence) (wal.GCResult, error) {
+	if !evidence.SnapshotVerified {
+		return wal.GCResult{}, fmt.Errorf("WAL collection requires a verified Snapshot")
+	}
+	s.maintenanceMu.Lock()
+	defer s.maintenanceMu.Unlock()
+	s.mu.Lock()
+	if s.shutdown {
+		s.mu.Unlock()
+		return wal.GCResult{}, errdefs.ErrClosed
+	}
+	if err := s.fatalError(); err != nil {
+		s.mu.Unlock()
+		return wal.GCResult{}, fmt.Errorf("engine failed: %w", err)
+	}
+	if err := s.committer.Barrier(context.Background()); err != nil {
+		s.setFatal(err)
+		s.mu.Unlock()
+		return wal.GCResult{}, err
+	}
+	manifest, ok := s.state.Manifest.Current()
+	if !ok || manifest.Header.RecordCount == 0 || evidence.SnapshotEntryID > manifest.Header.LastEntryID {
+		s.mu.Unlock()
+		return wal.GCResult{}, fmt.Errorf("verified Snapshot is not covered by the current Manifest")
+	}
+	watermarks := s.committer.Watermarks()
+	if (s.role == format.ReplicationRolePrimary || s.role == format.ReplicationRoleStandby) && (!watermarks.HasCommitted || evidence.SnapshotEntryID > watermarks.Committed) {
+		s.mu.Unlock()
+		return wal.GCResult{}, fmt.Errorf("verified Snapshot is not covered by committed state")
+	}
+	history, err := wal.OpenHistory(s.root.Path())
+	if err != nil {
+		s.mu.Unlock()
+		return wal.GCResult{}, err
+	}
+	replica := wal.HistoryPosition{Present: watermarks.HasReplicated, EntryID: watermarks.Replicated}
+	if s.role == format.ReplicationRoleSingle {
+		replica = wal.HistoryPosition{Present: watermarks.HasLocalDurable, EntryID: watermarks.LocalDurable}
+	}
+	s.mu.Unlock()
+	return history.Collect(wal.GCOptions{
+		SegmentedThrough: manifest.Header.LastEntryID, SnapshotThrough: evidence.SnapshotEntryID,
+		SnapshotVerified: true, ReplicaDurable: replica, MaxRetainedBytes: evidence.MaxRetainedBytes,
+	})
 }
 
 func (s *Store) CommitStats() commit.Stats {

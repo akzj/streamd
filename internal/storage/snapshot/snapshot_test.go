@@ -285,6 +285,45 @@ func TestCreateOnlineStrictPrimaryRequiresCommittedWritableSource(t *testing.T) 
 	}
 }
 
+func TestVerifiedOnlineSnapshotAllowsLiveWALCollection(t *testing.T) {
+	data := filepath.Join(t.TempDir(), "data")
+	node := format.NodeIdentity{ClusterID: snapshotID(1), GroupID: snapshotID(2), NodeID: snapshotID(3), CreatedAt: 1}
+	store, err := engine.OpenWithIdentity(data, node)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.Append(context.Background(), engine.AppendRequest{Namespace: "n", Stream: "s", RequestID: []byte("r"), Producer: "test", Records: []engine.InputRecord{{Payload: []byte("record")}}}); err != nil {
+		t.Fatal(err)
+	}
+	created, err := CreateOnline(store, filepath.Join(data, "snapshots", "online"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.CollectWAL(engine.WALCollectionEvidence{SnapshotEntryID: created.CheckpointEntryID}); err == nil {
+		t.Fatal("unverified Snapshot evidence was accepted")
+	}
+	collected, err := store.CollectWAL(engine.WALCollectionEvidence{SnapshotEntryID: created.CheckpointEntryID, SnapshotVerified: true})
+	if err != nil || len(collected.DeletedFiles) != 1 || collected.DeletedBytes == 0 {
+		t.Fatalf("WAL collection = %+v, error = %v", collected, err)
+	}
+	result, err := store.Read("n", "s", 0, 10, 0)
+	if err != nil || len(result.Records) != 1 {
+		t.Fatalf("Read after WAL collection = %+v, error = %v", result, err)
+	}
+	if err = store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = engine.OpenWithIdentity(data, node)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	result, err = store.Read("n", "s", 0, 10, 0)
+	if err != nil || len(result.Records) != 1 {
+		t.Fatalf("restart Read after WAL collection = %+v, error = %v", result, err)
+	}
+}
+
 func TestCreateOnlineRejectsUncertainStrictSuffix(t *testing.T) {
 	data := filepath.Join(t.TempDir(), "data")
 	node := format.NodeIdentity{ClusterID: snapshotID(1), GroupID: snapshotID(2), NodeID: snapshotID(3), CreatedAt: 1}
