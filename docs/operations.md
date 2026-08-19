@@ -213,6 +213,12 @@ make test-scale        # 默认一百万 Stream，保留峰值 RSS/重开/全量
 make test-soak-72h     # 有速率与磁盘预算的 72 小时持续写、维护和最终 scrub
 ```
 
+72 小时门禁必须从同一提交重新完整计时。运行期间 `benchmark.log` 必须保持为空；第一次 WAL GC 后还要
+持续确认 Snapshot ID/checkpoint 前进、旧 Snapshot 被删除、Primary sealed WAL 周期回落，以及 Trash、
+Segment、RSS 和 FD 保持有界。进程仍存活或第一次 Snapshot 成功都不构成通过。任何周期维护错误都会写入
+`benchmark.log` 并计入最终 `errors`；发现确定性不变量失败时应终止该 Run、保留完整产物并在修复后重跑，
+不能把修复前后的时长拼接为 72 小时。
+
 默认 `make test-scale` 会创建一百万个低密度 Stream。V1 Locator 格式至少为每个 Stream 分配一个
 64 KiB Page，实测最终 Locator Pack 为 65,536,069,720 bytes；执行前至少预留 80 GiB 可用空间，并将
 运行目录放在允许产生该体量临时/最终 Artifact 的测试磁盘。Locator Verify 和 Scrub 使用流式 SHA-256，

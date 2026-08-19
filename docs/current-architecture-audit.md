@@ -3,7 +3,7 @@
 | 属性 | 内容 |
 | --- | --- |
 | 审计性质 | 代码现实版整体架构审计，不是目标架构复述 |
-| 审计基线 | `d1747e5`（`main`，2026-08-19；本文件后的审计修正另行提交） |
+| 审计基线 | `a7380c2`（`main`，2026-08-19；本文件后的审计修正另行提交） |
 | 审计日期 | 2026-08-19 |
 | 相对上次审计新增 | 容量 Admission、阈值维护、在线 Snapshot/WAL GC、Standby Compaction、运行时 Stream 状态回收、规模/故障/兼容/Soak 门禁 |
 | 覆盖范围 | API、存储、索引、Checkpoint、Compaction、恢复、Snapshot、WAL GC、Strict HA、并发与运维入口 |
@@ -366,8 +366,9 @@ Snapshot Manifest、安装 Journal、崩溃续装以及三组 CURRENT 指针切�
 
 但运行形态分裂为两类：
 
-- `CreateOnline(store, ...)` 使用运行中的 Engine，在 Checkpoint 前后验证 Source Role、Strict
-  Durability、fatal、Lease Guard 和 committed watermark，但当前节点没有调度或 RPC 接入；
+- Single/Primary 维护调度使用运行中的 Engine，在 Checkpoint 前后验证 Source Role、Strict
+  Durability、fatal、Lease Guard 和 committed watermark；在线 retention 事务创建并验证 linked
+  Snapshot、先发布恢复锚点、回收 WAL，再发布新的 earliest-WAL 边界；
 - `streamd-tool snapshot` 只允许 Single 数据目录；检测到 PRIMARY、STANDBY 或 RECOVERING
   Replication State 时失败关闭；
 - `streamd-tool snapshot-primary` 只允许停止的 durable Strict Primary，或由 hash-linked 紧邻前态证明
@@ -376,8 +377,9 @@ Snapshot Manifest、安装 Journal、崩溃续装以及三组 CURRENT 指针切�
 
 WAL GC 要求当前 Manifest、已验证且位于 `data/snapshots/` 的 Snapshot，以及 replication state 的
 committed 证据。它只删除被 Segment 和 Snapshot 同时覆盖的连续 sealed WAL 前缀；Catch-up Pin 会
-阻止删除正在传输的文件。Retention Manager 从读取证据到删除和 State 发布全程持有数据根独占锁，
-在线进程存在时离线命令立即失败。
+阻止删除正在传输的文件。在线路径在删除前将 verified Snapshot 写入 durable Replication State，删除后
+再推进 earliest WAL；因此任一发布边界崩溃都保留保守且可恢复的状态。离线 Retention Manager 从读取
+证据到删除和 State 发布全程持有数据根独占锁，在线进程存在时离线命令立即失败。
 
 Replication State 中的 Installed Snapshot 只证明本地数据从哪个 checkpoint 恢复，不证明对应 Package
 仍可供其他副本安装。复制规划先按 WAL 事实尝试增量；只有遇到 `NO_RECOVERY_SOURCE` 或
@@ -500,9 +502,10 @@ rename 到 `trash/`。Segment Reader Handle 有引用计数，在线 Snapshot �
 Catch-up 使用独立的 WAL file Pin。
 
 这些 Pin 都是进程内短期 Pin。持久 Snapshot 通过复制出独立 Artifact 集合获得生命周期独立性；当前
-没有通用的持久 Pin Registry 或传输 Lease。当前 WAL GC 是离线命令，数据根独占锁排除了它与在线
-Catch-up 的跨进程竞争；同一 `wal.History` 内部的 Pin/Collect 由 mutex 和文件 pin 计数保护，并有并发
-回归测试证明持有 Pin 时 Collect 可完成但不会删除被 Pin 文件。
+没有通用的持久 Pin Registry 或传输 Lease。离线 WAL GC 依靠数据根独占锁排除与在线 Catch-up 的
+跨进程竞争；Single/Primary 在线 GC 与 Checkpoint/Compaction 共用 Engine maintenance lock。同一
+`wal.History` 内部的 Pin/Collect 由 mutex 和文件 pin 计数保护，并有并发回归测试证明持有 Pin 时
+Collect 可完成但不会删除被 Pin 文件。
 
 ## 8. 当前能力矩阵
 
@@ -584,6 +587,10 @@ Catch-up 的跨进程竞争；同一 `wal.History` 内部的 Pin/Collect 由 mut
 14. **退休 Artifact 只移入 Trash、不在运行期删除**：Checkpoint 和 Compaction 在新 Reader 安装、旧
     Reader 关闭且 Pin 规则允许退休后执行 Trash GC。3 分钟 Strict soak 跨 3 次 Checkpoint，始终只有
     1 个 live Locator Pack、`trash_files=0`，最终 Scrub/Standby WAL 验证通过；Pin 未释放的文件仍保留。
+15. **首次在线 WAL GC 后无法创建后续 replicated Snapshot**：节点与 benchmark 曾维护两份 retention
+    编排，benchmark 删除 WAL 后没有发布 Installed Snapshot 恢复锚点，下一次 State checkpoint 被格式
+    不变量拒绝。两条调用链现共用 `storage/retention.CreateSnapshotAndCollect`；回归测试连续推进两个
+    Strict Snapshot，秒级 Strict smoke 完成 3 次轮换、错误为 0、最终只保留 1 个 Snapshot。
 
 这些边界不得为了自动化或缩短 RTO 而放宽。
 
@@ -715,7 +722,7 @@ Promotion、Snapshot、WAL GC 和诊断仍必须结合物理 WAL；任何新模�
 | Read/Cache/投影构建 | `internal/storage/read/store.go`, `internal/storage/tail/`, `internal/storage/locator/`, `internal/storage/registry/` |
 | WAL History/GC Pin | `internal/storage/wal/history.go` |
 | Snapshot | `internal/storage/snapshot/` |
-| WAL Retention | `internal/storage/retention/manager.go` |
+| WAL Retention | `internal/storage/retention/` |
 | 容量维护 | `internal/node/maintenance.go`, `internal/replication/standby.go` |
 | 规模/故障/兼容/Soak | `test/scale/`, `test/fault/`, `test/compat/`, `test/soak/` |
 | Strict Replication | `internal/replication/primary.go`, `receiver.go`, `standby.go`, `catchup.go` |

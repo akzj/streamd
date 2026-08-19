@@ -228,6 +228,12 @@ Checkpoint 后执行有界 Compaction，每小时创建 verified linked Snapshot
 2026-08-19 的回归跨 3 次 Checkpoint、17,999 requests，错误为 0、最终 Scrub 和 Standby WAL 验证成功，
 Primary 始终只有 1 个 live Locator Pack 且 `trash_files=0`。
 
+同日首次正式 Run `soak-72h-20260819-r2` 在约 2.5 小时主动终止并判无效：第一次 Snapshot/WAL GC 后，
+后续 replicated Snapshot 因 Replication State 缺少 Installed Snapshot 恢复锚点而持续失败。修复将节点与
+benchmark 收敛到同一个在线 retention 事务，并让 benchmark 把周期 Checkpoint/Compaction/Snapshot 错误
+实时写入 stderr。修复后的 20 秒 Strict 诊断跨 3 次 Snapshot，`errors=0`、Scrub/Standby 验证成功、
+只保留 1 个 Snapshot、Primary WAL 回落到 2 个。该诊断只证明缺陷闭环，不能替代重新计时的 72 小时 Run。
+
 至少包含：
 
 - 72 小时持续混合读写；
