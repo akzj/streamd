@@ -656,9 +656,22 @@ func (s *Store) CheckpointReplicated(states *replicationstate.Store) (format.Man
 // that exact Manifest Generation. The release function must be called after an
 // online Snapshot or transfer no longer needs those immutable files.
 func (s *Store) CheckpointAndPin() (format.Manifest, bool, func(), error) {
+	return s.checkpointAndPin(nil)
+}
+
+// CheckpointAndPinReplicated persists the committed recovery floor in the
+// same freeze boundary before pinning the published Manifest for Snapshot.
+func (s *Store) CheckpointAndPinReplicated(states *replicationstate.Store) (format.Manifest, bool, func(), error) {
+	if states == nil {
+		return format.Manifest{}, false, nil, fmt.Errorf("replicated State store is required")
+	}
+	return s.checkpointAndPin(states)
+}
+
+func (s *Store) checkpointAndPin(states *replicationstate.Store) (format.Manifest, bool, func(), error) {
 	s.maintenanceMu.Lock()
 	defer s.maintenanceMu.Unlock()
-	manifest, created, err := s.checkpointLocked(nil)
+	manifest, created, err := s.checkpointLocked(states)
 	if err != nil {
 		return format.Manifest{}, false, nil, err
 	}

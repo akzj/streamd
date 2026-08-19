@@ -298,7 +298,7 @@ func (s *StandbyStore) Compact(options StandbyCompactionOptions) (StandbyCompact
 	if err != nil {
 		nextTailCatalog.Close()
 		nextLocator.Close()
-		return StandbyCompactionResult{}, err
+		return StandbyCompactionResult{}, s.receiver.fail(err)
 	}
 	if oldTailCatalog != nil {
 		err = oldTailCatalog.Close()
@@ -471,7 +471,7 @@ func (s *StandbyStore) checkpointLocked() error {
 	if err != nil {
 		nextTailCatalog.Close()
 		nextLocator.Close()
-		return err
+		return s.receiver.fail(err)
 	}
 	if oldTailCatalog != nil {
 		err = oldTailCatalog.Close()

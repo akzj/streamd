@@ -237,7 +237,13 @@ func walDirectoryBytes(root string) (uint64, error) {
 
 func createSnapshotAndCollectWAL(store *engine.Store, states *replicationstate.Store, maxRetained uint64, now time.Time) error {
 	destination := filepath.Join(store.DataRoot(), "snapshots", fmt.Sprintf("auto-%020d", now.UnixNano()))
-	created, err := snapshot.CreateOnlineLinked(store, destination)
+	var created snapshot.Result
+	var err error
+	if states != nil {
+		created, err = snapshot.CreateOnlineReplicatedLinked(store, states, destination)
+	} else {
+		created, err = snapshot.CreateOnlineLinked(store, destination)
+	}
 	if err != nil {
 		return err
 	}

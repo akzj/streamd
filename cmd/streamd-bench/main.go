@@ -20,6 +20,7 @@ import (
 	"github.com/akzj/streamd/internal/storage/errdefs"
 	"github.com/akzj/streamd/internal/storage/format"
 	"github.com/akzj/streamd/internal/storage/fsutil"
+	"github.com/akzj/streamd/internal/storage/replicationstate"
 	"github.com/akzj/streamd/internal/storage/scrub"
 	"github.com/akzj/streamd/internal/storage/snapshot"
 	"github.com/akzj/streamd/internal/storage/wal"
@@ -189,6 +190,25 @@ func main() {
 	if err != nil {
 		fatal(err)
 	}
+	var benchmarkStates *replicationstate.Store
+	if *mode == "strict" {
+		benchmarkStates, err = replicationstate.Open(dataPath, identity)
+		if err == nil {
+			_, err = benchmarkStates.Update(time.Now(), func(header *format.ReplicationStateHeader) error {
+				header.Term = 1
+				header.Role = format.ReplicationRolePrimary
+				header.Durability = format.ReplicationDurabilityStrict
+				header.HasLeader = true
+				header.LeaderID = identity.NodeID
+				header.HasLease = true
+				header.LeaseExpiresAt = time.Now().Add(*duration + 24*time.Hour).UnixNano()
+				return nil
+			})
+		}
+		if err != nil {
+			fatal(err)
+		}
+	}
 	closed := false
 	defer func() {
 		if !closed {
@@ -313,7 +333,13 @@ func main() {
 				}
 				if *retentionInterval > 0 && time.Since(lastSnapshot) >= *retentionInterval {
 					destination := filepath.Join(dataPath, "snapshots", fmt.Sprintf("soak-%020d", time.Now().UnixNano()))
-					created, snapshotErr := snapshot.CreateOnlineLinked(store, destination)
+					var created snapshot.Result
+					var snapshotErr error
+					if benchmarkStates != nil {
+						created, snapshotErr = snapshot.CreateOnlineReplicatedLinked(store, benchmarkStates, destination)
+					} else {
+						created, snapshotErr = snapshot.CreateOnlineLinked(store, destination)
+					}
 					if snapshotErr == nil {
 						_, snapshotErr = snapshot.Verify(created.Path)
 					}

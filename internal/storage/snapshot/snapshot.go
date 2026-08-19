@@ -67,7 +67,7 @@ func Create(dataRoot, destination string) (result Result, err error) {
 		return result, err
 	}
 	defer func() { err = errors.Join(err, store.Close()) }()
-	return createOnline(store, destination, 0)
+	return createOnline(store, nil, destination, 0)
 }
 
 // CreatePrimaryOffline creates a Snapshot from a stopped Strict Primary. A
@@ -112,7 +112,7 @@ func CreatePrimaryOffline(dataRoot, destination string) (result Result, err erro
 		return result, err
 	}
 	defer func() { err = errors.Join(err, store.Close()) }()
-	return create(store, destination, current.Header.Term, true, false)
+	return create(store, states, destination, current.Header.Term, true, false)
 }
 
 // CreateOnline takes a short engine checkpoint and then copies only immutable
@@ -126,7 +126,20 @@ func CreateOnline(store *engine.Store, destination string) (result Result, err e
 	if err = validateSource(health, false); err != nil {
 		return result, err
 	}
-	return createOnline(store, destination, health.Term)
+	return createOnline(store, nil, destination, health.Term)
+}
+
+// CreateOnlineReplicated binds a Strict Primary Snapshot checkpoint to its
+// durable Replication State floor.
+func CreateOnlineReplicated(store *engine.Store, states *replicationstate.Store, destination string) (result Result, err error) {
+	if store == nil || states == nil {
+		return result, fmt.Errorf("Snapshot engine and replicated State store are required")
+	}
+	health := store.Health()
+	if err = validateSource(health, false); err != nil {
+		return result, err
+	}
+	return createOnline(store, states, destination, health.Term)
 }
 
 // CreateOnlineLinked creates a local Snapshot whose immutable artifacts share
@@ -141,14 +154,27 @@ func CreateOnlineLinked(store *engine.Store, destination string) (result Result,
 	if err = validateSource(health, false); err != nil {
 		return result, err
 	}
-	return create(store, destination, health.Term, false, true)
+	return create(store, nil, destination, health.Term, false, true)
 }
 
-func createOnline(store *engine.Store, destination string, term uint64) (result Result, err error) {
-	return create(store, destination, term, false, false)
+// CreateOnlineReplicatedLinked combines the replicated recovery-floor binding
+// with local hard-linked immutable artifacts used by online WAL retention.
+func CreateOnlineReplicatedLinked(store *engine.Store, states *replicationstate.Store, destination string) (result Result, err error) {
+	if store == nil || states == nil {
+		return result, fmt.Errorf("Snapshot engine and replicated State store are required")
+	}
+	health := store.Health()
+	if err = validateSource(health, false); err != nil {
+		return result, err
+	}
+	return create(store, states, destination, health.Term, false, true)
 }
 
-func create(store *engine.Store, destination string, term uint64, allowReleasedPrimary, linkArtifacts bool) (result Result, err error) {
+func createOnline(store *engine.Store, states *replicationstate.Store, destination string, term uint64) (result Result, err error) {
+	return create(store, states, destination, term, false, false)
+}
+
+func create(store *engine.Store, states *replicationstate.Store, destination string, term uint64, allowReleasedPrimary, linkArtifacts bool) (result Result, err error) {
 	if store == nil {
 		return result, fmt.Errorf("Snapshot engine is required")
 	}
@@ -166,7 +192,17 @@ func create(store *engine.Store, destination string, term uint64, allowReleasedP
 		}
 		return result, err
 	}
-	manifest, _, releaseManifest, err := store.CheckpointAndPin()
+	health := store.Health()
+	var manifest format.Manifest
+	var releaseManifest func()
+	if health.Role == format.ReplicationRoleSingle || allowReleasedPrimary {
+		manifest, _, releaseManifest, err = store.CheckpointAndPin()
+	} else {
+		if states == nil {
+			return result, fmt.Errorf("replicated online Snapshot requires a Replication State store")
+		}
+		manifest, _, releaseManifest, err = store.CheckpointAndPinReplicated(states)
+	}
 	if err != nil {
 		return result, err
 	}
@@ -174,7 +210,7 @@ func create(store *engine.Store, destination string, term uint64, allowReleasedP
 	if manifest.Header.RecordCount == 0 {
 		return result, fmt.Errorf("empty data roots do not have an installable V1 Manifest")
 	}
-	health := store.Health()
+	health = store.Health()
 	if err = validateSource(health, allowReleasedPrimary); err != nil {
 		return result, err
 	}

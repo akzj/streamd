@@ -263,10 +263,29 @@ func TestCreateOnlineStrictPrimaryRequiresCommittedWritableSource(t *testing.T) 
 		t.Fatal(err)
 	}
 	defer store.Close()
+	states, err := replicationstate.Open(data, node)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = states.Update(time.Now(), func(header *format.ReplicationStateHeader) error {
+		header.Term = 7
+		header.Role = format.ReplicationRolePrimary
+		header.Durability = format.ReplicationDurabilityStrict
+		header.HasLeader = true
+		header.LeaderID = node.NodeID
+		header.HasLease = true
+		header.LeaseExpiresAt = time.Now().Add(time.Hour).UnixNano()
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
 	if _, err = store.Append(context.Background(), engine.AppendRequest{Namespace: "n", Stream: "s", RequestID: []byte("r"), Producer: "test", Records: []engine.InputRecord{{Payload: []byte("record")}}}); err != nil {
 		t.Fatal(err)
 	}
-	created, err := CreateOnline(store, filepath.Join(t.TempDir(), "snapshot"))
+	if _, err = CreateOnline(store, filepath.Join(t.TempDir(), "missing-state")); err == nil || !strings.Contains(err.Error(), "Replication State store") {
+		t.Fatalf("Strict Snapshot without durable State error = %v", err)
+	}
+	created, err := CreateOnlineReplicated(store, states, filepath.Join(t.TempDir(), "snapshot"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -274,9 +293,13 @@ func TestCreateOnlineStrictPrimaryRequiresCommittedWritableSource(t *testing.T) 
 	if created.Term != 7 || !health.Watermarks.HasCommitted || created.CheckpointEntryID > health.Watermarks.Committed {
 		t.Fatalf("Snapshot = %+v, Health = %+v", created, health)
 	}
+	durable, ok := states.Current()
+	if !ok || !durable.Header.Committed.Present || durable.Header.Committed.EntryID < created.CheckpointEntryID {
+		t.Fatalf("Snapshot checkpoint exceeded durable Replication State: Snapshot=%+v State=%+v", created, durable.Header)
+	}
 	store.SetCapacityCritical(true)
 	linkedPath := filepath.Join(data, "snapshots", "linked")
-	if _, err = CreateOnlineLinked(store, linkedPath); err != nil {
+	if _, err = CreateOnlineReplicatedLinked(store, states, linkedPath); err != nil {
 		t.Fatalf("capacity-critical maintenance Snapshot: %v", err)
 	}
 	liveSegments, globErr := filepath.Glob(filepath.Join(data, "segments", "*.seg"))
@@ -299,7 +322,7 @@ func TestCreateOnlineStrictPrimaryRequiresCommittedWritableSource(t *testing.T) 
 
 	guard.err = errors.New("lease expired")
 	destination := filepath.Join(t.TempDir(), "unsafe-snapshot")
-	if _, err = CreateOnline(store, destination); err == nil || !strings.Contains(err.Error(), "not safely writable") {
+	if _, err = CreateOnlineReplicated(store, states, destination); err == nil || !strings.Contains(err.Error(), "not safely writable") {
 		t.Fatalf("unsafe Primary Snapshot error = %v", err)
 	}
 	if _, statErr := os.Stat(destination); !errors.Is(statErr, os.ErrNotExist) {
