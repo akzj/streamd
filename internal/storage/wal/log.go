@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
+	"hash"
 	"io"
 	"os"
 	"path/filepath"
@@ -29,6 +30,7 @@ type Log struct {
 	pointer                format.WALCurrentPointer
 	scan                   ScanResult
 	expectedPreviousCRC32C uint32
+	contentHash            hash.Hash
 }
 
 func Create(root string, firstEntryID, term uint64, now time.Time) (*Log, error) {
@@ -56,7 +58,8 @@ func CreateAfter(root string, firstEntryID, term uint64, previousCRC32C uint32, 
 			os.Remove(path)
 		}
 	}()
-	if _, err = f.Write(format.MarshalWALFileHeader(header)); err != nil {
+	headerBytes := format.MarshalWALFileHeader(header)
+	if err = writeFull(f, headerBytes); err != nil {
 		return nil, err
 	}
 	if err = f.Sync(); err != nil {
@@ -74,7 +77,9 @@ func CreateAfter(root string, firstEntryID, term uint64, previousCRC32C uint32, 
 		return nil, err
 	}
 	ok = true
-	return &Log{root: root, file: f, pointer: pointer, scan: ScanResult{Header: header, LastGoodOffset: format.WALFileHeaderLength}, expectedPreviousCRC32C: previousCRC32C}, nil
+	contentHash := sha256.New()
+	_, _ = contentHash.Write(headerBytes)
+	return &Log{root: root, file: f, pointer: pointer, scan: ScanResult{Header: header, LastGoodOffset: format.WALFileHeaderLength}, expectedPreviousCRC32C: previousCRC32C, contentHash: contentHash}, nil
 }
 
 func Open(root string) (*Log, error) {
@@ -93,7 +98,7 @@ func OpenWithPrevious(root string, previousCRC32C uint32) (*Log, error) {
 	if err != nil {
 		return nil, err
 	}
-	scan, err := ScanActive(f)
+	scan, contentHash, err := scanActive(f)
 	if err != nil {
 		f.Close()
 		return nil, err
@@ -123,26 +128,33 @@ func OpenWithPrevious(root string, previousCRC32C uint32) (*Log, error) {
 		f.Close()
 		return nil, fmt.Errorf("active WAL does not continue previous CRC")
 	}
-	return &Log{root: root, file: f, pointer: pointer, scan: scan, expectedPreviousCRC32C: previousCRC32C}, nil
+	return &Log{root: root, file: f, pointer: pointer, scan: scan, expectedPreviousCRC32C: previousCRC32C, contentHash: contentHash}, nil
 }
 
 func ScanActive(f *os.File) (ScanResult, error) {
+	result, _, err := scanActive(f)
+	return result, err
+}
+
+func scanActive(f *os.File) (ScanResult, hash.Hash, error) {
 	var result ScanResult
+	contentHash := sha256.New()
 	info, err := f.Stat()
 	if err != nil {
-		return result, err
+		return result, nil, err
 	}
 	if info.Size() < format.WALFileHeaderLength {
-		return result, fmt.Errorf("active WAL header is truncated")
+		return result, nil, fmt.Errorf("active WAL header is truncated")
 	}
 	hb := make([]byte, format.WALFileHeaderLength)
 	if _, err = f.ReadAt(hb, 0); err != nil {
-		return result, err
+		return result, nil, err
 	}
 	result.Header, err = format.UnmarshalWALFileHeader(hb)
 	if err != nil {
-		return result, err
+		return result, nil, err
 	}
+	_, _ = contentHash.Write(hb)
 	pos := int64(format.WALFileHeaderLength)
 	result.LastGoodOffset = pos
 	next := result.Header.FirstEntryID
@@ -155,11 +167,11 @@ func ScanActive(f *os.File) (ScanResult, error) {
 		}
 		head := make([]byte, format.WALEntryHeaderLength)
 		if _, err = f.ReadAt(head, pos); err != nil {
-			return result, err
+			return result, nil, err
 		}
 		length := uint64(binary.LittleEndian.Uint32(head[8:12]))
 		if length < format.WALEntryHeaderLength+format.RecordFixedHeaderLength+format.RecordCRCSize+4 || length > format.WALEntryHeaderLength+format.MaxFrameLength+4 {
-			return result, fmt.Errorf("invalid WAL entry length %d at %d", length, pos)
+			return result, nil, fmt.Errorf("invalid WAL entry length %d at %d", length, pos)
 		}
 		if int64(length) > remaining {
 			result.TruncatedBytes = remaining
@@ -167,18 +179,19 @@ func ScanActive(f *os.File) (ScanResult, error) {
 		}
 		entryBytes := make([]byte, int(length))
 		if _, err = f.ReadAt(entryBytes, pos); err != nil {
-			return result, err
+			return result, nil, err
 		}
 		entry, err := format.UnmarshalWALEntry(entryBytes)
 		if err != nil {
-			return result, fmt.Errorf("WAL entry at %d: %w", pos, err)
+			return result, nil, fmt.Errorf("WAL entry at %d: %w", pos, err)
 		}
 		if result.EntryCount == 0 {
 			result.FirstEntryPreviousCRC32C = entry.PreviousEntryCRC32C
 		}
 		if entry.EntryID != next || (result.EntryCount > 0 && entry.PreviousEntryCRC32C != previous) {
-			return result, fmt.Errorf("WAL continuity failure at Entry %d", entry.EntryID)
+			return result, nil, fmt.Errorf("WAL continuity failure at Entry %d", entry.EntryID)
 		}
+		_, _ = contentHash.Write(entryBytes)
 		previous = entry.CRC32C
 		result.EntryCount++
 		result.LastEntryID = entry.EntryID
@@ -187,7 +200,7 @@ func ScanActive(f *os.File) (ScanResult, error) {
 		pos += int64(length)
 		result.LastGoodOffset = pos
 	}
-	return result, nil
+	return result, contentHash, nil
 }
 
 func (l *Log) Append(encodedEntries ...[]byte) error {
@@ -214,6 +227,7 @@ func (l *Log) Append(encodedEntries ...[]byte) error {
 		if err := writeFull(l.file, b); err != nil {
 			return err
 		}
+		_, _ = l.contentHash.Write(b)
 		entry, _ := format.UnmarshalWALEntry(b)
 		l.scan.EntryCount++
 		l.scan.LastEntryID = entry.EntryID
@@ -269,15 +283,8 @@ func (l *Log) Seal() error {
 	if err := l.file.Sync(); err != nil {
 		return err
 	}
-	h := sha256.New()
-	if _, err := l.file.Seek(0, io.SeekStart); err != nil {
-		return err
-	}
-	if _, err := io.CopyN(h, l.file, l.scan.LastGoodOffset); err != nil {
-		return err
-	}
 	var digest [sha256.Size]byte
-	copy(digest[:], h.Sum(nil))
+	copy(digest[:], l.contentHash.Sum(nil))
 	footer := format.WALSealFooter{FileID: l.pointer.FileID, EntryCount: l.scan.EntryCount, LastEntryID: l.scan.LastEntryID, LastEntryCRC32C: l.scan.LastEntryCRC32C, ContentSHA256: digest}
 	fb, err := format.MarshalWALSealFooter(footer)
 	if err != nil {
@@ -329,7 +336,8 @@ func (l *Log) Rotate(term uint64, now time.Time) error {
 		}
 	}()
 	header := format.WALFileHeader{FileID: id, FirstEntryID: first, CreatedTerm: term, CreatedAt: now.UnixNano()}
-	if err = writeFull(f, format.MarshalWALFileHeader(header)); err != nil {
+	headerBytes := format.MarshalWALFileHeader(header)
+	if err = writeFull(f, headerBytes); err != nil {
 		return err
 	}
 	if err = f.Sync(); err != nil {
@@ -351,6 +359,8 @@ func (l *Log) Rotate(term uint64, now time.Time) error {
 	l.pointer = pointer
 	l.scan = ScanResult{Header: header, LastGoodOffset: format.WALFileHeaderLength}
 	l.expectedPreviousCRC32C = previous
+	l.contentHash = sha256.New()
+	_, _ = l.contentHash.Write(headerBytes)
 	if oldEntryCount == 0 {
 		// The old active WAL was empty and never part of history. Removal is
 		// best-effort after the new pointer is durable; crash recovery ignores
