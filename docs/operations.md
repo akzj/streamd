@@ -164,6 +164,10 @@ streamd -config /etc/streamd/streamd.json
 Standby 每次成功 Checkpoint 后同样执行一次有界 Compaction，但当前仍不自动创建恢复 Snapshot 或传输
 Primary Snapshot。
 
+Checkpoint/Compaction 发布新 Manifest 并切换 Reader 后，旧 Segment/Artifact 先按 Pin 规则原子移入
+`trash/`，再执行运行期 Trash GC 和目录 fsync。未释放 Pin 的文件不会提前移动或删除；Trash 删除失败会
+使本次维护返回错误，不能静默累积到磁盘耗尽。异常退出遗留的 Trash 会在后续维护继续回收。
+
 Strict 节点使用同一个二进制。Primary 的关键配置如下，Standby 将 `role` 改为 `standby`，且不配置
 `peer_*`：
 

@@ -224,6 +224,10 @@ Checkpoint 后执行有界 Compaction，每小时创建 verified linked Snapshot
 运行目录持续保存 RSS/VSZ/FD/Primary bytes/Standby bytes。该 harness 的 Standby 是独立 durable WAL，
 不是完整 Standby 进程，因此 HA 进程切换与网络故障仍由 Compose 门禁覆盖，不能由此替代。
 
+正式 72 小时运行前的 3 分钟 Strict smoke 必须至少跨两次 Checkpoint，并确认 `trash/` 不随投影替换增长。
+2026-08-19 的回归跨 3 次 Checkpoint、17,999 requests，错误为 0、最终 Scrub 和 Standby WAL 验证成功，
+Primary 始终只有 1 个 live Locator Pack 且 `trash_files=0`。
+
 至少包含：
 
 - 72 小时持续混合读写；

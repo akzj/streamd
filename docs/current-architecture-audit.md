@@ -3,7 +3,7 @@
 | 属性 | 内容 |
 | --- | --- |
 | 审计性质 | 代码现实版整体架构审计，不是目标架构复述 |
-| 审计基线 | `97b528f`（`main`，2026-08-19；本文件后的审计修正另行提交） |
+| 审计基线 | `d1747e5`（`main`，2026-08-19；本文件后的审计修正另行提交） |
 | 审计日期 | 2026-08-19 |
 | 相对上次审计新增 | 容量 Admission、阈值维护、在线 Snapshot/WAL GC、Standby Compaction、运行时 Stream 状态回收、规模/故障/兼容/Soak 门禁 |
 | 覆盖范围 | API、存储、索引、Checkpoint、Compaction、恢复、Snapshot、WAL GC、Strict HA、并发与运维入口 |
@@ -581,6 +581,9 @@ Catch-up 的跨进程竞争；同一 `wal.History` 内部的 Pin/Collect 由 mut
 13. **容量压力下无法回收或扩大空间**：Capacity Critical 不再阻止维护 Snapshot；自动本地 Snapshot 对
     不可变 Artifact 使用硬链接，避免复制完整 Segment 集。WAL 删除后即使仍超过预算，也先持久化新的
     earliest WAL 和 verified Snapshot，再返回 retention pressure。
+14. **退休 Artifact 只移入 Trash、不在运行期删除**：Checkpoint 和 Compaction 在新 Reader 安装、旧
+    Reader 关闭且 Pin 规则允许退休后执行 Trash GC。3 分钟 Strict soak 跨 3 次 Checkpoint，始终只有
+    1 个 live Locator Pack、`trash_files=0`，最终 Scrub/Standby WAL 验证通过；Pin 未释放的文件仍保留。
 
 这些边界不得为了自动化或缩短 RTO 而放宽。
 
@@ -649,6 +652,8 @@ Promotion、Snapshot、WAL GC 和诊断仍必须结合物理 WAL；任何新模�
 - Locator Pack Verify/Scrub 已改为流式 SHA-256；同一 65.5 GB Pack 的独立 Scrub 峰值 RSS 从原验收
   暴露的 65,357,528 KiB 降至 626,280 KiB，但固定 Page 的磁盘成本仍未解决；
 - 已有本地 Snapshot/GC 自动调度；仍无传输限速、持久 Pin Lease、对象存储或跨故障域副本；
+- Segment/Artifact 退休采用 live -> trash -> unlink；Checkpoint/Compaction 已执行运行期 Trash GC，
+  删除失败会作为维护错误返回，避免固定 Page Artifact 在长稳中无界占满磁盘；
 - Maintenance failure policy 属于可维护性战略预警：持续非 fatal Checkpoint/Compaction/State 失败尚无
   统一退避、failure budget、readiness 降级或容量预测，但它不是当前功能完整性的首要阻塞；
 - 已有磁盘容量/可用空间和按类型文件字节指标，但 Snapshot、GC、Compaction、Cache、Pin 的事件指标、
