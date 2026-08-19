@@ -14,6 +14,8 @@ import (
 
 	"github.com/akzj/streamd/internal/storage/errdefs"
 	"github.com/akzj/streamd/internal/storage/format"
+	readstore "github.com/akzj/streamd/internal/storage/read"
+	"github.com/akzj/streamd/internal/storage/registry"
 	"github.com/akzj/streamd/internal/storage/replicationstate"
 )
 
@@ -421,6 +423,115 @@ func TestCheckpointPublishesSegmentRotatesWALAndRestarts(t *testing.T) {
 	read, err = store.Read("agent", "events", 0, 10, 0)
 	if err != nil || len(read.Records) != 3 || string(read.Records[2].Payload) != "three" {
 		t.Fatalf("restart Read = %+v, %v", read, err)
+	}
+}
+
+func TestCheckpointAllowsAppendAndReadDuringFlush(t *testing.T) {
+	store, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	firstRequest := AppendRequest{Namespace: "agent", Stream: "events", RequestID: []byte("first"), Producer: "test", Records: []InputRecord{{Payload: []byte("one")}}}
+	first, err := store.Append(context.Background(), firstRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	switched := make(chan struct{})
+	releaseFlush := make(chan struct{})
+	var switchOnce sync.Once
+	store.checkpointHook = func(point string) error {
+		if point == "after_memtable_switch" {
+			switchOnce.Do(func() { close(switched) })
+			<-releaseFlush
+		}
+		return nil
+	}
+	type checkpointResult struct {
+		manifest format.Manifest
+		created  bool
+		err      error
+	}
+	checkpointDone := make(chan checkpointResult, 1)
+	go func() {
+		manifest, created, checkpointErr := store.Checkpoint()
+		checkpointDone <- checkpointResult{manifest: manifest, created: created, err: checkpointErr}
+	}()
+	select {
+	case <-switched:
+	case <-time.After(5 * time.Second):
+		close(releaseFlush)
+		t.Fatal("checkpoint did not switch MemTables")
+	}
+
+	secondRequest := AppendRequest{Namespace: "agent", Stream: "events", ExpectedSequence: 1, RequestID: []byte("second"), Producer: "test", Records: []InputRecord{{Payload: []byte("two")}}}
+	appendDone := make(chan error, 1)
+	go func() {
+		_, appendErr := store.Append(context.Background(), secondRequest)
+		appendDone <- appendErr
+	}()
+	select {
+	case err = <-appendDone:
+		if err != nil {
+			close(releaseFlush)
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		close(releaseFlush)
+		t.Fatal("Append remained blocked during checkpoint Flush")
+	}
+
+	result, err := store.Read("agent", "events", 0, 10, 0)
+	if err != nil || len(result.Records) != 2 || string(result.Records[0].Payload) != "one" || string(result.Records[1].Payload) != "two" {
+		close(releaseFlush)
+		t.Fatalf("layered Read = %+v, error = %v", result, err)
+	}
+	info, err := store.Inspect("agent", "events")
+	if err != nil || info.RecordCount != 2 || info.FirstRecordedAt != first.FirstRecordedAt {
+		close(releaseFlush)
+		t.Fatalf("layered Inspect = %+v, error = %v", info, err)
+	}
+	sequence, _, found, err := store.ResolveTime("agent", "events", first.FirstRecordedAt, readstore.AtOrAfter)
+	if err != nil || !found || sequence != 0 {
+		close(releaseFlush)
+		t.Fatalf("layered ResolveTime = %d found=%v error=%v", sequence, found, err)
+	}
+	deduplicated, err := store.Append(context.Background(), firstRequest)
+	if err != nil || !deduplicated.Deduplicated || deduplicated.NextSequence != 1 {
+		close(releaseFlush)
+		t.Fatalf("layered deduplication = %+v, error = %v", deduplicated, err)
+	}
+	newStream := AppendRequest{Namespace: "agent", Stream: "new", RequestID: []byte("new"), Producer: "test", Records: []InputRecord{{Payload: []byte("created during Flush")}}}
+	if _, err = store.Append(context.Background(), newStream); err != nil {
+		close(releaseFlush)
+		t.Fatal(err)
+	}
+
+	close(releaseFlush)
+	checkpoint := <-checkpointDone
+	if checkpoint.err != nil || !checkpoint.created {
+		t.Fatalf("Checkpoint created=%v error=%v", checkpoint.created, checkpoint.err)
+	}
+	mapping, ok, err := store.state.Registry.Lookup("agent", "events")
+	if err != nil || !ok {
+		t.Fatalf("event mapping found=%v error=%v", ok, err)
+	}
+	newMapping, ok, err := store.state.Registry.Lookup("agent", "new")
+	if err != nil || !ok {
+		t.Fatalf("new mapping found=%v error=%v", ok, err)
+	}
+	result, err = store.Read("agent", "new", 0, 10, 0)
+	if err != nil || len(result.Records) != 1 || string(result.Records[0].Payload) != "created during Flush" {
+		t.Fatalf("new Stream after checkpoint = %+v, error = %v", result, err)
+	}
+	snapshots := store.state.MemTable.Snapshot()
+	retained := make(map[uint64]int, len(snapshots))
+	for _, snapshot := range snapshots {
+		retained[snapshot.StreamID] = len(snapshot.Frames)
+	}
+	if len(snapshots) != 3 || retained[mapping.StreamID] != 1 || retained[newMapping.StreamID] != 1 || retained[registry.RegistryStreamID] != 1 {
+		t.Fatalf("active MemTable retained unexpected checkpoint Tails: %+v", snapshots)
 	}
 }
 

@@ -543,9 +543,10 @@ func (s *Store) Checkpoint() (format.Manifest, bool, error) {
 }
 
 // CheckpointReplicated persists an exact committed recovery floor before it
-// publishes a Manifest that may cover the same entries. Both publications run
-// under the Engine lock, so a crash cannot leave the Manifest ahead of the
-// durable Replication State used to reopen a Standby or former Primary.
+// freezes the matching MemTable prefix. The Manifest is built later outside
+// the Engine lock, but cannot cover entries beyond that durable Replication
+// State floor, so a crash cannot reopen a Standby or former Primary behind the
+// published checkpoint.
 func (s *Store) CheckpointReplicated(states *replicationstate.Store) (format.Manifest, bool, error) {
 	if states == nil {
 		return format.Manifest{}, false, fmt.Errorf("replicated State store is required")
@@ -590,33 +591,30 @@ func (s *Store) CheckpointAndPin() (format.Manifest, bool, func(), error) {
 
 func (s *Store) checkpointLocked(states *replicationstate.Store) (format.Manifest, bool, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.shutdown {
+		s.mu.Unlock()
 		return format.Manifest{}, false, errdefs.ErrClosed
 	}
 	if err := s.fatalError(); err != nil {
+		s.mu.Unlock()
 		return format.Manifest{}, false, fmt.Errorf("engine failed: %w", err)
 	}
 	if err := s.committer.Barrier(context.Background()); err != nil {
 		s.setFatal(err)
+		s.mu.Unlock()
 		return format.Manifest{}, false, err
 	}
 	if states != nil {
 		if _, err := s.checkpointReplicationStateLocked(states); err != nil {
+			s.mu.Unlock()
 			return format.Manifest{}, false, err
 		}
 	}
 	records, _ := s.state.MemTable.Stats()
 	if records == 0 {
 		current, _ := s.state.Manifest.Current()
+		s.mu.Unlock()
 		return current, false, nil
-	}
-	snapshots := s.state.MemTable.Snapshot()
-	flush := make([]memtable.StreamSnapshot, 0, len(snapshots))
-	for _, snapshot := range snapshots {
-		if len(snapshot.Frames) > 0 {
-			flush = append(flush, snapshot)
-		}
 	}
 	lastEntryID := s.state.WAL.NextEntryID() - 1
 	lastCRC := s.state.WAL.PreviousEntryCRC32C()
@@ -624,28 +622,78 @@ func (s *Store) checkpointLocked(states *replicationstate.Store) (format.Manifes
 	if err := s.committer.Close(); err != nil {
 		s.archiveCommitterLocked()
 		s.setFatal(err)
+		s.mu.Unlock()
 		return format.Manifest{}, false, err
 	}
 	s.archiveCommitterLocked()
+
+	frozen := s.state.MemTable
+	frozen.Freeze()
+	active := memtable.New(0)
+	for _, snapshot := range frozen.Tails() {
+		if err := active.SeedTail(snapshot.StreamID, snapshot.Tail); err != nil {
+			s.setFatal(err)
+			s.mu.Unlock()
+			return format.Manifest{}, false, err
+		}
+	}
 	if err := s.state.WAL.Rotate(s.term, s.now()); err != nil {
 		s.setFatal(err)
+		s.mu.Unlock()
 		return format.Manifest{}, false, err
 	}
 	if s.checkpointHook != nil {
 		if err := s.checkpointHook("after_wal_rotate"); err != nil {
 			s.setFatal(err)
+			s.mu.Unlock()
 			return format.Manifest{}, false, err
 		}
 	}
 	previous, _ := s.state.Manifest.Current()
-	existing := make(map[format.UUID]bool, len(s.state.Segments))
-	for _, descriptor := range s.state.Segments {
+	baseDescriptors := append([]segment.Descriptor(nil), s.state.Segments...)
+	existing := make(map[format.UUID]bool, len(baseDescriptors))
+	for _, descriptor := range baseDescriptors {
 		existing[descriptor.Reference.SegmentID] = true
+	}
+	previousTailCatalog := s.state.TailCatalog
+	previousLocator := s.state.Locator
+	nextTailResolver := tailstore.NewResolver(active, previousTailCatalog, s.root.Path(), baseDescriptors, defaultStreamCacheCapacity)
+	nextCommitter := commit.NewWithOptions(s.state.WAL, active, s.commitOptions)
+	nextReader := readstore.New(readstore.LayerTables(active, frozen), nextTailResolver, s.root.Path(), previous.Header.Generation, baseDescriptors, previousLocator, defaultStreamCacheCapacity, defaultSegmentHandleCapacity)
+	s.viewMu.Lock()
+	previousReader := s.reader
+	s.state.MemTable = active
+	s.state.TailResolver = nextTailResolver
+	s.reader = nextReader
+	s.commitStatsMu.Lock()
+	s.committer = nextCommitter
+	s.commitArchived = false
+	s.commitStatsMu.Unlock()
+	s.viewMu.Unlock()
+	s.mu.Unlock()
+
+	if err := previousReader.Close(); err != nil {
+		s.setFatal(err)
+		return format.Manifest{}, false, err
+	}
+	if s.checkpointHook != nil {
+		if err := s.checkpointHook("after_memtable_switch"); err != nil {
+			s.setFatal(err)
+			return format.Manifest{}, false, err
+		}
+	}
+
+	snapshots := frozen.Snapshot()
+	flush := make([]memtable.StreamSnapshot, 0, len(snapshots))
+	for _, snapshot := range snapshots {
+		if len(snapshot.Frames) > 0 {
+			flush = append(flush, snapshot)
+		}
 	}
 	var descriptors []segment.Descriptor
 	var projections projection.Build
 	published, err := s.lifecycle.PublishFlushWithArtifacts(flush, lastEntryID, lastCRC, func(generation uint64, references []format.SegmentReference, coveredEntryID uint64) ([]format.ArtifactReference, error) {
-		descriptors = append([]segment.Descriptor(nil), s.state.Segments...)
+		descriptors = append([]segment.Descriptor(nil), baseDescriptors...)
 		for _, reference := range references {
 			if existing[reference.SegmentID] {
 				continue
@@ -699,37 +747,59 @@ func (s *Store) checkpointLocked(states *replicationstate.Store) (format.Manifes
 	nextRegistry.SetFallback(func() ([]registry.Mapping, error) {
 		return registry.RebuildMappings(s.root.Path(), fallbackDescriptors)
 	})
-	retiredArtifacts := projection.ReplacedArtifacts(previous.ArtifactReferences, s.state.Locator, projections)
-	newTable := memtable.New(0)
+
+	s.mu.Lock()
+	if err = s.fatalError(); err != nil {
+		s.mu.Unlock()
+		nextTailCatalog.Close()
+		nextLocator.Close()
+		return published, true, fmt.Errorf("engine failed while publishing checkpoint: %w", err)
+	}
+	// No Append can enter while mu is held. Drain every request admitted into
+	// the successor Committer before pruning seed-only historical Tails.
+	if err = s.committer.Barrier(context.Background()); err != nil {
+		s.setFatal(err)
+		s.mu.Unlock()
+		nextTailCatalog.Close()
+		nextLocator.Close()
+		return published, true, err
+	}
+	for _, mapping := range s.state.Registry.MappingsAfter(published.Header.LastEntryID) {
+		if err = nextRegistry.ApplyMapping(mapping); err != nil {
+			s.setFatal(err)
+			s.mu.Unlock()
+			nextTailCatalog.Close()
+			nextLocator.Close()
+			return published, true, err
+		}
+	}
+	retiredArtifacts := projection.ReplacedArtifacts(previous.ArtifactReferences, previousLocator, projections)
+	lightDescriptors := segment.LightDescriptors(descriptors)
+	finalTailResolver := tailstore.NewResolver(active, nextTailCatalog, s.root.Path(), lightDescriptors, defaultStreamCacheCapacity)
+	finalReader := readstore.New(active, finalTailResolver, s.root.Path(), published.Header.Generation, lightDescriptors, nextLocator, defaultStreamCacheCapacity, defaultSegmentHandleCapacity)
 	s.viewMu.Lock()
-	oldTable := s.state.MemTable
 	oldReader := s.reader
-	oldTailCatalog := s.state.TailCatalog
-	oldLocator := s.state.Locator
-	s.state.MemTable = newTable
-	s.state.Segments = segment.LightDescriptors(descriptors)
+	s.state.Segments = lightDescriptors
 	s.state.TailCatalog = nextTailCatalog
-	s.state.TailResolver = tailstore.NewResolver(newTable, nextTailCatalog, s.root.Path(), s.state.Segments, defaultStreamCacheCapacity)
+	s.state.TailResolver = finalTailResolver
 	s.state.Locator = nextLocator
 	s.state.Registry = nextRegistry
-	s.commitStatsMu.Lock()
-	s.committer = commit.NewWithOptions(s.state.WAL, newTable, s.commitOptions)
-	s.commitArchived = false
-	s.commitStatsMu.Unlock()
-	s.reader = readstore.New(newTable, s.state.TailResolver, s.root.Path(), published.Header.Generation, s.state.Segments, nextLocator, defaultStreamCacheCapacity, defaultSegmentHandleCapacity)
-	closeErr := oldReader.Close()
-	if oldTailCatalog != nil {
-		closeErr = errors.Join(closeErr, oldTailCatalog.Close())
-	}
-	if oldLocator != nil {
-		closeErr = errors.Join(closeErr, oldLocator.Close())
-	}
+	s.reader = finalReader
+	active.PruneSeeded()
 	s.viewMu.Unlock()
+	s.mu.Unlock()
+
+	closeErr := oldReader.Close()
+	if previousTailCatalog != nil {
+		closeErr = errors.Join(closeErr, previousTailCatalog.Close())
+	}
+	if previousLocator != nil {
+		closeErr = errors.Join(closeErr, previousLocator.Close())
+	}
 	if closeErr != nil {
 		s.setFatal(closeErr)
 		return published, true, closeErr
 	}
-	oldTable.Freeze()
 	if err = s.lifecycle.RetireArtifacts(retiredArtifacts); err != nil {
 		return published, true, err
 	}
